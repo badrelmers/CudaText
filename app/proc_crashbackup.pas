@@ -132,11 +132,15 @@ var
   WatchdogThread: TCrashWatchdogThread = nil;
 
   { Heartbeat timestamp - updated by the main thread via TTimer,
-    read by the watchdog thread. Aligned 32-bit reads/writes are
-    atomic on x86/x64, but we use InterlockedExchange for clarity
-    and portability. DWORD subtraction handles GetTickCount
-    wraparound (every ~49 days) correctly via modular arithmetic. }
-  MainThreadHeartbeat: DWORD = 0;
+    read by the watchdog thread. Stored as LongInt (not DWORD) because
+    FPC's InterlockedExchange/InterlockedExchangeAdd take LongInt.
+    GetTickCount returns DWORD; we cast to LongInt for storage. The
+    cast is safe: even though LongInt is signed, the modular
+    arithmetic used in 'Now - LastHB' still gives correct elapsed
+    time even across the DWORD -> LongInt -> DWORD conversion.
+    Aligned 32-bit reads/writes are atomic on x86/x64; we use the
+    Interlocked* family for clarity and portability. }
+  MainThreadHeartbeat: LongInt = 0;
   { 0 = no hang backup done yet (or main thread recovered since last hang).
     1 = hang backup already done for the current hang. Reset to 0
     when the main thread updates the heartbeat again. }
@@ -252,6 +256,7 @@ function FormatTimestamp: AnsiString;
 var
   ST: TSystemTime;
 begin
+  FillChar(ST, SizeOf(ST), 0);
   GetLocalTime(ST);
   Result :=
     ZeroPad4(ST.wYear) +
@@ -461,7 +466,8 @@ begin
   { Called by TTimer via WM_TIMER on the main thread. WM_TIMER only
     fires when the message loop is pumping - if the main thread is
     stuck, this never fires, the heartbeat goes stale, and the
-    watchdog triggers a backup. }
+    watchdog triggers a backup.
+    Cast DWORD to LongInt for storage (see MainThreadHeartbeat decl). }
   InterlockedExchange(MainThreadHeartbeat, LongInt(GetTickCount));
   { Main thread is alive - reset the hang-backup-done flag so a future
     hang can also be backed up. }
@@ -481,7 +487,8 @@ begin
 
     Now := GetTickCount;
     { Atomic read of the heartbeat. InterlockedExchangeAdd with 0
-      returns the old value without modifying it. }
+      returns the old value without modifying it. Cast back to DWORD
+      for arithmetic (see MainThreadHeartbeat decl). }
     LastHB := DWORD(InterlockedExchangeAdd(MainThreadHeartbeat, 0));
 
     { DWORD subtraction handles GetTickCount wraparound correctly
@@ -540,7 +547,8 @@ begin
   HeartbeatTimer.OnTimer := @Heartbeat.HandleTimer;
   HeartbeatTimer.Enabled := True;
   { Seed the initial heartbeat so the watchdog doesn't immediately
-    fire before the first WM_TIMER arrives. }
+    fire before the first WM_TIMER arrives. Cast DWORD to LongInt
+    for storage (see MainThreadHeartbeat decl). }
   InterlockedExchange(MainThreadHeartbeat, LongInt(GetTickCount));
   LogStep('Heartbeat timer installed, interval = ' + IntToStr(HEARTBEAT_INTERVAL_MS) + 'ms');
 
