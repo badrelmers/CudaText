@@ -3,14 +3,26 @@
   -----------------
   Crash backup for CudaText on Windows, with diagnostic logging.
 
-  Writes a step-by-step log to MULTIPLE locations so we can find it
-  no matter what:
-    1. %TEMP%\cudatext_crash.log          (user temp dir)
-    2. <exe_dir>\cudatext_crash.log       (next to cudatext.exe)
-    3. %USERPROFILE%\cudatext_crash.log   (user home dir)
+  When an unhandled exception is about to terminate the process, this
+  unit writes a backup copy of the currently focused editor's text to
+  "<originalfile>.bak" next to the original file (or to
+  %TEMP%\cudatext_recovery.bak for untitled tabs).
 
-  At install time, also shows a MessageBox so we have visual proof
-  the unit is being loaded even if all file logging fails.
+  Focused editor detection:
+    We maintain our own shadow pointer CrashBackup_FocusedEditor that is
+    updated by Screen.OnActiveControlChange (fires on the main thread
+    whenever focus moves between controls). The VEH handler reads this
+    pointer - no LCL method calls from the crash handler.
+
+    We only UPDATE the shadow when an editor actually has focus, so if
+    the user clicks on a menu, tree, or other non-editor control, the
+    shadow keeps pointing to the last editor they were typing in. This
+    matches the user expectation: "the file I was editing".
+
+  Log file:
+    Written to three locations (TEMP, exe dir, USERPROFILE) so we can
+    find it no matter what. Uses only Win32 API calls - no FPC heap
+    operations in the logging path.
 }
 unit proc_crashbackup;
 
@@ -53,9 +65,16 @@ var
   CrashHandler: TCrashExceptionHandler = nil;
   PrevExceptProc: TExceptProc = nil;
   PrevOnException: TExceptionEvent = nil;
+  PrevOnActiveControlChange: TNotifyEvent = nil;
   CrashHandled: LongInt = 0;
   Installed: Boolean = False;
   LogPaths: array[0..MAX_LOG_PATHS-1] of UnicodeString;
+
+  { Shadow pointer to the editor that most recently had keyboard focus.
+    Written by the main thread (in OnActiveControlChange), read by any
+    thread (in the VEH). Aligned pointer writes are atomic on x86/x64,
+    so no lock is needed. }
+  CrashBackup_FocusedEditor: TATSynEdit = nil;
 
 { ---------- Log path initialization ---------- }
 
@@ -72,20 +91,15 @@ begin
   for i := 0 to MAX_LOG_PATHS - 1 do
     LogPaths[i] := '';
 
-  { 1. %TEMP%\cudatext_crash.log }
   TempLen := GetTempPathW(MAX_PATH, @TempBuf[0]);
   if (TempLen > 0) and (TempLen < MAX_PATH) then
   begin
-    { IMPORTANT: use PWideChar, NOT PChar. In {$mode objfpc}{$H+},
-      PChar = PAnsiChar, which would feed wide-char data into the
-      AnsiString SetString overload and produce a garbage UnicodeString. }
     SetString(LogPaths[0], PWideChar(@TempBuf[0]), TempLen);
     if (Length(LogPaths[0]) > 0) and (LogPaths[0][Length(LogPaths[0])] <> '\') then
       LogPaths[0] := LogPaths[0] + '\';
     LogPaths[0] := LogPaths[0] + 'cudatext_crash.log';
   end;
 
-  { 2. <exe_dir>\cudatext_crash.log }
   ExeLen := GetModuleFileNameW(0, @ExeBuf[0], MAX_PATH);
   if (ExeLen > 0) and (ExeLen < MAX_PATH) then
   begin
@@ -99,7 +113,6 @@ begin
     end;
   end;
 
-  { 3. %USERPROFILE%\cudatext_crash.log }
   HomeLen := GetEnvironmentVariableW('USERPROFILE', @HomeBuf[0], MAX_PATH);
   if (HomeLen > 0) and (HomeLen < MAX_PATH) then
   begin
@@ -153,6 +166,52 @@ begin
   Result := (Code and $C0000000) = $C0000000;
 end;
 
+{ ---------- Focused editor tracking ---------- }
+
+procedure UpdateFocusedEditor;
+var
+  i: Integer;
+  Frame: TEditorFrame;
+  NewEd: TATSynEdit;
+begin
+  NewEd := nil;
+  if AppFrameList1 <> nil then
+  begin
+    for i := 0 to AppFrameList1.Count - 1 do
+    begin
+      Frame := TEditorFrame(AppFrameList1.Items[i]);
+      if Frame = nil then Continue;
+      { Calling .Focused is safe here - this runs on the main thread
+        in the OnActiveControlChange handler. }
+      if (Frame.Ed1 <> nil) and Frame.Ed1.Focused then
+      begin
+        NewEd := Frame.Ed1;
+        Break;
+      end;
+      if (Frame.Ed2 <> nil) and Frame.Ed2.Focused then
+      begin
+        NewEd := Frame.Ed2;
+        Break;
+      end;
+    end;
+  end;
+  { Only update if we found an editor. If focus moved to a non-editor
+    control (menu, tree, etc.), keep the shadow pointing to the last
+    editor that had focus - that's the file the user was editing. }
+  if NewEd <> nil then
+    CrashBackup_FocusedEditor := NewEd;
+end;
+
+procedure CrashScreenActiveControlChange(Sender: TObject);
+begin
+  try
+    UpdateFocusedEditor;
+  except
+  end;
+  if Assigned(PrevOnActiveControlChange) then
+    PrevOnActiveControlChange(Sender);
+end;
+
 { ---------- The actual backup ---------- }
 
 procedure DoBackup;
@@ -166,6 +225,8 @@ var
   TextU8: RawByteString;
   Stream: TFileStream;
   BOM: array[0..2] of Byte;
+  ShadowEd: TATSynEdit;
+  ShadowIsValid: Boolean;
 begin
   LogStep('  [step] DoBackup entered');
 
@@ -182,24 +243,61 @@ begin
     Exit;
   end;
 
-  Ed := nil;
-  LogStep('  [step] AppCodetreeState.Editor ptr = ' + IntToHex(PtrUInt(AppCodetreeState.Editor), 16));
-  for i := 0 to AppFrameList1.Count - 1 do
+  { Read the shadow pointer ONCE. It could be changed by the main thread
+    while we're reading it, but aligned pointer reads are atomic on
+    x86/x64, so we'll get either the old or new value - never a torn read. }
+  ShadowEd := CrashBackup_FocusedEditor;
+  LogStep('  [step] Shadow ptr = ' + IntToHex(PtrUInt(ShadowEd), 16));
+
+  { Verify the shadow pointer is still valid by finding it in the list.
+    If the tab was closed, the pointer would be dangling. }
+  ShadowIsValid := False;
+  if ShadowEd <> nil then
   begin
-    Frame := TEditorFrame(AppFrameList1.Items[i]);
-    if Frame = nil then Continue;
-    if (Frame.Ed1 = AppCodetreeState.Editor) or
-       (Frame.Ed2 = AppCodetreeState.Editor) then
+    for i := 0 to AppFrameList1.Count - 1 do
     begin
-      Ed := TATSynEdit(AppCodetreeState.Editor);
-      LogStep('  [step] Found focused editor at frame index ' + IntToStr(i));
-      Break;
+      Frame := TEditorFrame(AppFrameList1.Items[i]);
+      if Frame = nil then Continue;
+      if (Frame.Ed1 = ShadowEd) or (Frame.Ed2 = ShadowEd) then
+      begin
+        ShadowIsValid := True;
+        Break;
+      end;
+    end;
+  end;
+  LogStep('  [step] Shadow ptr valid = ' + BoolToStr(ShadowIsValid, True));
+
+  Ed := nil;
+  if ShadowIsValid then
+  begin
+    Ed := ShadowEd;
+    LogStep('  [step] Using shadow-ptr editor');
+  end
+  else
+  begin
+    LogStep('  [step] Shadow ptr nil or stale, trying AppCodetreeState.Editor');
+    LogStep('  [step] AppCodetreeState.Editor ptr = ' + IntToHex(PtrUInt(AppCodetreeState.Editor), 16));
+    { Try AppCodetreeState.Editor next }
+    if AppCodetreeState.Editor <> nil then
+    begin
+      for i := 0 to AppFrameList1.Count - 1 do
+      begin
+        Frame := TEditorFrame(AppFrameList1.Items[i]);
+        if Frame = nil then Continue;
+        if (Frame.Ed1 = AppCodetreeState.Editor) or
+           (Frame.Ed2 = AppCodetreeState.Editor) then
+        begin
+          Ed := TATSynEdit(AppCodetreeState.Editor);
+          LogStep('  [step] Found editor via AppCodetreeState');
+          Break;
+        end;
+      end;
     end;
   end;
 
   if Ed = nil then
   begin
-    LogStep('  [step] Focused editor not found, using fallback');
+    LogStep('  [step] Focused editor not found, using fallback (first editor)');
     for i := 0 to AppFrameList1.Count - 1 do
     begin
       Frame := TEditorFrame(AppFrameList1.Items[i]);
@@ -217,7 +315,7 @@ begin
     Exit;
   end;
 
-  LogStep('  [step] Found editor, Ed1 ptr = ' + IntToHex(PtrUInt(Ed), 16));
+  LogStep('  [step] Found editor, ptr = ' + IntToHex(PtrUInt(Ed), 16));
   LogStep('  [step] Ed.Modified = ' + BoolToStr(Ed.Modified, True));
 
   if not Ed.Modified then
@@ -334,7 +432,6 @@ procedure InstallCrashBackup;
 var
   StackGuarantee: ULONG;
   VehHandle: Pointer;
-  Msg: UnicodeString;
 begin
   if Installed then Exit;
   Installed := True;
@@ -344,17 +441,6 @@ begin
   LogStep('Log path[0] (TEMP) = ' + AnsiString(LogPaths[0]));
   LogStep('Log path[1] (EXE)  = ' + AnsiString(LogPaths[1]));
   LogStep('Log path[2] (HOME) = ' + AnsiString(LogPaths[2]));
-
-  { Visual confirmation that the unit is loaded and InstallCrashBackup
-    is being called. Even if all file logging fails, the user will see
-    this popup. Comment out the MessageBoxW call once diagnostics are
-    no longer needed. }
-  Msg := 'CudaText CrashBackup installed.' + #13#10 +
-         'Log paths:' + #13#10 +
-         '  [0] ' + LogPaths[0] + #13#10 +
-         '  [1] ' + LogPaths[1] + #13#10 +
-         '  [2] ' + LogPaths[2];
-  MessageBoxW(0, PWideChar(Msg), 'CudaText CrashBackup', MB_OK or MB_ICONINFORMATION);
 
   LogStep('Installing VEH...');
   VehHandle := AddVectoredExceptionHandler(1, TCrashVectoredHandler(@CrashVectoredFilter));
@@ -377,6 +463,17 @@ begin
   PrevOnException := Application.OnException;
   Application.OnException := @CrashHandler.HandleException;
   LogStep('OnException hooked');
+
+  LogStep('Hooking Screen.OnActiveControlChange...');
+  PrevOnActiveControlChange := Screen.OnActiveControlChange;
+  Screen.OnActiveControlChange := @CrashScreenActiveControlChange;
+  LogStep('OnActiveControlChange hooked');
+
+  { Do an initial focus scan so the shadow is populated even before
+    the user moves focus. }
+  LogStep('Doing initial focus scan...');
+  UpdateFocusedEditor;
+  LogStep('Initial shadow ptr = ' + IntToHex(PtrUInt(CrashBackup_FocusedEditor), 16));
 
   LogStep('=== InstallCrashBackup complete ===');
 end;
