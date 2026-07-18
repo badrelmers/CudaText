@@ -181,6 +181,16 @@ begin
   Result := (Code and $C0000000) = $C0000000;
 end;
 
+function IsNonContinuable(ExceptionInfo: PExceptionPointers): Boolean;
+begin
+  { EXCEPTION_NONCONTINUABLE = 1. If this flag is set, the exception
+    CANNOT be resumed from - the program must terminate. This is the
+    most reliable signal that the exception is a real crash, not a
+    recoverable error. Pascal exceptions, C++ exceptions, and Python
+    exceptions are normally continuable (flag = 0). }
+  Result := (ExceptionInfo^.ExceptionRecord^.ExceptionFlags and 1) <> 0;
+end;
+
 { ---------- Timestamp formatting ---------- }
 
 function ZeroPad2(N: Integer): AnsiString;
@@ -395,19 +405,35 @@ end;
 function CrashVectoredFilter(ExceptionInfo: PExceptionPointers): LongInt; stdcall;
 var
   Code: DWORD;
+  NonCont: Boolean;
+  Fatal: Boolean;
 begin
   Result := EXCEPTION_CONTINUE_SEARCH;
 
   Code := DWORD(ExceptionInfo^.ExceptionRecord^.ExceptionCode);
-  LogStep('[VEH] entered, exception code = ' + IntToHex(Code, 8));
+  Fatal := IsFatalExceptionCode(Code);
+  NonCont := IsNonContinuable(ExceptionInfo);
+  LogStep('[VEH] entered, exception code = ' + IntToHex(Code, 8) +
+          ', fatal=' + BoolToStr(Fatal, True) +
+          ', noncontinuable=' + BoolToStr(NonCont, True));
 
-  if not IsFatalExceptionCode(Code) then
+  { Only act if BOTH:
+    - The exception code is in the "error" severity range (excludes
+      Pascal software exceptions, debugger events, C++ exceptions)
+    - The exception is non-continuable (cannot be resumed from - the
+      program must terminate)
+
+    Pascal/C++/Python exceptions that CudaText catches and recovers
+    from are continuable (flag = 0), so they are filtered out here.
+    This prevents backups from being created for non-crashing errors
+    like Python console exceptions. }
+  if not (Fatal and NonCont) then
   begin
-    LogStep('[VEH] non-fatal code, skipping backup');
+    LogStep('[VEH] recoverable or non-fatal, skipping backup');
     Exit;
   end;
 
-  LogStep('[VEH] fatal code, attempting backup');
+  LogStep('[VEH] fatal + non-continuable, attempting backup');
   TryDoBackup('VEH');
 end;
 
