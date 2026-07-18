@@ -31,6 +31,6 @@ begin
   RequireDerivedFormResource:= True;
   Application.Initialize;
   Application.CreateForm(TfmMain, fmMain);
-  InstallCrashBackup; //install unhandled-exception filter after main form is created
+  InstallCrashBackup; //install VEH + FPC hooks after main form is created
   Application.Run;
 end.

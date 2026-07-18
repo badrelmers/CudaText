@@ -1,7 +1,7 @@
 {
   proc_crashbackup
   -----------------
-  Crash backup for CudaText.
+  Crash backup for CudaText on Windows.
 
   When an unhandled exception is about to terminate the process, this
   unit writes a backup copy of the currently focused editor's text to
@@ -15,37 +15,53 @@
 
   Design notes:
 
-  * We hook FPC's own exception dispatch, NOT the Windows unhandled
-    exception filter. The Windows filter (SetUnhandledExceptionFilter)
-    is a single global slot that FPC's RTL relies on to translate
-    STATUS_ACCESS_VIOLATION etc. into EAccessViolation during normal
-    operation. Replacing it - even with chaining - can break that
-    translation and silently kill the process during LCL startup.
+  * We use THREE complementary hooks, each covering a different class
+    of crash:
 
-    Instead we hook two FPC-level mechanisms:
+    1. AddVectoredExceptionHandler (VEH)
+       Fires for EVERY Windows SEH exception on ANY thread - including
+       raw access violations on threads FPC doesn't manage (e.g. a
+       plugin thread, a parser thread, or a thread created externally).
+       This is the ONLY hook that catches the case of a remote thread
+       crashing with STATUS_ACCESS_VIOLATION.
 
-    1. ExceptProc  - called by FPC when a Pascal exception is unhandled
-                     on ANY thread (main or background). This is the
-                     primary crash-detection path.
+    2. ExceptProc (FPC RTL)
+       Fires for unhandled Pascal exceptions on any thread. Covers
+       crashes that FPC translates from SEH into EAccessViolation,
+       EDivByZero, ERangeError, etc.
 
-    2. Application.OnException - fired by the LCL for exceptions that
-                     escape event handlers on the main thread. Without
-                     this, main-thread crashes caught by the LCL would
-                     not trigger a backup (ExceptProc is not called for
-                     them because HandleException swallows them).
+    3. Application.OnException (LCL)
+       Fires for exceptions that escape event handlers on the main
+       thread. This is the normal path for crashes during a click or
+       key press - the LCL catches them and would normally show its
+       own error dialog.
 
-    Both hooks chain to the previous handler after writing the backup,
-    so FPC's and the LCL's normal exception behavior is preserved.
+  * The VEH handler is installed AFTER Application.CreateForm, not in
+    the unit's initialization section. Installing it too early (before
+    FPC's RTL and the LCL are fully ready) breaks startup because the
+    VEH fires for internal SEH exceptions that FPC/LCL raise and catch
+    during initialization, and running our handler that early can
+    fault. By waiting until the main form exists, all of FPC's and
+    LCL's internal state is ready.
+
+  * The VEH handler filters by exception code: only "error" severity
+    codes (top two bits = 11) trigger a backup. This excludes:
+    - Pascal/Delphi software exceptions ($0EEDFADE, severity "success")
+    - Debugger events (breakpoint, single-step, severity "information")
+    - C++ exceptions ($E06D7363, severity "warning")
 
   * We use a single atomic flag (InterlockedCompareExchange) to
     serialize the backup. This cannot deadlock on re-entrant crashes -
-    the second attempt simply backs off.
+    the second attempt simply backs off. The flag is reset after the
+    backup completes, so a later crash on a different thread can also
+    be backed up.
 
-  * The handler body is wrapped in try/except to absorb any secondary
+  * The backup logic is wrapped in try/except to absorb any secondary
     faults (e.g. if heap corruption makes Ed.Text fault).
 
-  * InstallCrashBackup must be called AFTER Application.CreateForm,
-    because it needs Application.OnException to be assignable.
+  * The VEH handler always returns EXCEPTION_CONTINUE_SEARCH - we
+    NEVER swallow the exception. FPC's normal exception translation
+    and Windows' default crash handling continue to work as before.
 }
 unit proc_crashbackup;
 
@@ -54,23 +70,48 @@ unit proc_crashbackup;
 interface
 
 procedure InstallCrashBackup;
-  { Hook ExceptProc and Application.OnException. MUST be called after
-    Application.CreateForm. Idempotent - safe to call multiple times. }
+  { Install the VEH, ExceptProc, and OnException hooks. MUST be called
+    after Application.CreateForm. Idempotent - safe to call multiple times. }
+
+procedure CrashBackup_RegisterThread;
+  { No-op stub kept for API compatibility. The VEH covers all threads
+    automatically, so per-thread registration is no longer needed. }
 
 implementation
 
+{$IFDEF WINDOWS}
+
 uses
-  SysUtils, Classes, Forms,
+  Windows, SysUtils, Classes, Forms,
   proc_globdata, form_frame, ATSynEdit;
 
 type
-  { Small singleton whose sole purpose is to give us a method that can
-    be assigned to Application.OnException (which is a "procedure of object"
-    and requires an instance, not a plain function). }
+  { Signature of a vectored exception handler callback. Must match the
+    Windows PVECTORED_EXCEPTION_HANDLER type. }
+  TCrashVectoredHandler = function(ExceptionInfo: PExceptionPointers): LongInt; stdcall;
+
+  { Signature of an unhandled-exception filter callback. }
+  TTopLevelExceptionFilter = function(ExceptionInfo: PExceptionPointers): LongInt; stdcall;
+
+  { Small singleton to provide a method pointer for Application.OnException. }
   TCrashExceptionHandler = class
   public
     procedure HandleException(Sender: TObject; E: Exception);
   end;
+
+{ These Win32 APIs are not declared in FPC's Windows unit on all versions,
+  so declare them manually as kernel32 imports. }
+function AddVectoredExceptionHandler(
+  FirstHandler: ULONG;
+  Handler: TCrashVectoredHandler
+): Pointer; stdcall; external 'kernel32' name 'AddVectoredExceptionHandler';
+
+function SetThreadStackGuarantee(
+  var StackSizeInBytes: ULONG
+): DWORD; stdcall; external 'kernel32' name 'SetThreadStackGuarantee';
+
+const
+  CRASH_STACK_GUARANTEE = 16384;  // ~16 KB reserved for the handler to run in
 
 var
   CrashHandler: TCrashExceptionHandler = nil;
@@ -78,6 +119,27 @@ var
   PrevOnException: TExceptionEvent = nil;
   CrashHandled: LongInt = 0;       // 0 = free, 1 = a backup is already in progress
   Installed: Boolean = False;
+
+function IsFatalExceptionCode(Code: DWORD): Boolean;
+begin
+  { "Error" severity codes (top two bits = 11) are always fatal crashes:
+    STATUS_ACCESS_VIOLATION        $C0000005
+    STATUS_IN_PAGE_ERROR           $C0000006
+    STATUS_INVALID_HANDLE          $C0000008
+    STATUS_STACK_OVERFLOW          $C00000FD
+    STATUS_ILLEGAL_INSTRUCTION     $C000001D
+    STATUS_NONCONTINUABLE_EXCEPTION $C0000025
+    STATUS_INT_DIVIDE_BY_ZERO      $C0000094
+    STATUS_PRIV_INSTRUCTION        $C0000096
+
+    Pascal/Delphi software exceptions ($0EEDFADE) have severity "success"
+    (top two bits = 00) and are NOT caught here - those go through the
+    normal try/except path. Debugger events (EXCEPTION_BREAKPOINT /
+    EXCEPTION_SINGLE_STEP, $80000003 / $80000004) are "information"
+    severity and not caught. C++ exceptions ($E06D7363) are "warning"
+    severity and not caught. }
+  Result := (Code and $C0000000) = $C0000000;
+end;
 
 procedure DoBackup;
 var
@@ -176,6 +238,22 @@ begin
   end;
 end;
 
+{ Windows-level hook: fires for every SEH exception on any thread.
+  This is the only hook that catches raw access violations on threads
+  FPC doesn't manage (e.g. CreateRemoteThread, plugin threads). }
+function CrashVectoredFilter(ExceptionInfo: PExceptionPointers): LongInt; stdcall;
+begin
+  Result := EXCEPTION_CONTINUE_SEARCH;  // never swallow - just observe
+
+  { Only act on genuinely fatal exception codes. This excludes Pascal
+    software exceptions, debugger events, and C++ exceptions - all of
+    which are handled by FPC's normal dispatch. }
+  if not IsFatalExceptionCode(DWORD(ExceptionInfo^.ExceptionRecord^.ExceptionCode)) then
+    Exit;
+
+  TryDoBackup;
+end;
+
 { FPC-level hook: called for unhandled Pascal exceptions on any thread. }
 procedure CrashExceptProc(Obj: TObject; Addr: Pointer; FrameCount: LongInt; Frames: PPointer);
 begin
@@ -194,21 +272,49 @@ begin
 end;
 
 procedure InstallCrashBackup;
+var
+  StackGuarantee: ULONG;
 begin
   if Installed then Exit;
   Installed := True;
 
+  { Install the VEH FIRST, so it's at the head of the list and runs
+    before any other VEH someone else registered. }
+  AddVectoredExceptionHandler(1, TCrashVectoredHandler(@CrashVectoredFilter));
+
+  { Reserve ~16 KB of stack on the main thread so the VEH handler has
+    room to run even after a stack overflow. }
+  StackGuarantee := CRASH_STACK_GUARANTEE;
+  SetThreadStackGuarantee(StackGuarantee);
+
   CrashHandler := TCrashExceptionHandler.Create;
 
-  { Hook FPC's unhandled-exception proc (covers background threads and
-    anything that escapes the LCL). }
+  { Hook FPC's unhandled-exception proc (covers Pascal exceptions on
+    background threads). }
   PrevExceptProc := ExceptProc;
   ExceptProc := @CrashExceptProc;
 
-  { Hook the LCL's OnException (covers main-thread exceptions caught by
-    TApplication.HandleException - the usual path for UI-event crashes). }
+  { Hook the LCL's OnException (covers main-thread UI crashes). }
   PrevOnException := Application.OnException;
   Application.OnException := @CrashHandler.HandleException;
 end;
+
+procedure CrashBackup_RegisterThread;
+begin
+  { No-op. The VEH covers all threads automatically. Kept for API
+    compatibility in case external code calls it. }
+end;
+
+{$ELSE}  // non-Windows: provide no-op stubs so the unit compiles
+
+procedure InstallCrashBackup;
+begin
+end;
+
+procedure CrashBackup_RegisterThread;
+begin
+end;
+
+{$ENDIF}
 
 end.
