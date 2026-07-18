@@ -1,67 +1,36 @@
 {
   proc_crashbackup
   -----------------
-  Crash backup for CudaText on Windows.
+  Crash backup for CudaText on Windows, with diagnostic logging.
 
   When an unhandled exception is about to terminate the process, this
   unit writes a backup copy of the currently focused editor's text to
   "<originalfile>.bak" next to the original file (or to
   %TEMP%\cudatext_recovery.bak for untitled tabs).
 
-  The backup contains every keystroke up to the moment of the crash -
-  nothing is lost. Mirrors what Notepad4 does
-  (https://github.com/zufuliu/notepad4, commits 2ca839b / 0738e9c / 92b4df8),
-  ported to Free Pascal / CudaText.
+  It also writes a step-by-step log to %TEMP%\cudatext_crash.log so we
+  can diagnose exactly where the backup fails if it does. The log uses
+  ONLY Win32 API calls (no FPC heap operations) so it works even when
+  the FPC heap is corrupted.
 
   Design notes:
 
-  * We use THREE complementary hooks, each covering a different class
-    of crash:
+  * THREE complementary hooks, each covering a different crash class:
+    1. AddVectoredExceptionHandler - every SEH exception on any thread
+       (the only hook that catches foreign-thread crashes like
+       CreateRemoteThread)
+    2. ExceptProc - unhandled Pascal exceptions on any thread
+    3. Application.OnException - main-thread UI crashes
 
-    1. AddVectoredExceptionHandler (VEH)
-       Fires for EVERY Windows SEH exception on ANY thread - including
-       raw access violations on threads FPC doesn't manage (e.g. a
-       plugin thread, a parser thread, or a thread created externally).
-       This is the ONLY hook that catches the case of a remote thread
-       crashing with STATUS_ACCESS_VIOLATION.
+  * The VEH filters by exception code: only "error" severity codes
+    (top two bits = 11) trigger a backup.
 
-    2. ExceptProc (FPC RTL)
-       Fires for unhandled Pascal exceptions on any thread. Covers
-       crashes that FPC translates from SEH into EAccessViolation,
-       EDivByZero, ERangeError, etc.
+  * Atomic flag (InterlockedCompareExchange) serializes the backup.
 
-    3. Application.OnException (LCL)
-       Fires for exceptions that escape event handlers on the main
-       thread. This is the normal path for crashes during a click or
-       key press - the LCL catches them and would normally show its
-       own error dialog.
+  * The VEH always returns EXCEPTION_CONTINUE_SEARCH - never swallows.
 
-  * The VEH handler is installed AFTER Application.CreateForm, not in
-    the unit's initialization section. Installing it too early (before
-    FPC's RTL and the LCL are fully ready) breaks startup because the
-    VEH fires for internal SEH exceptions that FPC/LCL raise and catch
-    during initialization, and running our handler that early can
-    fault. By waiting until the main form exists, all of FPC's and
-    LCL's internal state is ready.
-
-  * The VEH handler filters by exception code: only "error" severity
-    codes (top two bits = 11) trigger a backup. This excludes:
-    - Pascal/Delphi software exceptions ($0EEDFADE, severity "success")
-    - Debugger events (breakpoint, single-step, severity "information")
-    - C++ exceptions ($E06D7363, severity "warning")
-
-  * We use a single atomic flag (InterlockedCompareExchange) to
-    serialize the backup. This cannot deadlock on re-entrant crashes -
-    the second attempt simply backs off. The flag is reset after the
-    backup completes, so a later crash on a different thread can also
-    be backed up.
-
-  * The backup logic is wrapped in try/except to absorb any secondary
-    faults (e.g. if heap corruption makes Ed.Text fault).
-
-  * The VEH handler always returns EXCEPTION_CONTINUE_SEARCH - we
-    NEVER swallow the exception. FPC's normal exception translation
-    and Windows' default crash handling continue to work as before.
+  * Log writes use CreateFileW/WriteFile/CloseHandle per line, so a
+    crash mid-backup still leaves the previous log lines on disk.
 }
 unit proc_crashbackup;
 
@@ -70,12 +39,7 @@ unit proc_crashbackup;
 interface
 
 procedure InstallCrashBackup;
-  { Install the VEH, ExceptProc, and OnException hooks. MUST be called
-    after Application.CreateForm. Idempotent - safe to call multiple times. }
-
 procedure CrashBackup_RegisterThread;
-  { No-op stub kept for API compatibility. The VEH covers all threads
-    automatically, so per-thread registration is no longer needed. }
 
 implementation
 
@@ -86,21 +50,12 @@ uses
   proc_globdata, form_frame, ATSynEdit;
 
 type
-  { Signature of a vectored exception handler callback. Must match the
-    Windows PVECTORED_EXCEPTION_HANDLER type. }
   TCrashVectoredHandler = function(ExceptionInfo: PExceptionPointers): LongInt; stdcall;
-
-  { Signature of an unhandled-exception filter callback. }
-  TTopLevelExceptionFilter = function(ExceptionInfo: PExceptionPointers): LongInt; stdcall;
-
-  { Small singleton to provide a method pointer for Application.OnException. }
   TCrashExceptionHandler = class
   public
     procedure HandleException(Sender: TObject; E: Exception);
   end;
 
-{ These Win32 APIs are not declared in FPC's Windows unit on all versions,
-  so declare them manually as kernel32 imports. }
 function AddVectoredExceptionHandler(
   FirstHandler: ULONG;
   Handler: TCrashVectoredHandler
@@ -111,35 +66,56 @@ function SetThreadStackGuarantee(
 ): DWORD; stdcall; external 'kernel32' name 'SetThreadStackGuarantee';
 
 const
-  CRASH_STACK_GUARANTEE = 16384;  // ~16 KB reserved for the handler to run in
+  CRASH_STACK_GUARANTEE = 16384;
 
 var
   CrashHandler: TCrashExceptionHandler = nil;
   PrevExceptProc: TExceptProc = nil;
   PrevOnException: TExceptionEvent = nil;
-  CrashHandled: LongInt = 0;       // 0 = free, 1 = a backup is already in progress
+  CrashHandled: LongInt = 0;
   Installed: Boolean = False;
+
+{ ---------- Diagnostic logging (WinAPI only, no FPC heap) ---------- }
+
+procedure LogLine(const S: AnsiString);
+var
+  PathBuf: array[0..MAX_PATH] of WideChar;
+  PathLen: Integer;
+  FullPath: UnicodeString;
+  FileHandle: THandle;
+  BytesWritten: DWORD;
+  LineEnd: AnsiString;
+begin
+  PathLen := GetTempPathW(MAX_PATH, @PathBuf[0]);
+  if PathLen = 0 then Exit;
+  SetString(FullPath, PChar(@PathBuf[0]), PathLen);
+  FullPath := FullPath + 'cudatext_crash.log';
+
+  FileHandle := CreateFileW(PWideChar(FullPath),
+    FILE_APPEND_DATA, FILE_SHARE_READ or FILE_SHARE_WRITE, nil,
+    OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+  if FileHandle = INVALID_HANDLE_VALUE then Exit;
+
+  LineEnd := #13#10;
+  WriteFile(FileHandle, S[1], Length(S), BytesWritten, nil);
+  WriteFile(FileHandle, LineEnd[1], 2, BytesWritten, nil);
+  CloseHandle(FileHandle);
+end;
+
+procedure LogStep(const S: AnsiString);
+begin
+  try
+    LogLine(S);
+  except
+  end;
+end;
 
 function IsFatalExceptionCode(Code: DWORD): Boolean;
 begin
-  { "Error" severity codes (top two bits = 11) are always fatal crashes:
-    STATUS_ACCESS_VIOLATION        $C0000005
-    STATUS_IN_PAGE_ERROR           $C0000006
-    STATUS_INVALID_HANDLE          $C0000008
-    STATUS_STACK_OVERFLOW          $C00000FD
-    STATUS_ILLEGAL_INSTRUCTION     $C000001D
-    STATUS_NONCONTINUABLE_EXCEPTION $C0000025
-    STATUS_INT_DIVIDE_BY_ZERO      $C0000094
-    STATUS_PRIV_INSTRUCTION        $C0000096
-
-    Pascal/Delphi software exceptions ($0EEDFADE) have severity "success"
-    (top two bits = 00) and are NOT caught here - those go through the
-    normal try/except path. Debugger events (EXCEPTION_BREAKPOINT /
-    EXCEPTION_SINGLE_STEP, $80000003 / $80000004) are "information"
-    severity and not caught. C++ exceptions ($E06D7363) are "warning"
-    severity and not caught. }
   Result := (Code and $C0000000) = $C0000000;
 end;
+
+{ ---------- The actual backup ---------- }
 
 procedure DoBackup;
 var
@@ -153,17 +129,23 @@ var
   Stream: TFileStream;
   BOM: array[0..2] of Byte;
 begin
-  { Cannot do anything sensible if the global frame list isn't
-    initialized yet (very early startup). }
-  if AppFrameList1 = nil then Exit;
-  if AppFrameList1.Count = 0 then Exit;
+  LogStep('  [step] DoBackup entered');
 
-  { Find the focused editor by raw pointer comparison with
-    AppCodetreeState.Editor. AppCodetreeState.Editor is a weak pointer
-    (the app itself never dereferences it, only compares it), so reading
-    it here is safe even if the focused tab was closed and the pointer
-    is dangling - we just won't find a matching frame and fall back. }
+  if AppFrameList1 = nil then
+  begin
+    LogStep('  [step] AppFrameList1 is nil - aborting');
+    Exit;
+  end;
+
+  LogStep('  [step] AppFrameList1 count = ' + IntToStr(AppFrameList1.Count));
+  if AppFrameList1.Count = 0 then
+  begin
+    LogStep('  [step] AppFrameList1 is empty - aborting');
+    Exit;
+  end;
+
   Ed := nil;
+  LogStep('  [step] AppCodetreeState.Editor ptr = ' + IntToHex(PtrUInt(AppCodetreeState.Editor), 16));
   for i := 0 to AppFrameList1.Count - 1 do
   begin
     Frame := TEditorFrame(AppFrameList1.Items[i]);
@@ -172,14 +154,14 @@ begin
        (Frame.Ed2 = AppCodetreeState.Editor) then
     begin
       Ed := TATSynEdit(AppCodetreeState.Editor);
+      LogStep('  [step] Found focused editor at frame index ' + IntToStr(i));
       Break;
     end;
   end;
 
-  { Fallback: if the focused-editor pointer is stale, back up the first
-    available frame's primary editor. Better than nothing. }
   if Ed = nil then
   begin
+    LogStep('  [step] Focused editor not found, using fallback');
     for i := 0 to AppFrameList1.Count - 1 do
     begin
       Frame := TEditorFrame(AppFrameList1.Items[i]);
@@ -191,85 +173,124 @@ begin
     end;
   end;
 
-  if Ed = nil then Exit;
+  if Ed = nil then
+  begin
+    LogStep('  [step] No editor found at all - aborting');
+    Exit;
+  end;
 
-  { Only back up buffers with unsaved changes. }
-  if not Ed.Modified then Exit;
+  LogStep('  [step] Found editor, Ed1 ptr = ' + IntToHex(PtrUInt(Ed), 16));
+  LogStep('  [step] Ed.Modified = ' + BoolToStr(Ed.Modified, True));
+
+  if not Ed.Modified then
+  begin
+    LogStep('  [step] Editor not modified - aborting (file matches disk)');
+    Exit;
+  end;
 
   FileNameUTF8 := Ed.FileName;
+  LogStep('  [step] FileName = ' + AnsiString(FileNameUTF8));
 
   if FileNameUTF8 = '' then
-    BackupPath := GetTempDir(False) + 'cudatext_recovery.bak'
+  begin
+    BackupPath := GetTempDir(False) + 'cudatext_recovery.bak';
+    LogStep('  [step] Untitled tab, backup path = ' + AnsiString(BackupPath));
+  end
   else
+  begin
     BackupPath := FileNameUTF8 + '.bak';
+    LogStep('  [step] Backup path = ' + AnsiString(BackupPath));
+  end;
 
-  { Get text and convert to UTF-8 (with BOM so editors detect encoding
-    correctly when the .bak is opened later). }
+  LogStep('  [step] Reading Ed.Text');
   TextU := Ed.Text;
-  if TextU = '' then Exit;
+  LogStep('  [step] Ed.Text length = ' + IntToStr(Length(TextU)));
+  if TextU = '' then
+  begin
+    LogStep('  [step] Ed.Text is empty - aborting');
+    Exit;
+  end;
 
+  LogStep('  [step] UTF8 encoding');
   TextU8 := UTF8Encode(TextU);
+  LogStep('  [step] UTF8 length = ' + IntToStr(Length(TextU8)));
 
+  LogStep('  [step] Creating TFileStream');
   Stream := TFileStream.Create(BackupPath, fmCreate);
   try
+    LogStep('  [step] Writing BOM');
     BOM[0] := $EF; BOM[1] := $BB; BOM[2] := $BF;
     Stream.Write(BOM, 3);
+
+    LogStep('  [step] Writing text');
     if Length(TextU8) > 0 then
       Stream.Write(TextU8[1], Length(TextU8));
+
+    LogStep('  [step] Backup complete');
   finally
     Stream.Free;
   end;
 end;
 
-procedure TryDoBackup;
+procedure TryDoBackup(const HookName: AnsiString);
 begin
-  { Only one thread may attempt the backup at a time. InterlockedCompareExchange
-    is a single CPU instruction - it cannot deadlock, even if a second crash
-    happens re-entrantly while we're already inside. }
-  if InterlockedCompareExchange(CrashHandled, 1, 0) <> 0 then Exit;
+  if InterlockedCompareExchange(CrashHandled, 1, 0) <> 0 then
+  begin
+    LogStep('[' + HookName + '] already in progress, backing off');
+    Exit;
+  end;
   try
+    LogStep('[' + HookName + '] backup starting');
     try
       DoBackup;
     except
-      { Swallow - we're in a crash handler, nothing else we can do. }
+      on E: Exception do
+        LogStep('  [EXCEPTION] ' + AnsiString(E.ClassName) + ': ' + AnsiString(E.Message));
     end;
   finally
     InterlockedExchange(CrashHandled, 0);
+    LogStep('[' + HookName + '] backup finished');
   end;
 end;
 
-{ Windows-level hook: fires for every SEH exception on any thread.
-  This is the only hook that catches raw access violations on threads
-  FPC doesn't manage (e.g. CreateRemoteThread, plugin threads). }
+{ ---------- Hooks ---------- }
+
 function CrashVectoredFilter(ExceptionInfo: PExceptionPointers): LongInt; stdcall;
+var
+  Code: DWORD;
 begin
-  Result := EXCEPTION_CONTINUE_SEARCH;  // never swallow - just observe
+  Result := EXCEPTION_CONTINUE_SEARCH;
 
-  { Only act on genuinely fatal exception codes. This excludes Pascal
-    software exceptions, debugger events, and C++ exceptions - all of
-    which are handled by FPC's normal dispatch. }
-  if not IsFatalExceptionCode(DWORD(ExceptionInfo^.ExceptionRecord^.ExceptionCode)) then
+  Code := DWORD(ExceptionInfo^.ExceptionRecord^.ExceptionCode);
+  LogStep('[VEH] entered, exception code = ' + IntToHex(Code, 8));
+
+  if not IsFatalExceptionCode(Code) then
+  begin
+    LogStep('[VEH] non-fatal code, skipping backup');
     Exit;
+  end;
 
-  TryDoBackup;
+  LogStep('[VEH] fatal code, attempting backup');
+  TryDoBackup('VEH');
 end;
 
-{ FPC-level hook: called for unhandled Pascal exceptions on any thread. }
 procedure CrashExceptProc(Obj: TObject; Addr: Pointer; FrameCount: LongInt; Frames: PPointer);
 begin
-  TryDoBackup;
+  LogStep('[ExceptProc] entered');
+  TryDoBackup('ExceptProc');
   if Assigned(PrevExceptProc) then
     PrevExceptProc(Obj, Addr, FrameCount, Frames);
 end;
 
-{ LCL-level hook: called for exceptions that escape event handlers on
-  the main thread. }
 procedure TCrashExceptionHandler.HandleException(Sender: TObject; E: Exception);
 begin
-  TryDoBackup;
+  LogStep('[OnException] entered, exception = ' + AnsiString(E.ClassName) + ': ' + AnsiString(E.Message));
+  TryDoBackup('OnException');
   if Assigned(PrevOnException) then
     PrevOnException(Sender, E);
 end;
+
+{ ---------- Installation ---------- }
 
 procedure InstallCrashBackup;
 var
@@ -278,34 +299,37 @@ begin
   if Installed then Exit;
   Installed := True;
 
-  { Install the VEH FIRST, so it's at the head of the list and runs
-    before any other VEH someone else registered. }
+  LogStep('=== InstallCrashBackup starting ===');
+  LogStep('Installing VEH...');
   AddVectoredExceptionHandler(1, TCrashVectoredHandler(@CrashVectoredFilter));
+  LogStep('VEH installed');
 
-  { Reserve ~16 KB of stack on the main thread so the VEH handler has
-    room to run even after a stack overflow. }
+  LogStep('Setting stack guarantee...');
   StackGuarantee := CRASH_STACK_GUARANTEE;
   SetThreadStackGuarantee(StackGuarantee);
+  LogStep('Stack guarantee set');
 
+  LogStep('Creating crash handler object...');
   CrashHandler := TCrashExceptionHandler.Create;
 
-  { Hook FPC's unhandled-exception proc (covers Pascal exceptions on
-    background threads). }
+  LogStep('Hooking ExceptProc...');
   PrevExceptProc := ExceptProc;
   ExceptProc := @CrashExceptProc;
+  LogStep('ExceptProc hooked');
 
-  { Hook the LCL's OnException (covers main-thread UI crashes). }
+  LogStep('Hooking Application.OnException...');
   PrevOnException := Application.OnException;
   Application.OnException := @CrashHandler.HandleException;
+  LogStep('OnException hooked');
+
+  LogStep('=== InstallCrashBackup complete ===');
 end;
 
 procedure CrashBackup_RegisterThread;
 begin
-  { No-op. The VEH covers all threads automatically. Kept for API
-    compatibility in case external code calls it. }
 end;
 
-{$ELSE}  // non-Windows: provide no-op stubs so the unit compiles
+{$ELSE}
 
 procedure InstallCrashBackup;
 begin
