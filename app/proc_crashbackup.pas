@@ -3,11 +3,11 @@
   -----------------
   Crash backup for CudaText on Windows, with diagnostic logging.
 
-  When the program is about to terminate due to a fatal Windows
-  exception, this unit writes a backup copy of the currently focused
-  editor's text to "<originalfile>.<timestamp>.bak" next to the
-  original file (or to %TEMP%\cudatext_recovery_<timestamp>.bak for
-  untitled tabs).
+  When the program is about to terminate due to a fatal exception
+  that nothing caught, this unit writes a backup copy of the
+  currently focused editor's text to
+  "<originalfile>.<timestamp>.bak" next to the original file (or to
+  %TEMP%\cudatext_recovery_<timestamp>.bak for untitled tabs).
 
   The timestamp format is YYYYMMDD_HHMMSS, e.g. 20260323_130455.
 
@@ -19,26 +19,38 @@
     File>New, File>Open, split-view switches, etc.
 
   Crash detection:
-    We use ONLY AddVectoredExceptionHandler (VEH). VEH fires for every
-    Windows SEH exception on ANY thread - this is the only hook that
-    catches raw access violations on threads FPC doesn't manage (e.g.
-    CreateRemoteThread, plugin threads, foreign threads).
+    We use SetUnhandledExceptionFilter. This is the Windows API that
+    fires ONLY when an exception has propagated through every handler
+    in the application and nothing caught it - i.e. a real crash.
 
-    We filter to "error" severity codes (top two bits = 11) so we
-    don't fire for:
-      - Pascal/Delphi software exceptions ($0EEDFADE, severity "success")
-      - Debugger events (breakpoint, single-step, severity "information")
-      - C++ exceptions ($E06D7363, severity "warning")
+    This is fundamentally different from AddVectoredExceptionHandler
+    (VEH), which fires for EVERY exception including ones the
+    application is about to catch. CudaText's Python integration
+    raises Python errors as real SEH exceptions (code $E0465043,
+    .NET CLR exception, marked non-continuable) and then catches
+    them at a higher level. VEH sees these and creates false-positive
+    backups. SetUnhandledExceptionFilter does not, because by the
+    time it's called, the application has already had its chance to
+    catch the exception.
 
-    We do NOT hook:
-      - Application.OnException: fires for exceptions the LCL HANDLES
-        (shows in dialog/console, then continues) - not crashes.
-        Hooking it caused false positives for Python console errors.
-      - ExceptProc: fires for unhandled Pascal exceptions, but in
-        CudaText's case it fires for non-fatal Python errors that
-        CudaText recovers from. Hooking it caused the same false
-        positives. VEH covers the underlying SEH for almost all
-        real crashes anyway.
+    We chain to the previous filter (which FPC's RTL installs to
+    translate STATUS_ACCESS_VIOLATION etc. into EAccessViolation).
+    This preserves FPC's normal exception behavior.
+
+    Note: SetUnhandledExceptionFilter can be silently replaced by
+    other DLLs that call it themselves (the CRT does this on Vista+).
+    This is a known limitation. For CudaText this is not a practical
+    issue since FPC-built executables don't drag in the MSVC runtime
+    the way C++ apps do.
+
+  Installation timing:
+    InstallCrashBackup MUST be called after Application.CreateForm,
+    not in the unit's initialization section. Installing too early
+    (before FPC's RTL and the LCL are fully ready) breaks startup
+    because the unhandled-exception filter is a single global slot
+    and swapping it before FPC's runtime is fully ready can break
+    FPC's internal exception translation. By the time CreateForm
+    returns, all of FPC's and LCL's internal state is ready.
 
   Log file:
     Written to three locations (TEMP, exe dir, USERPROFILE) so we can
@@ -63,12 +75,15 @@ uses
   proc_globdata, form_frame, ATSynEdit;
 
 type
-  TCrashVectoredHandler = function(ExceptionInfo: PExceptionPointers): LongInt; stdcall;
+  { Signature of a top-level exception filter callback. Must match
+    the Windows LPTOP_LEVEL_EXCEPTION_FILTER type. }
+  TTopLevelExceptionFilter = function(ExceptionInfo: PExceptionPointers): LongInt; stdcall;
 
-function AddVectoredExceptionHandler(
-  FirstHandler: ULONG;
-  Handler: TCrashVectoredHandler
-): Pointer; stdcall; external 'kernel32' name 'AddVectoredExceptionHandler';
+{ SetUnhandledExceptionFilter is not declared in FPC's Windows unit on
+  all versions, so declare it manually as a kernel32 import. }
+function SetUnhandledExceptionFilter(
+  Filter: TTopLevelExceptionFilter
+): TTopLevelExceptionFilter; stdcall; external 'kernel32' name 'SetUnhandledExceptionFilter';
 
 function SetThreadStackGuarantee(
   var StackSizeInBytes: ULONG
@@ -79,6 +94,12 @@ const
   MAX_LOG_PATHS = 3;
 
 var
+  PrevFilter: TTopLevelExceptionFilter = nil;
+  { ChainToPrevFilter gates whether we may safely call PrevFilter. It is
+    set to True only after InstallCrashBackup has returned, so if the
+    filter is somehow called during installation we don't dereference
+    a half-initialized PrevFilter. }
+  ChainToPrevFilter: Boolean = False;
   CrashHandled: LongInt = 0;
   Installed: Boolean = False;
   LogPaths: array[0..MAX_LOG_PATHS-1] of UnicodeString;
@@ -167,28 +188,6 @@ begin
     LogLine(S);
   except
   end;
-end;
-
-function IsFatalExceptionCode(Code: DWORD): Boolean;
-begin
-  { "Error" severity codes (top two bits = 11) are always fatal crashes.
-    See the Microsoft NTSTATUS documentation for the severity field.
-
-    This excludes:
-    - Pascal/Delphi software exceptions ($0EEDFADE, severity "success")
-    - Debugger events (breakpoint $80000003, single-step $80000004)
-    - C++ exceptions ($E06D7363, severity "warning") }
-  Result := (Code and $C0000000) = $C0000000;
-end;
-
-function IsNonContinuable(ExceptionInfo: PExceptionPointers): Boolean;
-begin
-  { EXCEPTION_NONCONTINUABLE = 1. If this flag is set, the exception
-    CANNOT be resumed from - the program must terminate. This is the
-    most reliable signal that the exception is a real crash, not a
-    recoverable error. Pascal exceptions, C++ exceptions, and Python
-    exceptions are normally continuable (flag = 0). }
-  Result := (ExceptionInfo^.ExceptionRecord^.ExceptionFlags and 1) <> 0;
 end;
 
 { ---------- Timestamp formatting ---------- }
@@ -400,41 +399,36 @@ begin
   end;
 end;
 
-{ ---------- VEH hook ---------- }
+{ ---------- The unhandled exception filter ---------- }
 
-function CrashVectoredFilter(ExceptionInfo: PExceptionPointers): LongInt; stdcall;
+function CrashUnhandledFilter(ExceptionInfo: PExceptionPointers): LongInt; stdcall;
 var
   Code: DWORD;
-  NonCont: Boolean;
-  Fatal: Boolean;
 begin
-  Result := EXCEPTION_CONTINUE_SEARCH;
+  { This filter is ONLY called by Windows when an exception has
+    propagated through every try/except in the application and nothing
+    caught it. By definition, this is a real crash - the application
+    is about to terminate.
+
+    This is fundamentally different from VEH (AddVectoredExceptionHandler),
+    which fires for every exception including ones the application is
+    about to catch. CudaText's Python integration raises Python errors
+    as real SEH exceptions and catches them at a higher level - VEH
+    sees these and would create false-positive backups. This filter
+    does not, because if we're here, the exception was not caught. }
 
   Code := DWORD(ExceptionInfo^.ExceptionRecord^.ExceptionCode);
-  Fatal := IsFatalExceptionCode(Code);
-  NonCont := IsNonContinuable(ExceptionInfo);
-  LogStep('[VEH] entered, exception code = ' + IntToHex(Code, 8) +
-          ', fatal=' + BoolToStr(Fatal, True) +
-          ', noncontinuable=' + BoolToStr(NonCont, True));
+  LogStep('[UnhandledFilter] entered, exception code = ' + IntToHex(Code, 8));
 
-  { Only act if BOTH:
-    - The exception code is in the "error" severity range (excludes
-      Pascal software exceptions, debugger events, C++ exceptions)
-    - The exception is non-continuable (cannot be resumed from - the
-      program must terminate)
+  TryDoBackup('UnhandledFilter');
 
-    Pascal/C++/Python exceptions that CudaText catches and recovers
-    from are continuable (flag = 0), so they are filtered out here.
-    This prevents backups from being created for non-crashing errors
-    like Python console exceptions. }
-  if not (Fatal and NonCont) then
-  begin
-    LogStep('[VEH] recoverable or non-fatal, skipping backup');
-    Exit;
-  end;
-
-  LogStep('[VEH] fatal + non-continuable, attempting backup');
-  TryDoBackup('VEH');
+  { Chain to the previous filter (FPC's RTL filter) so FPC's normal
+    exception translation (STATUS_ACCESS_VIOLATION -> EAccessViolation
+    etc.) and crash dialog behavior continue to work as before. }
+  if ChainToPrevFilter and Assigned(PrevFilter) then
+    Result := PrevFilter(ExceptionInfo)
+  else
+    Result := EXCEPTION_CONTINUE_SEARCH;
 end;
 
 { ---------- Installation ---------- }
@@ -442,7 +436,6 @@ end;
 procedure InstallCrashBackup;
 var
   StackGuarantee: ULONG;
-  VehHandle: Pointer;
 begin
   if Installed then Exit;
   Installed := True;
@@ -453,9 +446,10 @@ begin
   LogStep('Log path[1] (EXE)  = ' + AnsiString(LogPaths[1]));
   LogStep('Log path[2] (HOME) = ' + AnsiString(LogPaths[2]));
 
-  LogStep('Installing VEH (only hook - no ExceptProc, no OnException)...');
-  VehHandle := AddVectoredExceptionHandler(1, TCrashVectoredHandler(@CrashVectoredFilter));
-  LogStep('VEH installed, handle = ' + IntToHex(PtrUInt(VehHandle), 16));
+  LogStep('Installing SetUnhandledExceptionFilter (chaining to FPC''s previous filter)...');
+  PrevFilter := SetUnhandledExceptionFilter(@CrashUnhandledFilter);
+  ChainToPrevFilter := True;
+  LogStep('Filter installed, prev filter ptr = ' + IntToHex(PtrUInt(PrevFilter), 16));
 
   LogStep('Setting stack guarantee...');
   StackGuarantee := CRASH_STACK_GUARANTEE;
