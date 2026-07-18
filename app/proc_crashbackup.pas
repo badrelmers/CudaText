@@ -3,36 +3,41 @@
   -----------------
   Crash backup for CudaText on Windows, with diagnostic logging.
 
-  When an unhandled exception is about to terminate the process, this
-  unit writes a backup copy of the currently focused editor's text to
-  "<originalfile>.bak" next to the original file (or to
-  %TEMP%\cudatext_recovery.bak for untitled tabs).
+  When the program is about to terminate due to an unhandled exception,
+  this unit writes a backup copy of the currently focused editor's text
+  to "<originalfile>.<timestamp>.bak" next to the original file (or to
+  %TEMP%\cudatext_recovery_<timestamp>.bak for untitled tabs).
+
+  The timestamp format is YYYYMMDD_HHMMSS, e.g. 20260323_130455.
 
   Focused editor detection:
     We read AppCrashBackup_FocusedEditor, a global shadow pointer
     declared in proc_globdata.pas and updated by TEditorFrame.EditorOnEnter
     in form_frame.pas. That handler is the central OnEnter callback wired
-    up for every TATSynEdit (line ~2362 of form_frame.pas:
-      ed.OnEnter:= @EditorOnEnter;
-    ), so it fires for EVERY focus path:
-      - Tab click in the tab bar
-      - File > New / File > Open (creates a new tab and focuses it)
-      - Split-view switch between Ed1/Ed2
-      - Clicking inside an editor
-      - Keyboard navigation that changes focus
+    up for every TATSynEdit, so it fires for every focus path: tab clicks,
+    File>New, File>Open, split-view switches, etc.
 
-    This is the same hook CudaText uses to fire the Python "on_focus"
-    event exposed to plugins - so it's the canonical "this editor just
-    got focus" notification.
+  Crash detection:
+    We use TWO hooks, each covering a different class of crash:
 
-    We don't need to subscribe to or replicate any focus-tracking logic
-    here - we just read the value CudaText already maintains.
+    1. AddVectoredExceptionHandler (VEH)
+       Fires for every Windows SEH exception on ANY thread. This is the
+       ONLY hook that catches raw access violations on threads FPC
+       doesn't manage (e.g. CreateRemoteThread, plugin threads).
 
-  Hooks:
-    1. AddVectoredExceptionHandler - fires for every SEH exception on
-       any thread (catches foreign-thread crashes, plugin crashes, etc.)
-    2. ExceptProc - unhandled Pascal exceptions on any thread
-    3. Application.OnException - main-thread UI crashes
+       We filter to "error" severity codes (top two bits = 11) so we
+       don't fire for Pascal software exceptions, debugger events, or
+       C++ exceptions.
+
+    2. ExceptProc (FPC RTL)
+       Fires for unhandled Pascal exceptions on any thread. This is the
+       canonical "program is terminating" notification - if ExceptProc
+       fires, the program is about to halt.
+
+    We do NOT hook Application.OnException. That hook fires for
+    exceptions the LCL is HANDLING (showing in a dialog or the console,
+    then continuing) - not for crashes. Hooking it caused backups to be
+    created for non-crashing errors like Python console exceptions.
 
   Log file:
     Written to three locations (TEMP, exe dir, USERPROFILE) so we can
@@ -60,7 +65,8 @@ type
   TCrashVectoredHandler = function(ExceptionInfo: PExceptionPointers): LongInt; stdcall;
   TCrashExceptionHandler = class
   public
-    procedure HandleException(Sender: TObject; E: Exception);
+    { Kept as a placeholder in case we need to re-add OnException later.
+      Currently no methods are assigned to any LCL event. }
   end;
 
 function AddVectoredExceptionHandler(
@@ -77,9 +83,7 @@ const
   MAX_LOG_PATHS = 3;
 
 var
-  CrashHandler: TCrashExceptionHandler = nil;
   PrevExceptProc: TExceptProc = nil;
-  PrevOnException: TExceptionEvent = nil;
   CrashHandled: LongInt = 0;
   Installed: Boolean = False;
   LogPaths: array[0..MAX_LOG_PATHS-1] of UnicodeString;
@@ -172,7 +176,43 @@ end;
 
 function IsFatalExceptionCode(Code: DWORD): Boolean;
 begin
+  { "Error" severity codes (top two bits = 11) are always fatal crashes.
+    See the Microsoft NTSTATUS documentation for the severity field. }
   Result := (Code and $C0000000) = $C0000000;
+end;
+
+{ ---------- Timestamp formatting (no FPC heap ops) ---------- }
+
+function ZeroPad2(N: Integer): AnsiString;
+begin
+  if N < 10 then
+    Result := '0' + IntToStr(N)
+  else
+    Result := IntToStr(N);
+end;
+
+function ZeroPad4(N: Integer): AnsiString;
+var
+  S: AnsiString;
+begin
+  S := IntToStr(N);
+  while Length(S) < 4 do
+    S := '0' + S;
+  Result := S;
+end;
+
+function FormatTimestamp: AnsiString;
+var
+  ST: TSystemTime;
+begin
+  GetLocalTime(ST);
+  Result :=
+    ZeroPad4(ST.wYear) +
+    ZeroPad2(ST.wMonth) +
+    ZeroPad2(ST.wDay) + '_' +
+    ZeroPad2(ST.wHour) +
+    ZeroPad2(ST.wMinute) +
+    ZeroPad2(ST.wSecond);
 end;
 
 { ---------- The actual backup ---------- }
@@ -190,6 +230,7 @@ var
   BOM: array[0..2] of Byte;
   ShadowEd: TATSynEdit;
   ShadowIsValid: Boolean;
+  Timestamp: AnsiString;
 begin
   LogStep('  [step] DoBackup entered');
 
@@ -206,14 +247,9 @@ begin
     Exit;
   end;
 
-  { Read the shadow pointer ONCE. It could be changed by the main thread
-    while we're reading it, but aligned pointer reads are atomic on
-    x86/x64, so we'll get either the old or new value - never a torn read. }
   ShadowEd := TATSynEdit(AppCrashBackup_FocusedEditor);
   LogStep('  [step] Shadow ptr (AppCrashBackup_FocusedEditor) = ' + IntToHex(PtrUInt(ShadowEd), 16));
 
-  { Verify the shadow pointer is still valid by finding it in the list.
-    If the tab was closed, the pointer would be dangling. }
   ShadowIsValid := False;
   if ShadowEd <> nil then
   begin
@@ -289,14 +325,17 @@ begin
   FileNameUTF8 := Ed.FileName;
   LogStep('  [step] FileName = ' + AnsiString(FileNameUTF8));
 
+  Timestamp := FormatTimestamp;
+  LogStep('  [step] Timestamp = ' + Timestamp);
+
   if FileNameUTF8 = '' then
   begin
-    BackupPath := GetTempDir(False) + 'cudatext_recovery.bak';
+    BackupPath := GetTempDir(False) + 'cudatext_recovery_' + string(Timestamp) + '.bak';
     LogStep('  [step] Untitled tab, backup path = ' + AnsiString(BackupPath));
   end
   else
   begin
-    BackupPath := FileNameUTF8 + '.bak';
+    BackupPath := FileNameUTF8 + '.' + string(Timestamp) + '.bak';
     LogStep('  [step] Backup path = ' + AnsiString(BackupPath));
   end;
 
@@ -374,18 +413,10 @@ end;
 
 procedure CrashExceptProc(Obj: TObject; Addr: Pointer; FrameCount: LongInt; Frames: PPointer);
 begin
-  LogStep('[ExceptProc] entered');
+  LogStep('[ExceptProc] entered - unhandled Pascal exception, program terminating');
   TryDoBackup('ExceptProc');
   if Assigned(PrevExceptProc) then
     PrevExceptProc(Obj, Addr, FrameCount, Frames);
-end;
-
-procedure TCrashExceptionHandler.HandleException(Sender: TObject; E: Exception);
-begin
-  LogStep('[OnException] entered, exception = ' + AnsiString(E.ClassName) + ': ' + AnsiString(E.Message));
-  TryDoBackup('OnException');
-  if Assigned(PrevOnException) then
-    PrevOnException(Sender, E);
 end;
 
 { ---------- Installation ---------- }
@@ -413,18 +444,10 @@ begin
   SetThreadStackGuarantee(StackGuarantee);
   LogStep('Stack guarantee set');
 
-  LogStep('Creating crash handler object...');
-  CrashHandler := TCrashExceptionHandler.Create;
-
-  LogStep('Hooking ExceptProc...');
+  LogStep('Hooking ExceptProc (NOT hooking Application.OnException)...');
   PrevExceptProc := ExceptProc;
   ExceptProc := @CrashExceptProc;
   LogStep('ExceptProc hooked');
-
-  LogStep('Hooking Application.OnException...');
-  PrevOnException := Application.OnException;
-  Application.OnException := @CrashHandler.HandleException;
-  LogStep('OnException hooked');
 
   LogStep('Initial shadow ptr = ' + IntToHex(PtrUInt(AppCrashBackup_FocusedEditor), 16));
 
