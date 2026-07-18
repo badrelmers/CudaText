@@ -68,6 +68,23 @@ uses
   Windows, SysUtils, Classes,
   proc_globdata, form_frame, ATSynEdit;
 
+type
+  { Signature of a vectored exception handler callback. Must match the
+    Windows PVECTORED_EXCEPTION_HANDLER type. }
+  TCrashVectoredHandler = function(ExceptionInfo: PExceptionPointers): LongInt; stdcall;
+
+{ These two Win32 APIs are not declared in FPC's Windows unit on all versions,
+  so declare them manually as kernel32 imports. Both are available on
+  Windows XP SP2 / Vista and later - which is well below CudaText's minimum. }
+function AddVectoredExceptionHandler(
+  FirstHandler: ULONG;
+  Handler: TCrashVectoredHandler
+): Pointer; stdcall; external 'kernel32' name 'AddVectoredExceptionHandler';
+
+function SetThreadStackGuarantee(
+  var StackSizeInBytes: ULONG
+): DWORD; stdcall; external 'kernel32' name 'SetThreadStackGuarantee';
+
 const
   CRASH_STACK_GUARANTEE = 16384;  // ~16 KB reserved for the handler to run in
 
@@ -242,7 +259,7 @@ begin
 
   { AddVectoredExceptionHandler(1, ...) installs our handler at the HEAD
     of the VEH list, so it runs first. }
-  AddVectoredExceptionHandler(1, @CrashBackupFilter);
+  AddVectoredExceptionHandler(1, TCrashVectoredHandler(@CrashBackupFilter));
 
   { Reserve ~16 KB of stack so the handler has room to run even after a
     stack overflow. This call only protects the calling thread - other
