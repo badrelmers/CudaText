@@ -3,34 +3,10 @@
   -----------------
   Crash backup for CudaText on Windows, with diagnostic logging.
 
-  When an unhandled exception is about to terminate the process, this
-  unit writes a backup copy of the currently focused editor's text to
-  "<originalfile>.bak" next to the original file (or to
-  %TEMP%\cudatext_recovery.bak for untitled tabs).
-
-  It also writes a step-by-step log to %TEMP%\cudatext_crash.log so we
-  can diagnose exactly where the backup fails if it does. The log uses
-  ONLY Win32 API calls (no FPC heap operations) so it works even when
-  the FPC heap is corrupted.
-
-  Design notes:
-
-  * THREE complementary hooks, each covering a different crash class:
-    1. AddVectoredExceptionHandler - every SEH exception on any thread
-       (the only hook that catches foreign-thread crashes like
-       CreateRemoteThread)
-    2. ExceptProc - unhandled Pascal exceptions on any thread
-    3. Application.OnException - main-thread UI crashes
-
-  * The VEH filters by exception code: only "error" severity codes
-    (top two bits = 11) trigger a backup.
-
-  * Atomic flag (InterlockedCompareExchange) serializes the backup.
-
-  * The VEH always returns EXCEPTION_CONTINUE_SEARCH - never swallows.
-
-  * Log writes use CreateFileW/WriteFile/CloseHandle per line, so a
-    crash mid-backup still leaves the previous log lines on disk.
+  Writes a step-by-step log to %TEMP%\cudatext_crash.log so we can see
+  exactly where (and whether) the hooks fire. The log uses ONLY Win32
+  API calls (no FPC heap operations) so it works even when the FPC heap
+  is corrupted.
 }
 unit proc_crashbackup;
 
@@ -74,30 +50,37 @@ var
   PrevOnException: TExceptionEvent = nil;
   CrashHandled: LongInt = 0;
   Installed: Boolean = False;
+  LogPath: UnicodeString = '';
 
 { ---------- Diagnostic logging (WinAPI only, no FPC heap) ---------- }
 
-procedure LogLine(const S: AnsiString);
+procedure InitLogPath;
 var
   PathBuf: array[0..MAX_PATH] of WideChar;
   PathLen: Integer;
-  FullPath: UnicodeString;
+begin
+  PathLen := GetTempPathW(MAX_PATH, @PathBuf[0]);
+  if PathLen = 0 then Exit;
+  SetString(LogPath, PChar(@PathBuf[0]), PathLen);
+  LogPath := LogPath + 'cudatext_crash.log';
+end;
+
+procedure LogLine(const S: AnsiString);
+var
   FileHandle: THandle;
   BytesWritten: DWORD;
   LineEnd: AnsiString;
 begin
-  PathLen := GetTempPathW(MAX_PATH, @PathBuf[0]);
-  if PathLen = 0 then Exit;
-  SetString(FullPath, PChar(@PathBuf[0]), PathLen);
-  FullPath := FullPath + 'cudatext_crash.log';
+  if LogPath = '' then Exit;
 
-  FileHandle := CreateFileW(PWideChar(FullPath),
+  FileHandle := CreateFileW(PWideChar(LogPath),
     FILE_APPEND_DATA, FILE_SHARE_READ or FILE_SHARE_WRITE, nil,
     OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
   if FileHandle = INVALID_HANDLE_VALUE then Exit;
 
   LineEnd := #13#10;
-  WriteFile(FileHandle, S[1], Length(S), BytesWritten, nil);
+  if Length(S) > 0 then
+    WriteFile(FileHandle, S[1], Length(S), BytesWritten, nil);
   WriteFile(FileHandle, LineEnd[1], 2, BytesWritten, nil);
   CloseHandle(FileHandle);
 end;
@@ -295,14 +278,18 @@ end;
 procedure InstallCrashBackup;
 var
   StackGuarantee: ULONG;
+  VehHandle: Pointer;
 begin
   if Installed then Exit;
   Installed := True;
 
+  InitLogPath;
   LogStep('=== InstallCrashBackup starting ===');
+  LogStep('Log path = ' + AnsiString(LogPath));
+
   LogStep('Installing VEH...');
-  AddVectoredExceptionHandler(1, TCrashVectoredHandler(@CrashVectoredFilter));
-  LogStep('VEH installed');
+  VehHandle := AddVectoredExceptionHandler(1, TCrashVectoredHandler(@CrashVectoredFilter));
+  LogStep('VEH installed, handle = ' + IntToHex(PtrUInt(VehHandle), 16));
 
   LogStep('Setting stack guarantee...');
   StackGuarantee := CRASH_STACK_GUARANTEE;
@@ -315,7 +302,7 @@ begin
   LogStep('Hooking ExceptProc...');
   PrevExceptProc := ExceptProc;
   ExceptProc := @CrashExceptProc;
-  LogStep('ExceptProc hooked');
+  LogStep('ExceptProc hooked, prev = ' + IntToHex(PtrUInt(@PrevExceptProc), 16));
 
   LogStep('Hooking Application.OnException...');
   PrevOnException := Application.OnException;
@@ -328,6 +315,12 @@ end;
 procedure CrashBackup_RegisterThread;
 begin
 end;
+
+initialization
+  { Initialize the log path as early as possible so we can confirm the
+    unit is being loaded at all. }
+  InitLogPath;
+  LogStep('[init] proc_crashbackup unit loaded');
 
 {$ELSE}
 
