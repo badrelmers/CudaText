@@ -146,6 +146,16 @@ var
     when the main thread updates the heartbeat again. }
   HangBackupDone: LongInt = 0;
 
+  { Path of the backup file created by the last hang. Stored as UTF-8
+    string (Lazarus default). When the main thread recovers from a
+    hang (heartbeat updates again), this file is deleted because the
+    user didn't actually lose any data. Cleared after deletion.
+    Synchronization: watchdog sets HangBackupDone=1 AND
+    LastHangBackupPath; main thread atomically claims HangBackupDone
+    back to 0 (via InterlockedCompareExchange), and only then reads
+    and deletes LastHangBackupPath. }
+  LastHangBackupPath: string = '';
+
 { ---------- Log path initialization ---------- }
 
 procedure InitLogPaths;
@@ -269,7 +279,7 @@ end;
 
 { ---------- The actual backup ---------- }
 
-procedure DoBackup;
+function DoBackup: string;
 var
   Ed: TATSynEdit;
   Frame: TEditorFrame;
@@ -284,6 +294,7 @@ var
   ShadowIsValid: Boolean;
   Timestamp: AnsiString;
 begin
+  Result := '';
   LogStep('  [step] DoBackup entered');
 
   if AppFrameList1 = nil then
@@ -416,12 +427,15 @@ begin
       Stream.Write(TextU8[1], Length(TextU8));
 
     LogStep('  [step] Backup complete');
+    Result := BackupPath;
   finally
     Stream.Free;
   end;
 end;
 
-procedure TryDoBackup(const HookName: AnsiString);
+procedure TryDoBackup(const HookName: AnsiString; IsHang: Boolean = False);
+var
+  BackupPath: string;
 begin
   if InterlockedCompareExchange(CrashHandled, 1, 0) <> 0 then
   begin
@@ -430,11 +444,19 @@ begin
   end;
   try
     LogStep('[' + HookName + '] backup starting');
+    BackupPath := '';
     try
-      DoBackup;
+      BackupPath := DoBackup;
     except
       on E: Exception do
         LogStep('  [EXCEPTION] ' + AnsiString(E.ClassName) + ': ' + AnsiString(E.Message));
+    end;
+    { If this was a hang backup and it actually wrote a file, remember
+      the path so the main thread can delete it on recovery. }
+    if IsHang and (BackupPath <> '') then
+    begin
+      LastHangBackupPath := BackupPath;
+      LogStep('[' + HookName + '] recorded hang backup path for deletion on recovery: ' + AnsiString(BackupPath));
     end;
   finally
     InterlockedExchange(CrashHandled, 0);
@@ -462,6 +484,8 @@ end;
 { ---------- Hang detection: heartbeat + watchdog ---------- }
 
 procedure TCrashHeartbeat.HandleTimer(Sender: TObject);
+var
+  PathToDelete: string;
 begin
   { Called by TTimer via WM_TIMER on the main thread. WM_TIMER only
     fires when the message loop is pumping - if the main thread is
@@ -469,9 +493,45 @@ begin
     watchdog triggers a backup.
     Cast DWORD to LongInt for storage (see MainThreadHeartbeat decl). }
   InterlockedExchange(MainThreadHeartbeat, LongInt(GetTickCount));
-  { Main thread is alive - reset the hang-backup-done flag so a future
-    hang can also be backed up. }
-  InterlockedExchange(HangBackupDone, 0);
+
+  { Main thread is alive. If we previously created a hang backup and
+    the main thread has now recovered, delete the backup file because
+    the user didn't actually lose any data.
+
+    We use InterlockedCompareExchange to atomically claim the
+    HangBackupDone flag back to 0. If it was already 0, no hang backup
+    was done - nothing to delete. If it was 1, we just claimed it, and
+    LastHangBackupPath now holds the path the watchdog wrote. We copy
+    it to a local, clear the global, then delete the file.
+
+    The watchdog may be writing to LastHangBackupPath at the same time
+    on another thread, but only when it has HangBackupDone=1 - and we
+    just atomically set HangBackupDone=0, so the watchdog will skip
+    the backup branch on its next iteration. There's a tiny race
+    window where the watchdog already set HangBackupDone=1 but hasn't
+    written LastHangBackupPath yet - in that case we'll see an empty
+    path and skip deletion, leaving the file. That's acceptable: a
+    stray backup file is far better than losing data. }
+  if InterlockedCompareExchange(HangBackupDone, 0, 1) = 1 then
+  begin
+    PathToDelete := LastHangBackupPath;
+    LastHangBackupPath := '';
+    if PathToDelete <> '' then
+    begin
+      LogStep('[Heartbeat] main thread recovered from hang, deleting backup: ' + AnsiString(PathToDelete));
+      try
+        if FileExists(PathToDelete) then
+          DeleteFile(PathToDelete);
+      except
+        on E: Exception do
+          LogStep('[Heartbeat] exception deleting backup: ' + AnsiString(E.ClassName) + ': ' + AnsiString(E.Message));
+      end;
+    end
+    else
+    begin
+      LogStep('[Heartbeat] main thread recovered, but no hang backup path was recorded (race?)');
+    end;
+  end;
 end;
 
 procedure TCrashWatchdogThread.Execute;
@@ -504,7 +564,7 @@ begin
         thread updates the heartbeat again (i.e. recovers). }
       if InterlockedCompareExchange(HangBackupDone, 1, 0) = 0 then
       begin
-        TryDoBackup('Watchdog');
+        TryDoBackup('Watchdog', True);
       end
       else
       begin
