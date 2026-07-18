@@ -1,11 +1,12 @@
 {
   proc_crashbackup
   -----------------
-  Crash backup for CudaText on Windows, with diagnostic logging.
+  Crash AND hang backup for CudaText on Windows, with diagnostic logging.
 
   When the program is about to terminate due to a fatal exception
-  that nothing caught, this unit writes a backup copy of the
-  currently focused editor's text to
+  that nothing caught, OR when the main thread hangs for more than
+  HANG_THRESHOLD_MS milliseconds, this unit writes a backup copy of
+  the currently focused editor's text to
   "<originalfile>.<timestamp>.bak" next to the original file (or to
   %TEMP%\cudatext_recovery_<timestamp>.bak for untitled tabs).
 
@@ -37,20 +38,30 @@
     translate STATUS_ACCESS_VIOLATION etc. into EAccessViolation).
     This preserves FPC's normal exception behavior.
 
-    Note: SetUnhandledExceptionFilter can be silently replaced by
-    other DLLs that call it themselves (the CRT does this on Vista+).
-    This is a known limitation. For CudaText this is not a practical
-    issue since FPC-built executables don't drag in the MSVC runtime
-    the way C++ apps do.
+  Hang detection:
+    A "hang" is when the main thread stops processing messages
+    (stuck in an infinite loop, deadlock, or blocking syscall). No
+    exception is raised - the main thread is just stuck. Windows
+    detects this after ~5 seconds of no message processing and shows
+    the "Application Not Responding" / AppHangB1 dialog.
+
+    We detect hangs with a TTimer + watchdog thread:
+    1. A TTimer (firing on the main thread via WM_TIMER every
+       HEARTBEAT_INTERVAL_MS) updates a global "heartbeat" timestamp.
+       WM_TIMER only fires when the message loop is pumping messages -
+       if the main thread hangs, the timer stops firing.
+    2. A background watchdog thread checks the heartbeat every
+       WATCHDOG_CHECK_MS. If the heartbeat is more than
+       HANG_THRESHOLD_MS stale, the watchdog runs the backup.
+    3. If the main thread recovers (heartbeat updates again), the
+       watchdog resets so future hangs also get backed up.
+
+    This catches the AppHangB1 case: by the time Windows shows the
+    "Wait or Kill" dialog, our watchdog has already written the
+    backup, so clicking "Kill" doesn't lose data.
 
   Installation timing:
-    InstallCrashBackup MUST be called after Application.CreateForm,
-    not in the unit's initialization section. Installing too early
-    (before FPC's RTL and the LCL are fully ready) breaks startup
-    because the unhandled-exception filter is a single global slot
-    and swapping it before FPC's runtime is fully ready can break
-    FPC's internal exception translation. By the time CreateForm
-    returns, all of FPC's and LCL's internal state is ready.
+    InstallCrashBackup MUST be called after Application.CreateForm.
 
   Log file:
     Written to three locations (TEMP, exe dir, USERPROFILE) so we can
@@ -71,13 +82,26 @@ implementation
 {$IFDEF WINDOWS}
 
 uses
-  Windows, SysUtils, Classes, Forms,
+  Windows, SysUtils, Classes, Forms, ExtCtrls,
   proc_globdata, form_frame, ATSynEdit;
 
 type
   { Signature of a top-level exception filter callback. Must match
     the Windows LPTOP_LEVEL_EXCEPTION_FILTER type. }
   TTopLevelExceptionFilter = function(ExceptionInfo: PExceptionPointers): LongInt; stdcall;
+
+  { Provides the method pointer for TTimer.OnTimer. }
+  TCrashHeartbeat = class
+  public
+    procedure HandleTimer(Sender: TObject);
+  end;
+
+  { Watchdog thread that monitors the main thread heartbeat and
+    triggers a backup if the main thread hangs. }
+  TCrashWatchdogThread = class(TThread)
+  protected
+    procedure Execute; override;
+  end;
 
 { SetUnhandledExceptionFilter is not declared in FPC's Windows unit on
   all versions, so declare it manually as a kernel32 import. }
@@ -92,17 +116,31 @@ function SetThreadStackGuarantee(
 const
   CRASH_STACK_GUARANTEE = 16384;
   MAX_LOG_PATHS = 3;
+  HEARTBEAT_INTERVAL_MS = 1000;   { TTimer fires every 1 second }
+  WATCHDOG_CHECK_MS = 1000;       { Watchdog checks every 1 second }
+  HANG_THRESHOLD_MS = 7000;       { User-requested: 7 seconds = hang }
 
 var
   PrevFilter: TTopLevelExceptionFilter = nil;
-  { ChainToPrevFilter gates whether we may safely call PrevFilter. It is
-    set to True only after InstallCrashBackup has returned, so if the
-    filter is somehow called during installation we don't dereference
-    a half-initialized PrevFilter. }
   ChainToPrevFilter: Boolean = False;
   CrashHandled: LongInt = 0;
   Installed: Boolean = False;
   LogPaths: array[0..MAX_LOG_PATHS-1] of UnicodeString;
+
+  Heartbeat: TCrashHeartbeat = nil;
+  HeartbeatTimer: TTimer = nil;
+  WatchdogThread: TCrashWatchdogThread = nil;
+
+  { Heartbeat timestamp - updated by the main thread via TTimer,
+    read by the watchdog thread. Aligned 32-bit reads/writes are
+    atomic on x86/x64, but we use InterlockedExchange for clarity
+    and portability. DWORD subtraction handles GetTickCount
+    wraparound (every ~49 days) correctly via modular arithmetic. }
+  MainThreadHeartbeat: DWORD = 0;
+  { 0 = no hang backup done yet (or main thread recovered since last hang).
+    1 = hang backup already done for the current hang. Reset to 0
+    when the main thread updates the heartbeat again. }
+  HangBackupDone: LongInt = 0;
 
 { ---------- Log path initialization ---------- }
 
@@ -399,36 +437,75 @@ begin
   end;
 end;
 
-{ ---------- The unhandled exception filter ---------- }
+{ ---------- Crash detection: unhandled exception filter ---------- }
 
 function CrashUnhandledFilter(ExceptionInfo: PExceptionPointers): LongInt; stdcall;
 var
   Code: DWORD;
 begin
-  { This filter is ONLY called by Windows when an exception has
-    propagated through every try/except in the application and nothing
-    caught it. By definition, this is a real crash - the application
-    is about to terminate.
-
-    This is fundamentally different from VEH (AddVectoredExceptionHandler),
-    which fires for every exception including ones the application is
-    about to catch. CudaText's Python integration raises Python errors
-    as real SEH exceptions and catches them at a higher level - VEH
-    sees these and would create false-positive backups. This filter
-    does not, because if we're here, the exception was not caught. }
-
   Code := DWORD(ExceptionInfo^.ExceptionRecord^.ExceptionCode);
   LogStep('[UnhandledFilter] entered, exception code = ' + IntToHex(Code, 8));
 
   TryDoBackup('UnhandledFilter');
 
-  { Chain to the previous filter (FPC's RTL filter) so FPC's normal
-    exception translation (STATUS_ACCESS_VIOLATION -> EAccessViolation
-    etc.) and crash dialog behavior continue to work as before. }
   if ChainToPrevFilter and Assigned(PrevFilter) then
     Result := PrevFilter(ExceptionInfo)
   else
     Result := EXCEPTION_CONTINUE_SEARCH;
+end;
+
+{ ---------- Hang detection: heartbeat + watchdog ---------- }
+
+procedure TCrashHeartbeat.HandleTimer(Sender: TObject);
+begin
+  { Called by TTimer via WM_TIMER on the main thread. WM_TIMER only
+    fires when the message loop is pumping - if the main thread is
+    stuck, this never fires, the heartbeat goes stale, and the
+    watchdog triggers a backup. }
+  InterlockedExchange(MainThreadHeartbeat, LongInt(GetTickCount));
+  { Main thread is alive - reset the hang-backup-done flag so a future
+    hang can also be backed up. }
+  InterlockedExchange(HangBackupDone, 0);
+end;
+
+procedure TCrashWatchdogThread.Execute;
+var
+  Now: DWORD;
+  LastHB: DWORD;
+  Diff: DWORD;
+begin
+  LogStep('[Watchdog] thread started');
+  while not Terminated do
+  begin
+    Sleep(WATCHDOG_CHECK_MS);
+
+    Now := GetTickCount;
+    { Atomic read of the heartbeat. InterlockedExchangeAdd with 0
+      returns the old value without modifying it. }
+    LastHB := DWORD(InterlockedExchangeAdd(MainThreadHeartbeat, 0));
+
+    { DWORD subtraction handles GetTickCount wraparound correctly
+      via modular arithmetic. }
+    Diff := Now - LastHB;
+
+    if Diff > HANG_THRESHOLD_MS then
+    begin
+      LogStep('[Watchdog] hang detected, heartbeat age = ' + IntToStr(Int64(Diff)) + 'ms');
+
+      { Only do the backup ONCE per hang. If we already did it,
+        don't spam more backups. The flag is reset when the main
+        thread updates the heartbeat again (i.e. recovers). }
+      if InterlockedCompareExchange(HangBackupDone, 1, 0) = 0 then
+      begin
+        TryDoBackup('Watchdog');
+      end
+      else
+      begin
+        LogStep('[Watchdog] hang backup already done for this hang, waiting for recovery');
+      end;
+    end;
+  end;
+  LogStep('[Watchdog] thread terminating');
 end;
 
 { ---------- Installation ---------- }
@@ -455,6 +532,20 @@ begin
   StackGuarantee := CRASH_STACK_GUARANTEE;
   SetThreadStackGuarantee(StackGuarantee);
   LogStep('Stack guarantee set');
+
+  LogStep('Setting up hang detection (heartbeat timer + watchdog thread)...');
+  Heartbeat := TCrashHeartbeat.Create;
+  HeartbeatTimer := TTimer.Create(nil);
+  HeartbeatTimer.Interval := HEARTBEAT_INTERVAL_MS;
+  HeartbeatTimer.OnTimer := @Heartbeat.HandleTimer;
+  HeartbeatTimer.Enabled := True;
+  { Seed the initial heartbeat so the watchdog doesn't immediately
+    fire before the first WM_TIMER arrives. }
+  InterlockedExchange(MainThreadHeartbeat, LongInt(GetTickCount));
+  LogStep('Heartbeat timer installed, interval = ' + IntToStr(HEARTBEAT_INTERVAL_MS) + 'ms');
+
+  WatchdogThread := TCrashWatchdogThread.Create(False);
+  LogStep('Watchdog thread started, hang threshold = ' + IntToStr(HANG_THRESHOLD_MS) + 'ms');
 
   LogStep('Initial shadow ptr = ' + IntToHex(PtrUInt(AppCrashBackup_FocusedEditor), 16));
 
