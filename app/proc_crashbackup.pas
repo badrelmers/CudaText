@@ -3,10 +3,11 @@
   -----------------
   Crash backup for CudaText on Windows, with diagnostic logging.
 
-  When the program is about to terminate due to an unhandled exception,
-  this unit writes a backup copy of the currently focused editor's text
-  to "<originalfile>.<timestamp>.bak" next to the original file (or to
-  %TEMP%\cudatext_recovery_<timestamp>.bak for untitled tabs).
+  When the program is about to terminate due to a fatal Windows
+  exception, this unit writes a backup copy of the currently focused
+  editor's text to "<originalfile>.<timestamp>.bak" next to the
+  original file (or to %TEMP%\cudatext_recovery_<timestamp>.bak for
+  untitled tabs).
 
   The timestamp format is YYYYMMDD_HHMMSS, e.g. 20260323_130455.
 
@@ -18,26 +19,26 @@
     File>New, File>Open, split-view switches, etc.
 
   Crash detection:
-    We use TWO hooks, each covering a different class of crash:
+    We use ONLY AddVectoredExceptionHandler (VEH). VEH fires for every
+    Windows SEH exception on ANY thread - this is the only hook that
+    catches raw access violations on threads FPC doesn't manage (e.g.
+    CreateRemoteThread, plugin threads, foreign threads).
 
-    1. AddVectoredExceptionHandler (VEH)
-       Fires for every Windows SEH exception on ANY thread. This is the
-       ONLY hook that catches raw access violations on threads FPC
-       doesn't manage (e.g. CreateRemoteThread, plugin threads).
+    We filter to "error" severity codes (top two bits = 11) so we
+    don't fire for:
+      - Pascal/Delphi software exceptions ($0EEDFADE, severity "success")
+      - Debugger events (breakpoint, single-step, severity "information")
+      - C++ exceptions ($E06D7363, severity "warning")
 
-       We filter to "error" severity codes (top two bits = 11) so we
-       don't fire for Pascal software exceptions, debugger events, or
-       C++ exceptions.
-
-    2. ExceptProc (FPC RTL)
-       Fires for unhandled Pascal exceptions on any thread. This is the
-       canonical "program is terminating" notification - if ExceptProc
-       fires, the program is about to halt.
-
-    We do NOT hook Application.OnException. That hook fires for
-    exceptions the LCL is HANDLING (showing in a dialog or the console,
-    then continuing) - not for crashes. Hooking it caused backups to be
-    created for non-crashing errors like Python console exceptions.
+    We do NOT hook:
+      - Application.OnException: fires for exceptions the LCL HANDLES
+        (shows in dialog/console, then continues) - not crashes.
+        Hooking it caused false positives for Python console errors.
+      - ExceptProc: fires for unhandled Pascal exceptions, but in
+        CudaText's case it fires for non-fatal Python errors that
+        CudaText recovers from. Hooking it caused the same false
+        positives. VEH covers the underlying SEH for almost all
+        real crashes anyway.
 
   Log file:
     Written to three locations (TEMP, exe dir, USERPROFILE) so we can
@@ -63,11 +64,6 @@ uses
 
 type
   TCrashVectoredHandler = function(ExceptionInfo: PExceptionPointers): LongInt; stdcall;
-  TCrashExceptionHandler = class
-  public
-    { Kept as a placeholder in case we need to re-add OnException later.
-      Currently no methods are assigned to any LCL event. }
-  end;
 
 function AddVectoredExceptionHandler(
   FirstHandler: ULONG;
@@ -83,7 +79,6 @@ const
   MAX_LOG_PATHS = 3;
 
 var
-  PrevExceptProc: TExceptProc = nil;
   CrashHandled: LongInt = 0;
   Installed: Boolean = False;
   LogPaths: array[0..MAX_LOG_PATHS-1] of UnicodeString;
@@ -177,11 +172,16 @@ end;
 function IsFatalExceptionCode(Code: DWORD): Boolean;
 begin
   { "Error" severity codes (top two bits = 11) are always fatal crashes.
-    See the Microsoft NTSTATUS documentation for the severity field. }
+    See the Microsoft NTSTATUS documentation for the severity field.
+
+    This excludes:
+    - Pascal/Delphi software exceptions ($0EEDFADE, severity "success")
+    - Debugger events (breakpoint $80000003, single-step $80000004)
+    - C++ exceptions ($E06D7363, severity "warning") }
   Result := (Code and $C0000000) = $C0000000;
 end;
 
-{ ---------- Timestamp formatting (no FPC heap ops) ---------- }
+{ ---------- Timestamp formatting ---------- }
 
 function ZeroPad2(N: Integer): AnsiString;
 begin
@@ -390,7 +390,7 @@ begin
   end;
 end;
 
-{ ---------- Hooks ---------- }
+{ ---------- VEH hook ---------- }
 
 function CrashVectoredFilter(ExceptionInfo: PExceptionPointers): LongInt; stdcall;
 var
@@ -411,14 +411,6 @@ begin
   TryDoBackup('VEH');
 end;
 
-procedure CrashExceptProc(Obj: TObject; Addr: Pointer; FrameCount: LongInt; Frames: PPointer);
-begin
-  LogStep('[ExceptProc] entered - unhandled Pascal exception, program terminating');
-  TryDoBackup('ExceptProc');
-  if Assigned(PrevExceptProc) then
-    PrevExceptProc(Obj, Addr, FrameCount, Frames);
-end;
-
 { ---------- Installation ---------- }
 
 procedure InstallCrashBackup;
@@ -435,7 +427,7 @@ begin
   LogStep('Log path[1] (EXE)  = ' + AnsiString(LogPaths[1]));
   LogStep('Log path[2] (HOME) = ' + AnsiString(LogPaths[2]));
 
-  LogStep('Installing VEH...');
+  LogStep('Installing VEH (only hook - no ExceptProc, no OnException)...');
   VehHandle := AddVectoredExceptionHandler(1, TCrashVectoredHandler(@CrashVectoredFilter));
   LogStep('VEH installed, handle = ' + IntToHex(PtrUInt(VehHandle), 16));
 
@@ -443,11 +435,6 @@ begin
   StackGuarantee := CRASH_STACK_GUARANTEE;
   SetThreadStackGuarantee(StackGuarantee);
   LogStep('Stack guarantee set');
-
-  LogStep('Hooking ExceptProc (NOT hooking Application.OnException)...');
-  PrevExceptProc := ExceptProc;
-  ExceptProc := @CrashExceptProc;
-  LogStep('ExceptProc hooked');
 
   LogStep('Initial shadow ptr = ' + IntToHex(PtrUInt(AppCrashBackup_FocusedEditor), 16));
 
