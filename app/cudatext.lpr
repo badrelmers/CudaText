@@ -6,9 +6,9 @@ uses
   {$IFDEF UNIX}
   cthreads,
   {$ENDIF}
-  proc_crashbackup, //crash backup support (filter installed after main form is created)
-  proc_inittick,
   Interfaces, // this includes the LCL widgetset
+  proc_inittick,
+  proc_crashbackup, //crash backup support (filter installed after main form is created)
   SysUtils, Forms, lazcontrols, FormMain, form_console, form_menu_commands,
   form_goto, form_menu_list, form_tabs_save, form_confirm_rep, form_lexer_prop,
   form_lexer_lib, form_color_setup, form_about, form_keys, form_char_map,
