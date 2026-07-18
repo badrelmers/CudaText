@@ -46,6 +46,7 @@ type
   TCrashExceptionHandler = class
   public
     procedure HandleException(Sender: TObject; E: Exception);
+    procedure HandleActiveControlChange(Sender: TObject);
   end;
 
 function AddVectoredExceptionHandler(
@@ -138,6 +139,7 @@ begin
     OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
   if FileHandle = INVALID_HANDLE_VALUE then Exit;
 
+  BytesWritten := 0;
   LineEnd := #13#10;
   if Length(S) > 0 then
     WriteFile(FileHandle, S[1], Length(S), BytesWritten, nil);
@@ -202,7 +204,7 @@ begin
     CrashBackup_FocusedEditor := NewEd;
 end;
 
-procedure CrashScreenActiveControlChange(Sender: TObject);
+procedure TCrashExceptionHandler.HandleActiveControlChange(Sender: TObject);
 begin
   try
     UpdateFocusedEditor;
@@ -466,7 +468,7 @@ begin
 
   LogStep('Hooking Screen.OnActiveControlChange...');
   PrevOnActiveControlChange := Screen.OnActiveControlChange;
-  Screen.OnActiveControlChange := @CrashScreenActiveControlChange;
+  Screen.OnActiveControlChange := @CrashHandler.HandleActiveControlChange;
   LogStep('OnActiveControlChange hooked');
 
   { Do an initial focus scan so the shadow is populated even before
