@@ -6,7 +6,7 @@ uses
   {$IFDEF UNIX}
   cthreads,
   {$ENDIF}
-  proc_crashbackup, //install vectored exception handler as early as possible
+  proc_crashbackup, //crash backup support (filter installed after main form is created)
   proc_inittick,
   Interfaces, // this includes the LCL widgetset
   SysUtils, Forms, lazcontrols, FormMain, form_console, form_menu_commands,
@@ -31,5 +31,6 @@ begin
   RequireDerivedFormResource:= True;
   Application.Initialize;
   Application.CreateForm(TfmMain, fmMain);
+  InstallCrashBackup; //install unhandled-exception filter after main form is created
   Application.Run;
 end.
