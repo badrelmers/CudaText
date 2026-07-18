@@ -3,10 +3,14 @@
   -----------------
   Crash backup for CudaText on Windows, with diagnostic logging.
 
-  Writes a step-by-step log to %TEMP%\cudatext_crash.log so we can see
-  exactly where (and whether) the hooks fire. The log uses ONLY Win32
-  API calls (no FPC heap operations) so it works even when the FPC heap
-  is corrupted.
+  Writes a step-by-step log to MULTIPLE locations so we can find it
+  no matter what:
+    1. %TEMP%\cudatext_crash.log          (user temp dir)
+    2. <exe_dir>\cudatext_crash.log       (next to cudatext.exe)
+    3. %USERPROFILE%\cudatext_crash.log   (user home dir)
+
+  At install time, also shows a MessageBox so we have visual proof
+  the unit is being loaded even if all file logging fails.
 }
 unit proc_crashbackup;
 
@@ -43,6 +47,7 @@ function SetThreadStackGuarantee(
 
 const
   CRASH_STACK_GUARANTEE = 16384;
+  MAX_LOG_PATHS = 3;
 
 var
   CrashHandler: TCrashExceptionHandler = nil;
@@ -50,30 +55,72 @@ var
   PrevOnException: TExceptionEvent = nil;
   CrashHandled: LongInt = 0;
   Installed: Boolean = False;
-  LogPath: UnicodeString = '';
+  LogPaths: array[0..MAX_LOG_PATHS-1] of UnicodeString;
+
+{ ---------- Log path initialization ---------- }
+
+procedure InitLogPaths;
+var
+  TempBuf: array[0..MAX_PATH] of WideChar;
+  TempLen: Integer;
+  ExeBuf: array[0..MAX_PATH] of WideChar;
+  ExeLen: Integer;
+  HomeBuf: array[0..MAX_PATH] of WideChar;
+  HomeLen: Integer;
+  i, LastSlash: Integer;
+begin
+  for i := 0 to MAX_LOG_PATHS - 1 do
+    LogPaths[i] := '';
+
+  { 1. %TEMP%\cudatext_crash.log }
+  TempLen := GetTempPathW(MAX_PATH, @TempBuf[0]);
+  if (TempLen > 0) and (TempLen < MAX_PATH) then
+  begin
+    { IMPORTANT: use PWideChar, NOT PChar. In {$mode objfpc}{$H+},
+      PChar = PAnsiChar, which would feed wide-char data into the
+      AnsiString SetString overload and produce a garbage UnicodeString. }
+    SetString(LogPaths[0], PWideChar(@TempBuf[0]), TempLen);
+    if (Length(LogPaths[0]) > 0) and (LogPaths[0][Length(LogPaths[0])] <> '\') then
+      LogPaths[0] := LogPaths[0] + '\';
+    LogPaths[0] := LogPaths[0] + 'cudatext_crash.log';
+  end;
+
+  { 2. <exe_dir>\cudatext_crash.log }
+  ExeLen := GetModuleFileNameW(0, @ExeBuf[0], MAX_PATH);
+  if (ExeLen > 0) and (ExeLen < MAX_PATH) then
+  begin
+    LastSlash := -1;
+    for i := 0 to ExeLen - 1 do
+      if ExeBuf[i] = '\' then LastSlash := i;
+    if LastSlash >= 0 then
+    begin
+      SetString(LogPaths[1], PWideChar(@ExeBuf[0]), LastSlash + 1);
+      LogPaths[1] := LogPaths[1] + 'cudatext_crash.log';
+    end;
+  end;
+
+  { 3. %USERPROFILE%\cudatext_crash.log }
+  HomeLen := GetEnvironmentVariableW('USERPROFILE', @HomeBuf[0], MAX_PATH);
+  if (HomeLen > 0) and (HomeLen < MAX_PATH) then
+  begin
+    SetString(LogPaths[2], PWideChar(@HomeBuf[0]), HomeLen);
+    if (Length(LogPaths[2]) > 0) and (LogPaths[2][Length(LogPaths[2])] <> '\') then
+      LogPaths[2] := LogPaths[2] + '\';
+    LogPaths[2] := LogPaths[2] + 'cudatext_crash.log';
+  end;
+end;
 
 { ---------- Diagnostic logging (WinAPI only, no FPC heap) ---------- }
 
-procedure InitLogPath;
-var
-  PathBuf: array[0..MAX_PATH] of WideChar;
-  PathLen: Integer;
-begin
-  PathLen := GetTempPathW(MAX_PATH, @PathBuf[0]);
-  if PathLen = 0 then Exit;
-  SetString(LogPath, PChar(@PathBuf[0]), PathLen);
-  LogPath := LogPath + 'cudatext_crash.log';
-end;
-
-procedure LogLine(const S: AnsiString);
+procedure LogToPath(const Path: UnicodeString; const S: AnsiString);
 var
   FileHandle: THandle;
   BytesWritten: DWORD;
   LineEnd: AnsiString;
 begin
-  if LogPath = '' then Exit;
+  if Path = '' then Exit;
 
-  FileHandle := CreateFileW(PWideChar(LogPath),
+  FileHandle := CreateFileW(PWideChar(Path),
     FILE_APPEND_DATA, FILE_SHARE_READ or FILE_SHARE_WRITE, nil,
     OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
   if FileHandle = INVALID_HANDLE_VALUE then Exit;
@@ -83,6 +130,14 @@ begin
     WriteFile(FileHandle, S[1], Length(S), BytesWritten, nil);
   WriteFile(FileHandle, LineEnd[1], 2, BytesWritten, nil);
   CloseHandle(FileHandle);
+end;
+
+procedure LogLine(const S: AnsiString);
+var
+  i: Integer;
+begin
+  for i := 0 to MAX_LOG_PATHS - 1 do
+    LogToPath(LogPaths[i], S);
 end;
 
 procedure LogStep(const S: AnsiString);
@@ -279,13 +334,27 @@ procedure InstallCrashBackup;
 var
   StackGuarantee: ULONG;
   VehHandle: Pointer;
+  Msg: UnicodeString;
 begin
   if Installed then Exit;
   Installed := True;
 
-  InitLogPath;
+  InitLogPaths;
   LogStep('=== InstallCrashBackup starting ===');
-  LogStep('Log path = ' + AnsiString(LogPath));
+  LogStep('Log path[0] (TEMP) = ' + AnsiString(LogPaths[0]));
+  LogStep('Log path[1] (EXE)  = ' + AnsiString(LogPaths[1]));
+  LogStep('Log path[2] (HOME) = ' + AnsiString(LogPaths[2]));
+
+  { Visual confirmation that the unit is loaded and InstallCrashBackup
+    is being called. Even if all file logging fails, the user will see
+    this popup. Comment out the MessageBoxW call once diagnostics are
+    no longer needed. }
+  Msg := 'CudaText CrashBackup installed.' + #13#10 +
+         'Log paths:' + #13#10 +
+         '  [0] ' + LogPaths[0] + #13#10 +
+         '  [1] ' + LogPaths[1] + #13#10 +
+         '  [2] ' + LogPaths[2];
+  MessageBoxW(0, PWideChar(Msg), 'CudaText CrashBackup', MB_OK or MB_ICONINFORMATION);
 
   LogStep('Installing VEH...');
   VehHandle := AddVectoredExceptionHandler(1, TCrashVectoredHandler(@CrashVectoredFilter));
@@ -302,7 +371,7 @@ begin
   LogStep('Hooking ExceptProc...');
   PrevExceptProc := ExceptProc;
   ExceptProc := @CrashExceptProc;
-  LogStep('ExceptProc hooked, prev = ' + IntToHex(PtrUInt(@PrevExceptProc), 16));
+  LogStep('ExceptProc hooked');
 
   LogStep('Hooking Application.OnException...');
   PrevOnException := Application.OnException;
@@ -317,9 +386,7 @@ begin
 end;
 
 initialization
-  { Initialize the log path as early as possible so we can confirm the
-    unit is being loaded at all. }
-  InitLogPath;
+  InitLogPaths;
   LogStep('[init] proc_crashbackup unit loaded');
 
 {$ELSE}
