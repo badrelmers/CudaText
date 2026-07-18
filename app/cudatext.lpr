@@ -6,6 +6,7 @@ uses
   {$IFDEF UNIX}
   cthreads,
   {$ENDIF}
+  proc_crashbackup, //install vectored exception handler as early as possible
   proc_inittick,
   Interfaces, // this includes the LCL widgetset
   SysUtils, Forms, lazcontrols, FormMain, form_console, form_menu_commands,
