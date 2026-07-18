@@ -9,15 +9,30 @@
   %TEMP%\cudatext_recovery.bak for untitled tabs).
 
   Focused editor detection:
-    We maintain our own shadow pointer CrashBackup_FocusedEditor that is
-    updated by Screen.OnActiveControlChange (fires on the main thread
-    whenever focus moves between controls). The VEH handler reads this
-    pointer - no LCL method calls from the crash handler.
+    We read AppCrashBackup_FocusedEditor, a global shadow pointer
+    declared in proc_globdata.pas and updated by TEditorFrame.EditorOnEnter
+    in form_frame.pas. That handler is the central OnEnter callback wired
+    up for every TATSynEdit (line ~2362 of form_frame.pas:
+      ed.OnEnter:= @EditorOnEnter;
+    ), so it fires for EVERY focus path:
+      - Tab click in the tab bar
+      - File > New / File > Open (creates a new tab and focuses it)
+      - Split-view switch between Ed1/Ed2
+      - Clicking inside an editor
+      - Keyboard navigation that changes focus
 
-    We only UPDATE the shadow when an editor actually has focus, so if
-    the user clicks on a menu, tree, or other non-editor control, the
-    shadow keeps pointing to the last editor they were typing in. This
-    matches the user expectation: "the file I was editing".
+    This is the same hook CudaText uses to fire the Python "on_focus"
+    event exposed to plugins - so it's the canonical "this editor just
+    got focus" notification.
+
+    We don't need to subscribe to or replicate any focus-tracking logic
+    here - we just read the value CudaText already maintains.
+
+  Hooks:
+    1. AddVectoredExceptionHandler - fires for every SEH exception on
+       any thread (catches foreign-thread crashes, plugin crashes, etc.)
+    2. ExceptProc - unhandled Pascal exceptions on any thread
+    3. Application.OnException - main-thread UI crashes
 
   Log file:
     Written to three locations (TEMP, exe dir, USERPROFILE) so we can
@@ -46,7 +61,6 @@ type
   TCrashExceptionHandler = class
   public
     procedure HandleException(Sender: TObject; E: Exception);
-    procedure HandleActiveControlChange(Sender: TObject);
   end;
 
 function AddVectoredExceptionHandler(
@@ -66,16 +80,9 @@ var
   CrashHandler: TCrashExceptionHandler = nil;
   PrevExceptProc: TExceptProc = nil;
   PrevOnException: TExceptionEvent = nil;
-  PrevOnActiveControlChange: TNotifyEvent = nil;
   CrashHandled: LongInt = 0;
   Installed: Boolean = False;
   LogPaths: array[0..MAX_LOG_PATHS-1] of UnicodeString;
-
-  { Shadow pointer to the editor that most recently had keyboard focus.
-    Written by the main thread (in OnActiveControlChange), read by any
-    thread (in the VEH). Aligned pointer writes are atomic on x86/x64,
-    so no lock is needed. }
-  CrashBackup_FocusedEditor: TATSynEdit = nil;
 
 { ---------- Log path initialization ---------- }
 
@@ -168,52 +175,6 @@ begin
   Result := (Code and $C0000000) = $C0000000;
 end;
 
-{ ---------- Focused editor tracking ---------- }
-
-procedure UpdateFocusedEditor;
-var
-  i: Integer;
-  Frame: TEditorFrame;
-  NewEd: TATSynEdit;
-begin
-  NewEd := nil;
-  if AppFrameList1 <> nil then
-  begin
-    for i := 0 to AppFrameList1.Count - 1 do
-    begin
-      Frame := TEditorFrame(AppFrameList1.Items[i]);
-      if Frame = nil then Continue;
-      { Calling .Focused is safe here - this runs on the main thread
-        in the OnActiveControlChange handler. }
-      if (Frame.Ed1 <> nil) and Frame.Ed1.Focused then
-      begin
-        NewEd := Frame.Ed1;
-        Break;
-      end;
-      if (Frame.Ed2 <> nil) and Frame.Ed2.Focused then
-      begin
-        NewEd := Frame.Ed2;
-        Break;
-      end;
-    end;
-  end;
-  { Only update if we found an editor. If focus moved to a non-editor
-    control (menu, tree, etc.), keep the shadow pointing to the last
-    editor that had focus - that's the file the user was editing. }
-  if NewEd <> nil then
-    CrashBackup_FocusedEditor := NewEd;
-end;
-
-procedure TCrashExceptionHandler.HandleActiveControlChange(Sender: TObject);
-begin
-  try
-    UpdateFocusedEditor;
-  except
-  end;
-  if Assigned(PrevOnActiveControlChange) then
-    PrevOnActiveControlChange(Sender);
-end;
-
 { ---------- The actual backup ---------- }
 
 procedure DoBackup;
@@ -248,8 +209,8 @@ begin
   { Read the shadow pointer ONCE. It could be changed by the main thread
     while we're reading it, but aligned pointer reads are atomic on
     x86/x64, so we'll get either the old or new value - never a torn read. }
-  ShadowEd := CrashBackup_FocusedEditor;
-  LogStep('  [step] Shadow ptr = ' + IntToHex(PtrUInt(ShadowEd), 16));
+  ShadowEd := TATSynEdit(AppCrashBackup_FocusedEditor);
+  LogStep('  [step] Shadow ptr (AppCrashBackup_FocusedEditor) = ' + IntToHex(PtrUInt(ShadowEd), 16));
 
   { Verify the shadow pointer is still valid by finding it in the list.
     If the tab was closed, the pointer would be dangling. }
@@ -279,7 +240,6 @@ begin
   begin
     LogStep('  [step] Shadow ptr nil or stale, trying AppCodetreeState.Editor');
     LogStep('  [step] AppCodetreeState.Editor ptr = ' + IntToHex(PtrUInt(AppCodetreeState.Editor), 16));
-    { Try AppCodetreeState.Editor next }
     if AppCodetreeState.Editor <> nil then
     begin
       for i := 0 to AppFrameList1.Count - 1 do
@@ -466,16 +426,7 @@ begin
   Application.OnException := @CrashHandler.HandleException;
   LogStep('OnException hooked');
 
-  LogStep('Hooking Screen.OnActiveControlChange...');
-  PrevOnActiveControlChange := Screen.OnActiveControlChange;
-  Screen.OnActiveControlChange := @CrashHandler.HandleActiveControlChange;
-  LogStep('OnActiveControlChange hooked');
-
-  { Do an initial focus scan so the shadow is populated even before
-    the user moves focus. }
-  LogStep('Doing initial focus scan...');
-  UpdateFocusedEditor;
-  LogStep('Initial shadow ptr = ' + IntToHex(PtrUInt(CrashBackup_FocusedEditor), 16));
+  LogStep('Initial shadow ptr = ' + IntToHex(PtrUInt(AppCrashBackup_FocusedEditor), 16));
 
   LogStep('=== InstallCrashBackup complete ===');
 end;
