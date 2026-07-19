@@ -67,24 +67,26 @@ Copyright (c) Alexey Torgashin
        didn't actually lose any data.
 
   Backup file:
-    Written via a thread-safe manual write: CreateFileW / WriteFile /
-    CloseHandle (Win32 API only, no FPC heap ops in the write path),
-    iterating Ed.Strings.Lines[i] per-line and writing the editor's
-    line ending (read from Ed.Strings.Endings) after each line.
+    Written via Ed.Strings.SaveToStream (the low-level method that
+    SaveToFile calls internally). This preserves the original file's
+    encoding (UTF-8 / UTF-16 LE/BE / UTF-32 LE/BE / ANSI), BOM
+    presence, and line endings (CRLF/LF/CR) EXACTLY as CudaText
+    would save them - byte-for-byte identical to a normal save.
 
-    We do NOT use Ed.Strings.SaveToFile because it internally calls
-    TThread.Synchronize for progress reporting on large files
-    (>65536 lines), which fails with "EThread: CheckSynchronize
-    called from non-main thread" when invoked from our watchdog
-    thread or a crashed worker thread.
+    We use SaveToStream instead of SaveToFile for two reasons:
+    1. SaveToFile fires the OnProgress event every ~65536 lines,
+       and TATSynEdit's progress handler uses TThread.Synchronize
+       to update the UI. This fails with "EThread: CheckSynchronize
+       called from non-main thread" when invoked from our watchdog
+       thread or a crashed worker thread. We temporarily nil
+       OnProgress to suppress this.
+    2. SaveToFile touches editor state (Modified, undo buffer) even
+       with AsCopy=True. SaveToStream is the lowest-level "just write
+       the bytes" method and touches nothing.
 
-    Line endings (CRLF/LF/CR) are preserved exactly. Encoding is
-    always UTF-8 with BOM - if the original file was UTF-16 or ANSI,
-    the backup will be UTF-8 (acceptable for crash recovery; the user
-    can re-encode after recovering their content). The editor's
-    Modified flag, FileName, and ModifiedVersion are NOT touched,
-    so CudaText's session-restore on next startup still sees the
-    file as having unsaved changes.
+    The editor's Modified flag, FileName, and ModifiedVersion are
+    NOT touched, so CudaText's session-restore on next startup still
+    sees the file as having unsaved changes.
 
   Log file:
     Written to <AppDir_Settings>\crash_backup\cudatext_crash_backup.log.
@@ -113,7 +115,7 @@ implementation
 
 uses
   Windows, SysUtils, Classes, Forms, ExtCtrls,
-  proc_globdata, form_frame, ATSynEdit, ATStrings, ATStringProc;
+  proc_globdata, form_frame, ATSynEdit, ATStrings, ATStringProc, EncConv;
 
 type
   { Signature of a top-level exception filter callback. Must match
@@ -325,88 +327,88 @@ end;
 
 { ---------- The actual backup ---------- }
 
-{ Write the editor's text to a file using only Win32 API calls
-  (CreateFileW / WriteFile / CloseHandle) and per-line iteration.
-  This avoids Ed.Strings.SaveToFile, which internally uses
-  TThread.Synchronize for progress reporting on large files and
-  fails with "EThread: CheckSynchronize called from non-main thread"
-  when called from our watchdog thread or a crashed worker thread.
+{ Write the editor's text to a file, preserving the original encoding
+  (UTF-8/UTF-16/UTF-32/ANSI), BOM presence, and line endings (CRLF/LF/CR)
+  exactly as CudaText would save them.
 
-  Line endings are preserved by reading Ed.Strings.Endings and
-  writing the appropriate bytes (CRLF / LF / CR) after each line.
-  The file is written as UTF-8 with BOM - this matches what most
-  text files use today. If the original file was UTF-16 or ANSI,
-  the backup will be UTF-8 (the user can re-encode after recovery).
+  We use Ed.Strings.SaveToStream directly (the low-level method that
+  SaveToFile calls internally) instead of Ed.Strings.SaveToFile for
+  two reasons:
+
+  1. SaveToFile internally fires the OnProgress event every
+     ~65536 lines. The progress handler registered by TATSynEdit
+     uses TThread.Synchronize to update the UI, which fails with
+     "EThread: CheckSynchronize called from non-main thread" when
+     invoked from our watchdog thread or a crashed worker thread.
+     We temporarily nil OnProgress to suppress this.
+
+  2. SaveToFile (with AsCopy=False) clears the undo buffer and sets
+     Modified:=False via DoFinalizeSaving. Even with AsCopy=True it's
+     safer to use SaveToStream, which is the lowest-level "just write
+     the bytes" method and touches no editor state at all.
+
+  SaveToStream uses a TStream interface - we pass a TFileStream wrapped
+  in a TMemoryStream buffer (matching what SaveToFile does internally)
+  for efficiency on large files.
 
   Returns True on success, False on failure. }
 function WriteBackupManual(Ed: TATSynEdit; const BackupPath: string): Boolean;
 var
-  FileHandle: THandle;
-  BytesWritten: DWORD;
-  BOM: array[0..2] of Byte;
-  LineEnd: AnsiString;
-  LineU: UnicodeString;
-  LineU8: RawByteString;
-  Utf8Len: Integer;
-  i: Integer;
-  Count: Integer;
-  PathW: UnicodeString;
+  FS: TFileStream;
+  MS: TMemoryStream;
+  OldOnProgress: TATStringsProgressEvent;
+  OldEncConvErrorMode: TEncConvErrorMode;
 begin
   Result := False;
 
-  PathW := UTF8Decode(BackupPath);
-  FileHandle := CreateFileW(PWideChar(PathW),
-    GENERIC_WRITE, 0, nil, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
-  if FileHandle = INVALID_HANDLE_VALUE then Exit;
-
   try
-    { UTF-8 BOM }
-    BOM[0] := $EF; BOM[1] := $BB; BOM[2] := $BF;
-    if not WriteFile(FileHandle, BOM, 3, BytesWritten, nil) then Exit;
-
-    { Determine line ending bytes from the editor's Endings property. }
-    case Ed.Strings.Endings of
-      TATLineEnds.Windows: LineEnd := #13#10;
-      TATLineEnds.Mac:    LineEnd := #13;
-    else
-      { TATLineEnds.Unix and any other value }
-      LineEnd := #10;
-    end;
-
-    Count := Ed.Strings.Count;
-    for i := 0 to Count - 1 do
-    begin
-      LineU := Ed.Strings.Lines[i];
-
-      { Convert UnicodeString to UTF-8. }
-      if Length(LineU) > 0 then
-      begin
-        Utf8Len := WideCharToMultiByte(CP_UTF8, 0,
-          PWideChar(LineU), Length(LineU),
-          nil, 0, nil, nil);
-        if Utf8Len > 0 then
-        begin
-          SetLength(LineU8, Utf8Len);
-          if WideCharToMultiByte(CP_UTF8, 0,
-            PWideChar(LineU), Length(LineU),
-            PAnsiChar(LineU8), Utf8Len, nil, nil) = 0 then
-            Exit;
-          if not WriteFile(FileHandle, LineU8[1], Utf8Len, BytesWritten, nil) then Exit;
+    FS := TFileStream.Create(BackupPath, fmCreate);
+    try
+      MS := TMemoryStream.Create;
+      try
+        { Temporarily disable the progress callback so SaveToStream
+          doesn't fire OnProgress (which would call TThread.Synchronize
+          via TATSynEdit's handler and fail on non-main threads). }
+        OldOnProgress := Ed.Strings.OnProgress;
+        Ed.Strings.OnProgress := nil;
+        try
+          { EncConvErrorMode controls what happens when a character
+            can't be converted to the target encoding (e.g. a Unicode
+            char that doesn't exist in the ANSI codepage). Set to
+            eemException to match SaveToFile's behavior - if conversion
+            fails, we want to know about it (the file is left
+            half-written, but at least we tried). }
+          OldEncConvErrorMode := EncConvErrorMode;
+          EncConvErrorMode := eemException;
+          try
+            Ed.Strings.SaveToStream(MS,
+              Ed.Strings.Encoding,
+              Ed.Strings.IsSavingWithSignature);
+          finally
+            EncConvErrorMode := OldEncConvErrorMode;
+          end;
+        finally
+          Ed.Strings.OnProgress := OldOnProgress;
         end;
-      end;
 
-      { Write line ending (skip after the last line to match typical
-        text file convention - though many editors do write a trailing
-        newline, omitting it here is safer for diff tools). }
-      if i < Count - 1 then
-      begin
-        if not WriteFile(FileHandle, LineEnd[1], Length(LineEnd), BytesWritten, nil) then Exit;
+        { Copy the memory stream to the file stream. }
+        MS.Seek(0, soFromBeginning);
+        FS.Size := 0;
+        FS.Seek(0, soFromBeginning);
+        FS.CopyFrom(MS, MS.Size);
+      finally
+        MS.Free;
       end;
+      Result := True;
+    finally
+      FS.Free;
     end;
-
-    Result := True;
-  finally
-    CloseHandle(FileHandle);
+  except
+    on E: Exception do
+    begin
+      LogStep('[backup] WriteBackupManual exception: ' + AnsiString(E.ClassName) + ': ' + AnsiString(E.Message));
+      Result := False;
+    end;
   end;
 end;
 
@@ -525,17 +527,9 @@ begin
 
   LogStep('[backup] path = ' + AnsiString(BackupPath));
 
-  { Write the backup using a thread-safe manual write (WinAPI only,
-    per-line iteration). We do NOT use Ed.Strings.SaveToFile because
-    it internally calls TThread.Synchronize for progress reporting
-    on large files (>65536 lines), which fails with
-    "EThread: CheckSynchronize called from non-main thread" when
-    invoked from our watchdog thread or a crashed worker thread.
-
-    Trade-off: line endings are preserved (read from Ed.Strings.Endings),
-    but the encoding is always UTF-8 with BOM. If the original file was
-    UTF-16 or ANSI, the backup will be UTF-8 - the user can re-encode
-    after recovery. This is acceptable for crash recovery. }
+  { Write the backup using SaveToStream with OnProgress temporarily
+    disabled. This preserves encoding/BOM/line-endings exactly while
+    being thread-safe (no TThread.Synchronize calls). }
   if WriteBackupManual(Ed, BackupPath) then
   begin
     LogStep('[backup] complete');
