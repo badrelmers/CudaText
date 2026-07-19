@@ -358,8 +358,29 @@ var
   MS: TMemoryStream;
   OldOnProgress: TATStringsProgressEvent;
   OldEncConvErrorMode: TEncConvErrorMode;
+  WithSignature: Boolean;
 begin
   Result := False;
+
+  { Determine whether to write a BOM. This replicates the private
+    TATStrings.IsSavingWithSignature method, which we can't call
+    directly because it's in the private section. The logic is:
+      ANSI       -> no BOM
+      UTF-8      -> BOM if Ed.Strings.SaveSignUtf8 (a public property)
+      UTF-16/32  -> BOM if Ed.Strings.SaveSignWide (a public property) }
+  case Ed.Strings.Encoding of
+    TATFileEncoding.ANSI:
+      WithSignature := False;
+    TATFileEncoding.UTF8:
+      WithSignature := Ed.Strings.SaveSignUtf8;
+    TATFileEncoding.UTF16LE,
+    TATFileEncoding.UTF16BE,
+    TATFileEncoding.UTF32LE,
+    TATFileEncoding.UTF32BE:
+      WithSignature := Ed.Strings.SaveSignWide;
+  else
+    WithSignature := False;
+  end;
 
   try
     FS := TFileStream.Create(BackupPath, fmCreate);
@@ -383,7 +404,7 @@ begin
           try
             Ed.Strings.SaveToStream(MS,
               Ed.Strings.Encoding,
-              Ed.Strings.IsSavingWithSignature);
+              WithSignature);
           finally
             EncConvErrorMode := OldEncConvErrorMode;
           end;
