@@ -7,8 +7,11 @@
   that nothing caught, OR when the main thread hangs for more than
   HANG_THRESHOLD_MS milliseconds, this unit writes a backup copy of
   the currently focused editor's text to
-  "<originalfile>.<timestamp>.CTbak" next to the original file (or to
-  %TEMP%\cudatext_recovery_<timestamp>.CTbak for untitled tabs).
+  "<originalfile>.<timestamp>.CTbak" next to the original file (for
+  named files), or to
+  <AppDir_Settings>\crash_backup\cudatext_recovery_<timestamp>.CTbak
+  (for untitled tabs, with %TEMP% as a fallback if the settings
+  folder is not writable).
 
   The timestamp format is YYYYMMDD_HHMMSS, e.g. 20260323_130455.
 
@@ -66,12 +69,12 @@
     startup still sees the file as having unsaved changes.
 
   Log file:
-    Written to <AppDir_Settings>\cudatext_crash_backup.log (CudaText's
-    settings folder). Only meaningful events are logged - crashes,
-    hangs, backups, recoveries, and errors. Startup/installation
-    noise is NOT logged. Uses only Win32 API calls (CreateFileW /
-    WriteFile / CloseHandle) so the log works even if the FPC heap
-    is corrupted.
+    Written to <AppDir_Settings>\crash_backup\cudatext_crash_backup.log.
+    Each line is prefixed with "YYYY-MM-DD HH:MM:SS ". Only meaningful
+    events are logged - crashes, hangs, backups, recoveries, and errors.
+    Startup/installation noise is NOT logged. Uses only Win32 API calls
+    (CreateFileW / WriteFile / CloseHandle) so the log works even if
+    the FPC heap is corrupted.
 
   Installation timing:
     InstallCrashBackup MUST be called after Application.CreateForm,
@@ -139,6 +142,9 @@ var
   CrashHandled: LongInt = 0;
   Installed: Boolean = False;
   LogPath: UnicodeString = '';
+  { Folder where backups and the log are stored:
+    <AppDir_Settings>\crash_backup\. Created at install time. }
+  CrashBackupDir: string = '';
 
   Heartbeat: TCrashHeartbeat = nil;
   HeartbeatTimer: TTimer = nil;
@@ -165,45 +171,32 @@ procedure InitLogPath;
 begin
   { Use CudaText's settings folder. AppDir_Settings is set during
     CudaText's initialization, which has completed by the time
-    InstallCrashBackup is called (after Application.CreateForm). }
-  if AppDir_Settings <> '' then
-    LogPath := UnicodeString(AppDir_Settings) + '\cudatext_crash_backup.log'
-  else
-    LogPath := '';
-end;
+    InstallCrashBackup is called (after Application.CreateForm).
 
-{ ---------- Diagnostic logging (WinAPI only, no FPC heap) ---------- }
+    All crash-backup artifacts (log file + untitled-tab backups) live
+    in a dedicated subfolder <AppDir_Settings>\crash_backup\. }
+  LogPath := '';
+  CrashBackupDir := '';
+  if AppDir_Settings = '' then Exit;
 
-procedure LogLine(const S: AnsiString);
-var
-  FileHandle: THandle;
-  BytesWritten: DWORD;
-  LineEnd: AnsiString;
-begin
-  if LogPath = '' then Exit;
+  CrashBackupDir := AppDir_Settings + '\crash_backup';
 
-  FileHandle := CreateFileW(PWideChar(LogPath),
-    FILE_APPEND_DATA, FILE_SHARE_READ or FILE_SHARE_WRITE, nil,
-    OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
-  if FileHandle = INVALID_HANDLE_VALUE then Exit;
-
-  BytesWritten := 0;
-  LineEnd := #13#10;
-  if Length(S) > 0 then
-    WriteFile(FileHandle, S[1], Length(S), BytesWritten, nil);
-  WriteFile(FileHandle, LineEnd[1], 2, BytesWritten, nil);
-  CloseHandle(FileHandle);
-end;
-
-procedure LogStep(const S: AnsiString);
-begin
+  { Create the folder if it doesn't exist. ForceDirectories creates
+    all intermediate directories too. Wrapped in try/except because
+    directory creation can fail (permissions, disk full, etc.) - if
+    it fails, we just won't write logs/backups there, which is
+    acceptable degradation. }
   try
-    LogLine(S);
+    if not DirectoryExists(CrashBackupDir) then
+      ForceDirectories(CrashBackupDir);
   except
   end;
+
+  LogPath := UnicodeString(CrashBackupDir) + '\cudatext_crash_backup.log';
 end;
 
-{ ---------- Timestamp formatting ---------- }
+{ ---------- Timestamp formatting ----------
+  Declared before the logging functions because LogLine uses them. }
 
 function ZeroPad2(N: Integer): AnsiString;
 begin
@@ -236,6 +229,50 @@ begin
     ZeroPad2(ST.wHour) +
     ZeroPad2(ST.wMinute) +
     ZeroPad2(ST.wSecond);
+end;
+
+{ ---------- Diagnostic logging (WinAPI only, no FPC heap) ---------- }
+
+procedure LogLine(const S: AnsiString);
+var
+  FileHandle: THandle;
+  BytesWritten: DWORD;
+  LineEnd: AnsiString;
+  ST: TSystemTime;
+  FullLine: AnsiString;
+begin
+  if LogPath = '' then Exit;
+
+  FileHandle := CreateFileW(PWideChar(LogPath),
+    FILE_APPEND_DATA, FILE_SHARE_READ or FILE_SHARE_WRITE, nil,
+    OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+  if FileHandle = INVALID_HANDLE_VALUE then Exit;
+
+  { Prefix every line with a timestamp: YYYY-MM-DD HH:MM:SS. }
+  FillChar(ST, SizeOf(ST), 0);
+  GetLocalTime(ST);
+  FullLine :=
+    ZeroPad4(ST.wYear) + '-' +
+    ZeroPad2(ST.wMonth) + '-' +
+    ZeroPad2(ST.wDay) + ' ' +
+    ZeroPad2(ST.wHour) + ':' +
+    ZeroPad2(ST.wMinute) + ':' +
+    ZeroPad2(ST.wSecond) + ' ' + S;
+
+  BytesWritten := 0;
+  LineEnd := #13#10;
+  if Length(FullLine) > 0 then
+    WriteFile(FileHandle, FullLine[1], Length(FullLine), BytesWritten, nil);
+  WriteFile(FileHandle, LineEnd[1], 2, BytesWritten, nil);
+  CloseHandle(FileHandle);
+end;
+
+procedure LogStep(const S: AnsiString);
+begin
+  try
+    LogLine(S);
+  except
+  end;
 end;
 
 { ---------- The actual backup ---------- }
@@ -320,7 +357,17 @@ begin
   Timestamp := FormatTimestamp;
 
   if FileNameUTF8 = '' then
-    BackupPath := GetTempDir(False) + 'cudatext_recovery_' + string(Timestamp) + '.CTbak'
+  begin
+    { Untitled tab: try to save inside <settings>/crash_backup/ first.
+      If that fails (e.g. settings folder not writable), fall back to
+      the system temp folder. We try the preferred path with
+      Ed.Strings.SaveToFile and catch any exception to redirect to the
+      fallback path. }
+    if CrashBackupDir <> '' then
+      BackupPath := CrashBackupDir + '\cudatext_recovery_' + string(Timestamp) + '.CTbak'
+    else
+      BackupPath := GetTempDir(False) + 'cudatext_recovery_' + string(Timestamp) + '.CTbak';
+  end
   else
     BackupPath := FileNameUTF8 + '.' + string(Timestamp) + '.CTbak';
 
@@ -330,7 +377,10 @@ begin
     writes the file with the editor's current line endings (CRLF/LF/CR),
     encoding (UTF-8/UTF-16/ANSI), and BOM exactly as the original file,
     WITHOUT changing any editor state. The 'true' parameter means "don't
-    update Modified, don't update FileName, don't bump ModifiedVersion". }
+    update Modified, don't update FileName, don't bump ModifiedVersion".
+
+    For untitled tabs, if the save to CrashBackupDir fails, we retry
+    with the temp folder as a fallback. }
   try
     Ed.Strings.SaveToFile(BackupPath, True);
     LogStep('[backup] complete');
@@ -338,7 +388,24 @@ begin
   except
     on E: Exception do
     begin
-      LogStep('[backup] FAILED: ' + AnsiString(E.ClassName) + ': ' + AnsiString(E.Message));
+      { If this was an untitled-tab save to CrashBackupDir, retry in temp. }
+      if (FileNameUTF8 = '') and (CrashBackupDir <> '') and
+         (Pos(AnsiString(CrashBackupDir), AnsiString(BackupPath)) > 0) then
+      begin
+        BackupPath := GetTempDir(False) + 'cudatext_recovery_' + string(Timestamp) + '.CTbak';
+        LogStep('[backup] retrying in temp folder: ' + AnsiString(BackupPath));
+        try
+          Ed.Strings.SaveToFile(BackupPath, True);
+          LogStep('[backup] complete (temp folder)');
+          Result := BackupPath;
+          Exit;
+        except
+          on E2: Exception do
+            LogStep('[backup] FAILED in both locations: ' + AnsiString(E2.ClassName) + ': ' + AnsiString(E2.Message));
+        end;
+      end
+      else
+        LogStep('[backup] FAILED: ' + AnsiString(E.ClassName) + ': ' + AnsiString(E.Message));
       Result := '';
     end;
   end;
