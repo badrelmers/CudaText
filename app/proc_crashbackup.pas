@@ -67,13 +67,24 @@ Copyright (c) Alexey Torgashin
        didn't actually lose any data.
 
   Backup file:
-    Written via Ed.Strings.SaveToFile(path, True) - CudaText's own
-    "save copy" function. Preserves line endings (CRLF/LF/CR),
-    encoding (UTF-8/UTF-16/ANSI), and BOM exactly as the original
-    file. The True parameter means "don't update Modified, don't
-    update FileName, don't bump ModifiedVersion" - the editor's
-    state stays untouched, so CudaText's session-restore on next
-    startup still sees the file as having unsaved changes.
+    Written via a thread-safe manual write: CreateFileW / WriteFile /
+    CloseHandle (Win32 API only, no FPC heap ops in the write path),
+    iterating Ed.Strings.Lines[i] per-line and writing the editor's
+    line ending (read from Ed.Strings.Endings) after each line.
+
+    We do NOT use Ed.Strings.SaveToFile because it internally calls
+    TThread.Synchronize for progress reporting on large files
+    (>65536 lines), which fails with "EThread: CheckSynchronize
+    called from non-main thread" when invoked from our watchdog
+    thread or a crashed worker thread.
+
+    Line endings (CRLF/LF/CR) are preserved exactly. Encoding is
+    always UTF-8 with BOM - if the original file was UTF-16 or ANSI,
+    the backup will be UTF-8 (acceptable for crash recovery; the user
+    can re-encode after recovering their content). The editor's
+    Modified flag, FileName, and ModifiedVersion are NOT touched,
+    so CudaText's session-restore on next startup still sees the
+    file as having unsaved changes.
 
   Log file:
     Written to <AppDir_Settings>\crash_backup\cudatext_crash_backup.log.
@@ -102,7 +113,7 @@ implementation
 
 uses
   Windows, SysUtils, Classes, Forms, ExtCtrls,
-  proc_globdata, form_frame, ATSynEdit;
+  proc_globdata, form_frame, ATSynEdit, ATStrings, ATStringProc;
 
 type
   { Signature of a top-level exception filter callback. Must match
@@ -314,6 +325,91 @@ end;
 
 { ---------- The actual backup ---------- }
 
+{ Write the editor's text to a file using only Win32 API calls
+  (CreateFileW / WriteFile / CloseHandle) and per-line iteration.
+  This avoids Ed.Strings.SaveToFile, which internally uses
+  TThread.Synchronize for progress reporting on large files and
+  fails with "EThread: CheckSynchronize called from non-main thread"
+  when called from our watchdog thread or a crashed worker thread.
+
+  Line endings are preserved by reading Ed.Strings.Endings and
+  writing the appropriate bytes (CRLF / LF / CR) after each line.
+  The file is written as UTF-8 with BOM - this matches what most
+  text files use today. If the original file was UTF-16 or ANSI,
+  the backup will be UTF-8 (the user can re-encode after recovery).
+
+  Returns True on success, False on failure. }
+function WriteBackupManual(Ed: TATSynEdit; const BackupPath: string): Boolean;
+var
+  FileHandle: THandle;
+  BytesWritten: DWORD;
+  BOM: array[0..2] of Byte;
+  LineEnd: AnsiString;
+  LineU: UnicodeString;
+  LineU8: RawByteString;
+  Utf8Len: Integer;
+  i: Integer;
+  Count: Integer;
+  PathW: UnicodeString;
+begin
+  Result := False;
+
+  PathW := UTF8Decode(BackupPath);
+  FileHandle := CreateFileW(PWideChar(PathW),
+    GENERIC_WRITE, 0, nil, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+  if FileHandle = INVALID_HANDLE_VALUE then Exit;
+
+  try
+    { UTF-8 BOM }
+    BOM[0] := $EF; BOM[1] := $BB; BOM[2] := $BF;
+    if not WriteFile(FileHandle, BOM, 3, BytesWritten, nil) then Exit;
+
+    { Determine line ending bytes from the editor's Endings property. }
+    case Ed.Strings.Endings of
+      TATLineEnds.Windows: LineEnd := #13#10;
+      TATLineEnds.Mac:    LineEnd := #13;
+    else
+      { TATLineEnds.Unix and any other value }
+      LineEnd := #10;
+    end;
+
+    Count := Ed.Strings.Count;
+    for i := 0 to Count - 1 do
+    begin
+      LineU := Ed.Strings.Lines[i];
+
+      { Convert UnicodeString to UTF-8. }
+      if Length(LineU) > 0 then
+      begin
+        Utf8Len := WideCharToMultiByte(CP_UTF8, 0,
+          PWideChar(LineU), Length(LineU),
+          nil, 0, nil, nil);
+        if Utf8Len > 0 then
+        begin
+          SetLength(LineU8, Utf8Len);
+          if WideCharToMultiByte(CP_UTF8, 0,
+            PWideChar(LineU), Length(LineU),
+            PAnsiChar(LineU8), Utf8Len, nil, nil) = 0 then
+            Exit;
+          if not WriteFile(FileHandle, LineU8[1], Utf8Len, BytesWritten, nil) then Exit;
+        end;
+      end;
+
+      { Write line ending (skip after the last line to match typical
+        text file convention - though many editors do write a trailing
+        newline, omitting it here is safer for diff tools). }
+      if i < Count - 1 then
+      begin
+        if not WriteFile(FileHandle, LineEnd[1], Length(LineEnd), BytesWritten, nil) then Exit;
+      end;
+    end;
+
+    Result := True;
+  finally
+    CloseHandle(FileHandle);
+  end;
+end;
+
 function DoBackup: string;
 var
   Ed: TATSynEdit;
@@ -429,39 +525,44 @@ begin
 
   LogStep('[backup] path = ' + AnsiString(BackupPath));
 
-  { Use CudaText's "save copy" function - Ed.Strings.SaveToFile(fn, true)
-    writes the file with the editor's current line endings (CRLF/LF/CR),
-    encoding (UTF-8/UTF-16/ANSI), and BOM exactly as the original file,
-    WITHOUT changing any editor state. The 'true' parameter means "don't
-    update Modified, don't update FileName, don't bump ModifiedVersion".
+  { Write the backup using a thread-safe manual write (WinAPI only,
+    per-line iteration). We do NOT use Ed.Strings.SaveToFile because
+    it internally calls TThread.Synchronize for progress reporting
+    on large files (>65536 lines), which fails with
+    "EThread: CheckSynchronize called from non-main thread" when
+    invoked from our watchdog thread or a crashed worker thread.
 
-    For untitled tabs, if the save to CrashBackupDir fails, we retry
-    with the temp folder as a fallback. }
-  try
-    Ed.Strings.SaveToFile(BackupPath, True);
+    Trade-off: line endings are preserved (read from Ed.Strings.Endings),
+    but the encoding is always UTF-8 with BOM. If the original file was
+    UTF-16 or ANSI, the backup will be UTF-8 - the user can re-encode
+    after recovery. This is acceptable for crash recovery. }
+  if WriteBackupManual(Ed, BackupPath) then
+  begin
     LogStep('[backup] complete');
     Result := BackupPath;
-  except
-    on E: Exception do
+  end
+  else
+  begin
+    { If this was an untitled-tab save to CrashBackupDir, retry in temp. }
+    if (FileNameUTF8 = '') and (CrashBackupDir <> '') and
+       (Pos(AnsiString(CrashBackupDir), AnsiString(BackupPath)) > 0) then
     begin
-      { If this was an untitled-tab save to CrashBackupDir, retry in temp. }
-      if (FileNameUTF8 = '') and (CrashBackupDir <> '') and
-         (Pos(AnsiString(CrashBackupDir), AnsiString(BackupPath)) > 0) then
+      BackupPath := GetTempDir(False) + UntitledName + '_recovered_' + string(Timestamp) + '.CTbak';
+      LogStep('[backup] retrying in temp folder: ' + AnsiString(BackupPath));
+      if WriteBackupManual(Ed, BackupPath) then
       begin
-        BackupPath := GetTempDir(False) + UntitledName + '_recovered_' + string(Timestamp) + '.CTbak';
-        LogStep('[backup] retrying in temp folder: ' + AnsiString(BackupPath));
-        try
-          Ed.Strings.SaveToFile(BackupPath, True);
-          LogStep('[backup] complete (temp folder)');
-          Result := BackupPath;
-          Exit;
-        except
-          on E2: Exception do
-            LogStep('[backup] FAILED in both locations: ' + AnsiString(E2.ClassName) + ': ' + AnsiString(E2.Message));
-        end;
+        LogStep('[backup] complete (temp folder)');
+        Result := BackupPath;
       end
       else
-        LogStep('[backup] FAILED: ' + AnsiString(E.ClassName) + ': ' + AnsiString(E.Message));
+      begin
+        LogStep('[backup] FAILED in both locations');
+        Result := '';
+      end;
+    end
+    else
+    begin
+      LogStep('[backup] FAILED (WriteBackupManual returned False)');
       Result := '';
     end;
   end;
