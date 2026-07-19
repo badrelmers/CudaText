@@ -7,8 +7,8 @@
   that nothing caught, OR when the main thread hangs for more than
   HANG_THRESHOLD_MS milliseconds, this unit writes a backup copy of
   the currently focused editor's text to
-  "<originalfile>.<timestamp>.bak" next to the original file (or to
-  %TEMP%\cudatext_recovery_<timestamp>.bak for untitled tabs).
+  "<originalfile>.<timestamp>.CTbak" next to the original file (or to
+  %TEMP%\cudatext_recovery_<timestamp>.CTbak for untitled tabs).
 
   The timestamp format is YYYYMMDD_HHMMSS, e.g. 20260323_130455.
 
@@ -286,10 +286,6 @@ var
   i: Integer;
   FileNameUTF8: string;
   BackupPath: string;
-  TextU: UnicodeString;
-  TextU8: RawByteString;
-  Stream: TFileStream;
-  BOM: array[0..2] of Byte;
   ShadowEd: TATSynEdit;
   ShadowIsValid: Boolean;
   Timestamp: AnsiString;
@@ -393,43 +389,31 @@ begin
 
   if FileNameUTF8 = '' then
   begin
-    BackupPath := GetTempDir(False) + 'cudatext_recovery_' + string(Timestamp) + '.bak';
+    BackupPath := GetTempDir(False) + 'cudatext_recovery_' + string(Timestamp) + '.CTbak';
     LogStep('  [step] Untitled tab, backup path = ' + AnsiString(BackupPath));
   end
   else
   begin
-    BackupPath := FileNameUTF8 + '.' + string(Timestamp) + '.bak';
+    BackupPath := FileNameUTF8 + '.' + string(Timestamp) + '.CTbak';
     LogStep('  [step] Backup path = ' + AnsiString(BackupPath));
   end;
 
-  LogStep('  [step] Reading Ed.Text');
-  TextU := Ed.Text;
-  LogStep('  [step] Ed.Text length = ' + IntToStr(Length(TextU)));
-  if TextU = '' then
-  begin
-    LogStep('  [step] Ed.Text is empty - aborting');
-    Exit;
-  end;
-
-  LogStep('  [step] UTF8 encoding');
-  TextU8 := UTF8Encode(TextU);
-  LogStep('  [step] UTF8 length = ' + IntToStr(Length(TextU8)));
-
-  LogStep('  [step] Creating TFileStream');
-  Stream := TFileStream.Create(BackupPath, fmCreate);
+  { Use CudaText's own save function - Ed.SaveToFile preserves line
+    endings (CRLF/LF/CR), encoding (UTF-8/UTF-16/ANSI), and BOM
+    exactly as the original file. This avoids the line-ending
+    normalization issues that arose when we manually converted
+    Ed.Text to UTF-8 and wrote it ourselves. }
+  LogStep('  [step] Calling Ed.SaveToFile');
   try
-    LogStep('  [step] Writing BOM');
-    BOM[0] := $EF; BOM[1] := $BB; BOM[2] := $BF;
-    Stream.Write(BOM, 3);
-
-    LogStep('  [step] Writing text');
-    if Length(TextU8) > 0 then
-      Stream.Write(TextU8[1], Length(TextU8));
-
+    Ed.SaveToFile(BackupPath);
     LogStep('  [step] Backup complete');
     Result := BackupPath;
-  finally
-    Stream.Free;
+  except
+    on E: Exception do
+    begin
+      LogStep('  [step] Ed.SaveToFile raised: ' + AnsiString(E.ClassName) + ': ' + AnsiString(E.Message));
+      Result := '';
+    end;
   end;
 end;
 
