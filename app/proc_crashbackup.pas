@@ -30,9 +30,7 @@
     raises Python errors as real SEH exceptions (code $E0465043,
     .NET CLR exception, marked non-continuable) and then catches
     them at a higher level. VEH sees these and creates false-positive
-    backups. SetUnhandledExceptionFilter does not, because by the
-    time it's called, the application has already had its chance to
-    catch the exception.
+    backups. SetUnhandledExceptionFilter does not.
 
     We chain to the previous filter (which FPC's RTL installs to
     translate STATUS_ACCESS_VIOLATION etc. into EAccessViolation).
@@ -54,19 +52,31 @@
        WATCHDOG_CHECK_MS. If the heartbeat is more than
        HANG_THRESHOLD_MS stale, the watchdog runs the backup.
     3. If the main thread recovers (heartbeat updates again), the
-       watchdog resets so future hangs also get backed up.
+       watchdog resets so future hangs also get backed up. The
+       hang backup file is DELETED on recovery because the user
+       didn't actually lose any data.
 
-    This catches the AppHangB1 case: by the time Windows shows the
-    "Wait or Kill" dialog, our watchdog has already written the
-    backup, so clicking "Kill" doesn't lose data.
-
-  Installation timing:
-    InstallCrashBackup MUST be called after Application.CreateForm.
+  Backup file:
+    Written via Ed.Strings.SaveToFile(path, True) - CudaText's own
+    "save copy" function. Preserves line endings (CRLF/LF/CR),
+    encoding (UTF-8/UTF-16/ANSI), and BOM exactly as the original
+    file. The True parameter means "don't update Modified, don't
+    update FileName, don't bump ModifiedVersion" - the editor's
+    state stays untouched, so CudaText's session-restore on next
+    startup still sees the file as having unsaved changes.
 
   Log file:
-    Written to three locations (TEMP, exe dir, USERPROFILE) so we can
-    find it no matter what. Uses only Win32 API calls - no FPC heap
-    operations in the logging path.
+    Written to <AppDir_Settings>\cudatext_crash_backup.log (CudaText's
+    settings folder). Only meaningful events are logged - crashes,
+    hangs, backups, recoveries, and errors. Startup/installation
+    noise is NOT logged. Uses only Win32 API calls (CreateFileW /
+    WriteFile / CloseHandle) so the log works even if the FPC heap
+    is corrupted.
+
+  Installation timing:
+    InstallCrashBackup MUST be called after Application.CreateForm,
+    because it needs Application.OnException to be assignable and
+    AppDir_Settings to be set.
 }
 unit proc_crashbackup;
 
@@ -115,17 +125,20 @@ function SetThreadStackGuarantee(
 
 const
   CRASH_STACK_GUARANTEE = 16384;
-  MAX_LOG_PATHS = 3;
   HEARTBEAT_INTERVAL_MS = 1000;   { TTimer fires every 1 second }
   WATCHDOG_CHECK_MS = 1000;       { Watchdog checks every 1 second }
   HANG_THRESHOLD_MS = 7000;       { User-requested: 7 seconds = hang }
 
 var
   PrevFilter: TTopLevelExceptionFilter = nil;
+  { ChainToPrevFilter gates whether we may safely call PrevFilter. It is
+    set to True only after InstallCrashBackup has returned, so if the
+    filter is somehow called during installation we don't dereference
+    a half-initialized PrevFilter. }
   ChainToPrevFilter: Boolean = False;
   CrashHandled: LongInt = 0;
   Installed: Boolean = False;
-  LogPaths: array[0..MAX_LOG_PATHS-1] of UnicodeString;
+  LogPath: UnicodeString = '';
 
   Heartbeat: TCrashHeartbeat = nil;
   HeartbeatTimer: TTimer = nil;
@@ -134,86 +147,42 @@ var
   { Heartbeat timestamp - updated by the main thread via TTimer,
     read by the watchdog thread. Stored as LongInt (not DWORD) because
     FPC's InterlockedExchange/InterlockedExchangeAdd take LongInt.
-    GetTickCount returns DWORD; we cast to LongInt for storage. The
-    cast is safe: even though LongInt is signed, the modular
-    arithmetic used in 'Now - LastHB' still gives correct elapsed
-    time even across the DWORD -> LongInt -> DWORD conversion.
-    Aligned 32-bit reads/writes are atomic on x86/x64; we use the
-    Interlocked* family for clarity and portability. }
+    GetTickCount returns DWORD; we cast to LongInt for storage. }
   MainThreadHeartbeat: LongInt = 0;
   { 0 = no hang backup done yet (or main thread recovered since last hang).
     1 = hang backup already done for the current hang. Reset to 0
     when the main thread updates the heartbeat again. }
   HangBackupDone: LongInt = 0;
 
-  { Path of the backup file created by the last hang. Stored as UTF-8
-    string (Lazarus default). When the main thread recovers from a
-    hang (heartbeat updates again), this file is deleted because the
-    user didn't actually lose any data. Cleared after deletion.
-    Synchronization: watchdog sets HangBackupDone=1 AND
-    LastHangBackupPath; main thread atomically claims HangBackupDone
-    back to 0 (via InterlockedCompareExchange), and only then reads
-    and deletes LastHangBackupPath. }
+  { Path of the backup file created by the last hang. When the main
+    thread recovers from a hang, this file is deleted because the
+    user didn't actually lose any data. Guarded by HangBackupDone. }
   LastHangBackupPath: string = '';
 
 { ---------- Log path initialization ---------- }
 
-procedure InitLogPaths;
-var
-  TempBuf: array[0..MAX_PATH] of WideChar;
-  TempLen: Integer;
-  ExeBuf: array[0..MAX_PATH] of WideChar;
-  ExeLen: Integer;
-  HomeBuf: array[0..MAX_PATH] of WideChar;
-  HomeLen: Integer;
-  i, LastSlash: Integer;
+procedure InitLogPath;
 begin
-  for i := 0 to MAX_LOG_PATHS - 1 do
-    LogPaths[i] := '';
-
-  TempLen := GetTempPathW(MAX_PATH, @TempBuf[0]);
-  if (TempLen > 0) and (TempLen < MAX_PATH) then
-  begin
-    SetString(LogPaths[0], PWideChar(@TempBuf[0]), TempLen);
-    if (Length(LogPaths[0]) > 0) and (LogPaths[0][Length(LogPaths[0])] <> '\') then
-      LogPaths[0] := LogPaths[0] + '\';
-    LogPaths[0] := LogPaths[0] + 'cudatext_crash.log';
-  end;
-
-  ExeLen := GetModuleFileNameW(0, @ExeBuf[0], MAX_PATH);
-  if (ExeLen > 0) and (ExeLen < MAX_PATH) then
-  begin
-    LastSlash := -1;
-    for i := 0 to ExeLen - 1 do
-      if ExeBuf[i] = '\' then LastSlash := i;
-    if LastSlash >= 0 then
-    begin
-      SetString(LogPaths[1], PWideChar(@ExeBuf[0]), LastSlash + 1);
-      LogPaths[1] := LogPaths[1] + 'cudatext_crash.log';
-    end;
-  end;
-
-  HomeLen := GetEnvironmentVariableW('USERPROFILE', @HomeBuf[0], MAX_PATH);
-  if (HomeLen > 0) and (HomeLen < MAX_PATH) then
-  begin
-    SetString(LogPaths[2], PWideChar(@HomeBuf[0]), HomeLen);
-    if (Length(LogPaths[2]) > 0) and (LogPaths[2][Length(LogPaths[2])] <> '\') then
-      LogPaths[2] := LogPaths[2] + '\';
-    LogPaths[2] := LogPaths[2] + 'cudatext_crash.log';
-  end;
+  { Use CudaText's settings folder. AppDir_Settings is set during
+    CudaText's initialization, which has completed by the time
+    InstallCrashBackup is called (after Application.CreateForm). }
+  if AppDir_Settings <> '' then
+    LogPath := UnicodeString(AppDir_Settings) + '\cudatext_crash_backup.log'
+  else
+    LogPath := '';
 end;
 
 { ---------- Diagnostic logging (WinAPI only, no FPC heap) ---------- }
 
-procedure LogToPath(const Path: UnicodeString; const S: AnsiString);
+procedure LogLine(const S: AnsiString);
 var
   FileHandle: THandle;
   BytesWritten: DWORD;
   LineEnd: AnsiString;
 begin
-  if Path = '' then Exit;
+  if LogPath = '' then Exit;
 
-  FileHandle := CreateFileW(PWideChar(Path),
+  FileHandle := CreateFileW(PWideChar(LogPath),
     FILE_APPEND_DATA, FILE_SHARE_READ or FILE_SHARE_WRITE, nil,
     OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
   if FileHandle = INVALID_HANDLE_VALUE then Exit;
@@ -224,14 +193,6 @@ begin
     WriteFile(FileHandle, S[1], Length(S), BytesWritten, nil);
   WriteFile(FileHandle, LineEnd[1], 2, BytesWritten, nil);
   CloseHandle(FileHandle);
-end;
-
-procedure LogLine(const S: AnsiString);
-var
-  i: Integer;
-begin
-  for i := 0 to MAX_LOG_PATHS - 1 do
-    LogToPath(LogPaths[i], S);
 end;
 
 procedure LogStep(const S: AnsiString);
@@ -291,23 +252,11 @@ var
   Timestamp: AnsiString;
 begin
   Result := '';
-  LogStep('  [step] DoBackup entered');
 
-  if AppFrameList1 = nil then
-  begin
-    LogStep('  [step] AppFrameList1 is nil - aborting');
-    Exit;
-  end;
-
-  LogStep('  [step] AppFrameList1 count = ' + IntToStr(AppFrameList1.Count));
-  if AppFrameList1.Count = 0 then
-  begin
-    LogStep('  [step] AppFrameList1 is empty - aborting');
-    Exit;
-  end;
+  if AppFrameList1 = nil then Exit;
+  if AppFrameList1.Count = 0 then Exit;
 
   ShadowEd := TATSynEdit(AppCrashBackup_FocusedEditor);
-  LogStep('  [step] Shadow ptr (AppCrashBackup_FocusedEditor) = ' + IntToHex(PtrUInt(ShadowEd), 16));
 
   ShadowIsValid := False;
   if ShadowEd <> nil then
@@ -323,38 +272,27 @@ begin
       end;
     end;
   end;
-  LogStep('  [step] Shadow ptr valid = ' + BoolToStr(ShadowIsValid, True));
 
   Ed := nil;
   if ShadowIsValid then
+    Ed := ShadowEd
+  else if AppCodetreeState.Editor <> nil then
   begin
-    Ed := ShadowEd;
-    LogStep('  [step] Using shadow-ptr editor');
-  end
-  else
-  begin
-    LogStep('  [step] Shadow ptr nil or stale, trying AppCodetreeState.Editor');
-    LogStep('  [step] AppCodetreeState.Editor ptr = ' + IntToHex(PtrUInt(AppCodetreeState.Editor), 16));
-    if AppCodetreeState.Editor <> nil then
+    for i := 0 to AppFrameList1.Count - 1 do
     begin
-      for i := 0 to AppFrameList1.Count - 1 do
+      Frame := TEditorFrame(AppFrameList1.Items[i]);
+      if Frame = nil then Continue;
+      if (Frame.Ed1 = AppCodetreeState.Editor) or
+         (Frame.Ed2 = AppCodetreeState.Editor) then
       begin
-        Frame := TEditorFrame(AppFrameList1.Items[i]);
-        if Frame = nil then Continue;
-        if (Frame.Ed1 = AppCodetreeState.Editor) or
-           (Frame.Ed2 = AppCodetreeState.Editor) then
-        begin
-          Ed := TATSynEdit(AppCodetreeState.Editor);
-          LogStep('  [step] Found editor via AppCodetreeState');
-          Break;
-        end;
+        Ed := TATSynEdit(AppCodetreeState.Editor);
+        Break;
       end;
     end;
   end;
 
   if Ed = nil then
   begin
-    LogStep('  [step] Focused editor not found, using fallback (first editor)');
     for i := 0 to AppFrameList1.Count - 1 do
     begin
       Frame := TEditorFrame(AppFrameList1.Items[i]);
@@ -368,57 +306,39 @@ begin
 
   if Ed = nil then
   begin
-    LogStep('  [step] No editor found at all - aborting');
+    LogStep('[backup] no editor found - aborting');
     Exit;
   end;
 
-  LogStep('  [step] Found editor, ptr = ' + IntToHex(PtrUInt(Ed), 16));
-  LogStep('  [step] Ed.Modified = ' + BoolToStr(Ed.Modified, True));
-
   if not Ed.Modified then
   begin
-    LogStep('  [step] Editor not modified - aborting (file matches disk)');
+    LogStep('[backup] editor not modified - aborting (file matches disk)');
     Exit;
   end;
 
   FileNameUTF8 := Ed.FileName;
-  LogStep('  [step] FileName = ' + AnsiString(FileNameUTF8));
-
   Timestamp := FormatTimestamp;
-  LogStep('  [step] Timestamp = ' + Timestamp);
 
   if FileNameUTF8 = '' then
-  begin
-    BackupPath := GetTempDir(False) + 'cudatext_recovery_' + string(Timestamp) + '.CTbak';
-    LogStep('  [step] Untitled tab, backup path = ' + AnsiString(BackupPath));
-  end
+    BackupPath := GetTempDir(False) + 'cudatext_recovery_' + string(Timestamp) + '.CTbak'
   else
-  begin
     BackupPath := FileNameUTF8 + '.' + string(Timestamp) + '.CTbak';
-    LogStep('  [step] Backup path = ' + AnsiString(BackupPath));
-  end;
+
+  LogStep('[backup] path = ' + AnsiString(BackupPath));
 
   { Use CudaText's "save copy" function - Ed.Strings.SaveToFile(fn, true)
     writes the file with the editor's current line endings (CRLF/LF/CR),
     encoding (UTF-8/UTF-16/ANSI), and BOM exactly as the original file,
     WITHOUT changing any editor state. The 'true' parameter means "don't
-    update Modified, don't update FileName, don't bump ModifiedVersion"
-    - exactly what we want for a backup.
-
-    (Ed.SaveToFile would have the same byte-for-byte output, but as a
-    side effect it sets Modified:=False and FileName:=fn, which would
-    make CudaText think the file was actually saved - causing it to
-    drop the unsaved-changes recovery on next startup. Strings.SaveToFile
-    is the lower-level function that doesn't have those side effects.) }
-  LogStep('  [step] Calling Ed.Strings.SaveToFile');
+    update Modified, don't update FileName, don't bump ModifiedVersion". }
   try
     Ed.Strings.SaveToFile(BackupPath, True);
-    LogStep('  [step] Backup complete');
+    LogStep('[backup] complete');
     Result := BackupPath;
   except
     on E: Exception do
     begin
-      LogStep('  [step] Ed.Strings.SaveToFile raised: ' + AnsiString(E.ClassName) + ': ' + AnsiString(E.Message));
+      LogStep('[backup] FAILED: ' + AnsiString(E.ClassName) + ': ' + AnsiString(E.Message));
       Result := '';
     end;
   end;
@@ -442,13 +362,8 @@ begin
       on E: Exception do
         LogStep('  [EXCEPTION] ' + AnsiString(E.ClassName) + ': ' + AnsiString(E.Message));
     end;
-    { If this was a hang backup and it actually wrote a file, remember
-      the path so the main thread can delete it on recovery. }
     if IsHang and (BackupPath <> '') then
-    begin
       LastHangBackupPath := BackupPath;
-      LogStep('[' + HookName + '] recorded hang backup path for deletion on recovery: ' + AnsiString(BackupPath));
-    end;
   finally
     InterlockedExchange(CrashHandled, 0);
     LogStep('[' + HookName + '] backup finished');
@@ -478,31 +393,14 @@ procedure TCrashHeartbeat.HandleTimer(Sender: TObject);
 var
   PathToDelete: string;
 begin
-  { Called by TTimer via WM_TIMER on the main thread. WM_TIMER only
-    fires when the message loop is pumping - if the main thread is
-    stuck, this never fires, the heartbeat goes stale, and the
-    watchdog triggers a backup.
-    Cast DWORD to LongInt for storage (see MainThreadHeartbeat decl). }
+  { Update the heartbeat. WM_TIMER only fires when the message loop is
+    pumping - if the main thread is stuck, this never fires, the
+    heartbeat goes stale, and the watchdog triggers a backup. }
   InterlockedExchange(MainThreadHeartbeat, LongInt(GetTickCount));
 
   { Main thread is alive. If we previously created a hang backup and
     the main thread has now recovered, delete the backup file because
-    the user didn't actually lose any data.
-
-    We use InterlockedCompareExchange to atomically claim the
-    HangBackupDone flag back to 0. If it was already 0, no hang backup
-    was done - nothing to delete. If it was 1, we just claimed it, and
-    LastHangBackupPath now holds the path the watchdog wrote. We copy
-    it to a local, clear the global, then delete the file.
-
-    The watchdog may be writing to LastHangBackupPath at the same time
-    on another thread, but only when it has HangBackupDone=1 - and we
-    just atomically set HangBackupDone=0, so the watchdog will skip
-    the backup branch on its next iteration. There's a tiny race
-    window where the watchdog already set HangBackupDone=1 but hasn't
-    written LastHangBackupPath yet - in that case we'll see an empty
-    path and skip deletion, leaving the file. That's acceptable: a
-    stray backup file is far better than losing data. }
+    the user didn't actually lose any data. }
   if InterlockedCompareExchange(HangBackupDone, 0, 1) = 1 then
   begin
     PathToDelete := LastHangBackupPath;
@@ -515,7 +413,7 @@ begin
           DeleteFile(PathToDelete);
       except
         on E: Exception do
-          LogStep('[Heartbeat] exception deleting backup: ' + AnsiString(E.ClassName) + ': ' + AnsiString(E.Message));
+          LogStep('[Heartbeat] FAILED to delete backup: ' + AnsiString(E.ClassName) + ': ' + AnsiString(E.Message));
       end;
     end
     else
@@ -531,39 +429,26 @@ var
   LastHB: DWORD;
   Diff: DWORD;
 begin
-  LogStep('[Watchdog] thread started');
   while not Terminated do
   begin
     Sleep(WATCHDOG_CHECK_MS);
 
     Now := GetTickCount;
-    { Atomic read of the heartbeat. InterlockedExchangeAdd with 0
-      returns the old value without modifying it. Cast back to DWORD
-      for arithmetic (see MainThreadHeartbeat decl). }
     LastHB := DWORD(InterlockedExchangeAdd(MainThreadHeartbeat, 0));
 
-    { DWORD subtraction handles GetTickCount wraparound correctly
-      via modular arithmetic. }
+    { DWORD subtraction handles GetTickCount wraparound correctly. }
     Diff := Now - LastHB;
 
     if Diff > HANG_THRESHOLD_MS then
     begin
       LogStep('[Watchdog] hang detected, heartbeat age = ' + IntToStr(Int64(Diff)) + 'ms');
 
-      { Only do the backup ONCE per hang. If we already did it,
-        don't spam more backups. The flag is reset when the main
-        thread updates the heartbeat again (i.e. recovers). }
+      { Only do the backup ONCE per hang. The flag is reset when the
+        main thread updates the heartbeat again (i.e. recovers). }
       if InterlockedCompareExchange(HangBackupDone, 1, 0) = 0 then
-      begin
         TryDoBackup('Watchdog', True);
-      end
-      else
-      begin
-        LogStep('[Watchdog] hang backup already done for this hang, waiting for recovery');
-      end;
     end;
   end;
-  LogStep('[Watchdog] thread terminating');
 end;
 
 { ---------- Installation ---------- }
@@ -575,49 +460,34 @@ begin
   if Installed then Exit;
   Installed := True;
 
-  InitLogPaths;
-  LogStep('=== InstallCrashBackup starting ===');
-  LogStep('Log path[0] (TEMP) = ' + AnsiString(LogPaths[0]));
-  LogStep('Log path[1] (EXE)  = ' + AnsiString(LogPaths[1]));
-  LogStep('Log path[2] (HOME) = ' + AnsiString(LogPaths[2]));
+  InitLogPath;
 
-  LogStep('Installing SetUnhandledExceptionFilter (chaining to FPC''s previous filter)...');
+  { Install the unhandled exception filter, saving the previous one
+    so we can chain to it after writing the backup. FPC's RTL has
+    already installed its own filter by this point, so PrevFilter
+    will be FPC's filter. }
   PrevFilter := SetUnhandledExceptionFilter(@CrashUnhandledFilter);
   ChainToPrevFilter := True;
-  LogStep('Filter installed, prev filter ptr = ' + IntToHex(PtrUInt(PrevFilter), 16));
 
-  LogStep('Setting stack guarantee...');
+  { Reserve ~16 KB of stack on the main thread so the filter has room
+    to run even after a stack overflow. }
   StackGuarantee := CRASH_STACK_GUARANTEE;
   SetThreadStackGuarantee(StackGuarantee);
-  LogStep('Stack guarantee set');
 
-  LogStep('Setting up hang detection (heartbeat timer + watchdog thread)...');
+  { Set up hang detection: heartbeat timer + watchdog thread. }
   Heartbeat := TCrashHeartbeat.Create;
   HeartbeatTimer := TTimer.Create(nil);
   HeartbeatTimer.Interval := HEARTBEAT_INTERVAL_MS;
   HeartbeatTimer.OnTimer := @Heartbeat.HandleTimer;
   HeartbeatTimer.Enabled := True;
-  { Seed the initial heartbeat so the watchdog doesn't immediately
-    fire before the first WM_TIMER arrives. Cast DWORD to LongInt
-    for storage (see MainThreadHeartbeat decl). }
   InterlockedExchange(MainThreadHeartbeat, LongInt(GetTickCount));
-  LogStep('Heartbeat timer installed, interval = ' + IntToStr(HEARTBEAT_INTERVAL_MS) + 'ms');
 
   WatchdogThread := TCrashWatchdogThread.Create(False);
-  LogStep('Watchdog thread started, hang threshold = ' + IntToStr(HANG_THRESHOLD_MS) + 'ms');
-
-  LogStep('Initial shadow ptr = ' + IntToHex(PtrUInt(AppCrashBackup_FocusedEditor), 16));
-
-  LogStep('=== InstallCrashBackup complete ===');
 end;
 
 procedure CrashBackup_RegisterThread;
 begin
 end;
-
-initialization
-  InitLogPaths;
-  LogStep('[init] proc_crashbackup unit loaded');
 
 {$ELSE}
 
