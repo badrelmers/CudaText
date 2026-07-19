@@ -9,9 +9,9 @@
   the currently focused editor's text to
   "<originalfile>.<timestamp>.CTbak" next to the original file (for
   named files), or to
-  <AppDir_Settings>\crash_backup\cudatext_recovery_<timestamp>.CTbak
-  (for untitled tabs, with %TEMP% as a fallback if the settings
-  folder is not writable).
+  <AppDir_Settings>\crash_backup\<tabname>_tab_recovered_<timestamp>.CTbak
+  (for untitled tabs, e.g. "untitled3_tab_recovered_20260719_022954.CTbak",
+  with %TEMP% as a fallback if the settings folder is not writable).
 
   The timestamp format is YYYYMMDD_HHMMSS, e.g. 20260323_130455.
 
@@ -275,18 +275,45 @@ begin
   end;
 end;
 
+{ ---------- Filename sanitization for untitled tabs ---------- }
+
+{ Replace characters that are illegal in Windows filenames with '_'.
+  Also collapse spaces to '_' so the backup filename stays a single
+  clean token (e.g. "Untitled 3" -> "Untitled_3"). }
+function SanitizeForFilename(const S: string): string;
+const
+  cBadChars = '<>:"/\|?*';
+var
+  i, j: Integer;
+  Ch: Char;
+begin
+  SetLength(Result, Length(S));
+  j := 0;
+  for i := 1 to Length(S) do
+  begin
+    Ch := S[i];
+    if (Pos(Ch, cBadChars) > 0) or (Ch = ' ') or (Ch < #32) then
+      Ch := '_';
+    Inc(j);
+    Result[j] := Ch;
+  end;
+  SetLength(Result, j);
+end;
+
 { ---------- The actual backup ---------- }
 
 function DoBackup: string;
 var
   Ed: TATSynEdit;
   Frame: TEditorFrame;
+  MatchedFrame: TEditorFrame;
   i: Integer;
   FileNameUTF8: string;
   BackupPath: string;
   ShadowEd: TATSynEdit;
   ShadowIsValid: Boolean;
   Timestamp: AnsiString;
+  UntitledName: string;
 begin
   Result := '';
 
@@ -295,6 +322,7 @@ begin
 
   ShadowEd := TATSynEdit(AppCrashBackup_FocusedEditor);
 
+  MatchedFrame := nil;
   ShadowIsValid := False;
   if ShadowEd <> nil then
   begin
@@ -305,6 +333,7 @@ begin
       if (Frame.Ed1 = ShadowEd) or (Frame.Ed2 = ShadowEd) then
       begin
         ShadowIsValid := True;
+        MatchedFrame := Frame;
         Break;
       end;
     end;
@@ -323,6 +352,7 @@ begin
          (Frame.Ed2 = AppCodetreeState.Editor) then
       begin
         Ed := TATSynEdit(AppCodetreeState.Editor);
+        MatchedFrame := Frame;
         Break;
       end;
     end;
@@ -336,7 +366,11 @@ begin
       if Frame <> nil then
       begin
         Ed := Frame.Ed1;
-        if Ed <> nil then Break;
+        if Ed <> nil then
+        begin
+          MatchedFrame := Frame;
+          Break;
+        end;
       end;
     end;
   end;
@@ -360,13 +394,23 @@ begin
   begin
     { Untitled tab: try to save inside <settings>/crash_backup/ first.
       If that fails (e.g. settings folder not writable), fall back to
-      the system temp folder. We try the preferred path with
-      Ed.Strings.SaveToFile and catch any exception to redirect to the
-      fallback path. }
-    if CrashBackupDir <> '' then
-      BackupPath := CrashBackupDir + '\cudatext_recovery_' + string(Timestamp) + '.CTbak'
+      the system temp folder.
+
+      Try to use the tab's caption (e.g. "Untitled3") in the filename
+      so the user can tell which tab the backup came from. If we can't
+      get the caption, fall back to a generic "untitled_tab" name. }
+    UntitledName := '';
+    if MatchedFrame <> nil then
+      UntitledName := SanitizeForFilename(MatchedFrame.TabCaptionUntitled);
+    if UntitledName = '' then
+      UntitledName := 'untitled_tab'
     else
-      BackupPath := GetTempDir(False) + 'cudatext_recovery_' + string(Timestamp) + '.CTbak';
+      UntitledName := LowerCase(UntitledName) + '_tab';
+
+    if CrashBackupDir <> '' then
+      BackupPath := CrashBackupDir + '\' + UntitledName + '_recovered_' + string(Timestamp) + '.CTbak'
+    else
+      BackupPath := GetTempDir(False) + UntitledName + '_recovered_' + string(Timestamp) + '.CTbak';
   end
   else
     BackupPath := FileNameUTF8 + '.' + string(Timestamp) + '.CTbak';
@@ -392,7 +436,7 @@ begin
       if (FileNameUTF8 = '') and (CrashBackupDir <> '') and
          (Pos(AnsiString(CrashBackupDir), AnsiString(BackupPath)) > 0) then
       begin
-        BackupPath := GetTempDir(False) + 'cudatext_recovery_' + string(Timestamp) + '.CTbak';
+        BackupPath := GetTempDir(False) + UntitledName + '_recovered_' + string(Timestamp) + '.CTbak';
         LogStep('[backup] retrying in temp folder: ' + AnsiString(BackupPath));
         try
           Ed.Strings.SaveToFile(BackupPath, True);
