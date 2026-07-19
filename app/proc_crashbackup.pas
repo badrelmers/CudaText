@@ -398,20 +398,27 @@ begin
     LogStep('  [step] Backup path = ' + AnsiString(BackupPath));
   end;
 
-  { Use CudaText's own save function - Ed.SaveToFile preserves line
-    endings (CRLF/LF/CR), encoding (UTF-8/UTF-16/ANSI), and BOM
-    exactly as the original file. This avoids the line-ending
-    normalization issues that arose when we manually converted
-    Ed.Text to UTF-8 and wrote it ourselves. }
-  LogStep('  [step] Calling Ed.SaveToFile');
+  { Use CudaText's "save copy" function - Ed.Strings.SaveToFile(fn, true)
+    writes the file with the editor's current line endings (CRLF/LF/CR),
+    encoding (UTF-8/UTF-16/ANSI), and BOM exactly as the original file,
+    WITHOUT changing any editor state. The 'true' parameter means "don't
+    update Modified, don't update FileName, don't bump ModifiedVersion"
+    - exactly what we want for a backup.
+
+    (Ed.SaveToFile would have the same byte-for-byte output, but as a
+    side effect it sets Modified:=False and FileName:=fn, which would
+    make CudaText think the file was actually saved - causing it to
+    drop the unsaved-changes recovery on next startup. Strings.SaveToFile
+    is the lower-level function that doesn't have those side effects.) }
+  LogStep('  [step] Calling Ed.Strings.SaveToFile');
   try
-    Ed.SaveToFile(BackupPath);
+    Ed.Strings.SaveToFile(BackupPath, True);
     LogStep('  [step] Backup complete');
     Result := BackupPath;
   except
     on E: Exception do
     begin
-      LogStep('  [step] Ed.SaveToFile raised: ' + AnsiString(E.ClassName) + ': ' + AnsiString(E.Message));
+      LogStep('  [step] Ed.Strings.SaveToFile raised: ' + AnsiString(E.ClassName) + ': ' + AnsiString(E.Message));
       Result := '';
     end;
   end;
