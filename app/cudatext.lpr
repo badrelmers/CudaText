@@ -31,6 +31,6 @@ begin
   RequireDerivedFormResource:= True;
   Application.Initialize;
   Application.CreateForm(TfmMain, fmMain);
-  InstallCrashBackup; //install VEH + FPC hooks after main form is created
+  InstallCrashBackup; //install crash/hang backup hooks after main form is created
   Application.Run;
 end.

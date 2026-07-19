@@ -1,3 +1,10 @@
+(*
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this
+file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+Copyright (c) Alexey Torgashin
+*)
 {
   proc_crashbackup
   -----------------
@@ -78,8 +85,8 @@
 
   Installation timing:
     InstallCrashBackup MUST be called after Application.CreateForm,
-    because it needs Application.OnException to be assignable and
-    AppDir_Settings to be set.
+    because AppDir_Settings is set during CudaText's initialization,
+    and TTimer needs the LCL to be ready.
 }
 unit proc_crashbackup;
 
@@ -88,7 +95,6 @@ unit proc_crashbackup;
 interface
 
 procedure InstallCrashBackup;
-procedure CrashBackup_RegisterThread;
 
 implementation
 
@@ -150,6 +156,12 @@ var
   HeartbeatTimer: TTimer = nil;
   WatchdogThread: TCrashWatchdogThread = nil;
 
+  { Critical section protecting LastHangBackupPath. The watchdog thread
+    writes to it; the main thread (via TTimer) reads and clears it.
+    AnsiString assignment is NOT atomic in FPC (refcount + pointer copy),
+    so we need a real lock. }
+  HangPathLock: TRTLCriticalSection;
+
   { Heartbeat timestamp - updated by the main thread via TTimer,
     read by the watchdog thread. Stored as LongInt (not DWORD) because
     FPC's InterlockedExchange/InterlockedExchangeAdd take LongInt.
@@ -192,7 +204,7 @@ begin
   except
   end;
 
-  LogPath := UnicodeString(CrashBackupDir) + '\cudatext_crash_backup.log';
+  LogPath := UTF8Decode(CrashBackupDir) + '\cudatext_crash_backup.log';
 end;
 
 { ---------- Timestamp formatting ----------
@@ -282,7 +294,7 @@ end;
   clean token (e.g. "Untitled 3" -> "Untitled_3"). }
 function SanitizeForFilename(const S: string): string;
 const
-  cBadChars = '<>:"/\|?*';
+  BadFilenameChars = ['<', '>', ':', '"', '/', '\', '|', '?', '*', ' '];
 var
   i, j: Integer;
   Ch: Char;
@@ -292,7 +304,7 @@ begin
   for i := 1 to Length(S) do
   begin
     Ch := S[i];
-    if (Pos(Ch, cBadChars) > 0) or (Ch = ' ') or (Ch < #32) then
+    if (Ch in BadFilenameChars) or (Ch < #32) then
       Ch := '_';
     Inc(j);
     Result[j] := Ch;
@@ -474,7 +486,14 @@ begin
         LogStep('  [EXCEPTION] ' + AnsiString(E.ClassName) + ': ' + AnsiString(E.Message));
     end;
     if IsHang and (BackupPath <> '') then
-      LastHangBackupPath := BackupPath;
+    begin
+      EnterCriticalSection(HangPathLock);
+      try
+        LastHangBackupPath := BackupPath;
+      finally
+        LeaveCriticalSection(HangPathLock);
+      end;
+    end;
   finally
     InterlockedExchange(CrashHandled, 0);
     LogStep('[' + HookName + '] backup finished');
@@ -487,11 +506,31 @@ function CrashUnhandledFilter(ExceptionInfo: PExceptionPointers): LongInt; stdca
 var
   Code: DWORD;
 begin
-  Code := DWORD(ExceptionInfo^.ExceptionRecord^.ExceptionCode);
-  LogStep('[UnhandledFilter] entered, exception code = ' + IntToHex(Code, 8));
+  { The unhandled exception filter runs in a crashed process. Wrap
+    EVERYTHING in try/except so a fault in our own logging code
+    still falls through to the backup attempt. }
+  try
+    Code := DWORD(ExceptionInfo^.ExceptionRecord^.ExceptionCode);
+    try
+      LogStep('[UnhandledFilter] entered, exception code = ' + IntToHex(Code, 8));
+    except
+    end;
 
-  TryDoBackup('UnhandledFilter');
+    { Always attempt the crash backup, even if a hang backup is in
+      progress (CrashHandled=1). A crash is terminal - the process
+      is about to die - so we don't bother with the serialization
+      flag. The two backups go to different timestamped paths so
+      there's no file-level conflict. }
+    try
+      DoBackup;
+    except
+    end;
+  except
+  end;
 
+  { Chain to FPC's previous filter so normal exception translation
+    (STATUS_ACCESS_VIOLATION -> EAccessViolation etc.) and crash
+    dialog behavior continue to work. }
   if ChainToPrevFilter and Assigned(PrevFilter) then
     Result := PrevFilter(ExceptionInfo)
   else
@@ -514,8 +553,16 @@ begin
     the user didn't actually lose any data. }
   if InterlockedCompareExchange(HangBackupDone, 0, 1) = 1 then
   begin
-    PathToDelete := LastHangBackupPath;
-    LastHangBackupPath := '';
+    { Atomically claim and read the hang backup path. The lock
+      protects the AnsiString assignment in the watchdog thread. }
+    EnterCriticalSection(HangPathLock);
+    try
+      PathToDelete := LastHangBackupPath;
+      LastHangBackupPath := '';
+    finally
+      LeaveCriticalSection(HangPathLock);
+    end;
+
     if PathToDelete <> '' then
     begin
       LogStep('[Heartbeat] main thread recovered from hang, deleting backup: ' + AnsiString(PathToDelete));
@@ -536,7 +583,7 @@ end;
 
 procedure TCrashWatchdogThread.Execute;
 var
-  Now: DWORD;
+  CurrentTick: DWORD;
   LastHB: DWORD;
   Diff: DWORD;
 begin
@@ -544,11 +591,11 @@ begin
   begin
     Sleep(WATCHDOG_CHECK_MS);
 
-    Now := GetTickCount;
+    CurrentTick := GetTickCount;
     LastHB := DWORD(InterlockedExchangeAdd(MainThreadHeartbeat, 0));
 
     { DWORD subtraction handles GetTickCount wraparound correctly. }
-    Diff := Now - LastHB;
+    Diff := CurrentTick - LastHB;
 
     if Diff > HANG_THRESHOLD_MS then
     begin
@@ -572,6 +619,7 @@ begin
   Installed := True;
 
   InitLogPath;
+  InitCriticalSection(HangPathLock);
 
   { Install the unhandled exception filter, saving the previous one
     so we can chain to it after writing the backup. FPC's RTL has
@@ -596,20 +644,25 @@ begin
   WatchdogThread := TCrashWatchdogThread.Create(False);
 end;
 
-procedure CrashBackup_RegisterThread;
-begin
-end;
-
 {$ELSE}
 
 procedure InstallCrashBackup;
 begin
 end;
 
-procedure CrashBackup_RegisterThread;
-begin
-end;
+{$ENDIF}
 
+finalization
+{$IFDEF WINDOWS}
+  { Stop the watchdog thread first so it doesn't try to access globals
+    we're about to free. We Terminate but don't WaitFor - the thread
+    might be in the middle of SaveToFile and WaitFor could deadlock.
+    The OS will reap the thread on process exit. }
+  if Assigned(WatchdogThread) then
+    WatchdogThread.Terminate;
+  FreeAndNil(HeartbeatTimer);
+  FreeAndNil(Heartbeat);
+  DoneCriticalSection(HangPathLock);
 {$ENDIF}
 
 end.
