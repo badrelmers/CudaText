@@ -195,12 +195,13 @@ var
   AppEventWatcher: TEvent;
     //event set to signaled, when watcher thread is not busy
 
-  AppCrashBackup_FocusedEditor: Pointer {TATSynEdit} = nil;
-    //shadow pointer to the editor that most recently received keyboard focus.
+  AppCrashBackup_FocusedEditor: TObject;
+    //shadow reference to the editor (TATSynEdit, which is a TObject) that
+    //most recently received keyboard focus.
     //Updated by TEditorFrame.EditorOnEnter (the central handler that fires
     //for tab clicks, File>New, File>Open, split-view switches, etc.).
-    //Read by the crash backup handler in proc_crashbackup.pas.
-    //Type is Pointer (not TATSynEdit) to avoid a uses-clause dependency on
+    //Read by the crash backup handler in proc_crash_backup.pas.
+    //Type is TObject (not TATSynEdit) to avoid a uses-clause dependency on
     //ATSynEdit in this unit - readers should cast to TATSynEdit.
 
 type

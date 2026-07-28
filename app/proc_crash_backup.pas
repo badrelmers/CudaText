@@ -6,7 +6,7 @@ file, You can obtain one at http://mozilla.org/MPL/2.0/.
 Copyright (c) Alexey Torgashin
 *)
 {
-  proc_crashbackup
+  proc_crash_backup
   -----------------
   Crash AND hang backup for CudaText on Windows, with diagnostic logging.
 
@@ -101,7 +101,7 @@ Copyright (c) Alexey Torgashin
     because AppDir_Settings is set during CudaText's initialization,
     and TTimer needs the LCL to be ready.
 }
-unit proc_crashbackup;
+unit proc_crash_backup;
 
 {$mode objfpc}{$H+}
 
@@ -152,22 +152,22 @@ const
   HANG_THRESHOLD_MS = 7000;       { User-requested: 7 seconds = hang }
 
 var
-  PrevFilter: TTopLevelExceptionFilter = nil;
+  PrevFilter: TTopLevelExceptionFilter;
   { ChainToPrevFilter gates whether we may safely call PrevFilter. It is
     set to True only after InstallCrashBackup has returned, so if the
     filter is somehow called during installation we don't dereference
     a half-initialized PrevFilter. }
-  ChainToPrevFilter: Boolean = False;
-  CrashHandled: LongInt = 0;
-  Installed: Boolean = False;
-  LogPath: UnicodeString = '';
+  ChainToPrevFilter: Boolean;
+  CrashHandled: LongInt;
+  Installed: Boolean;
+  LogPath: UnicodeString;
   { Folder where backups and the log are stored:
-    <AppDir_Settings>\crash_backup\. Created at install time. }
-  CrashBackupDir: string = '';
+    <AppDir_Settings>\crash_backup\. Created lazily on first crash. }
+  CrashBackupDir: string;
 
-  Heartbeat: TCrashHeartbeat = nil;
-  HeartbeatTimer: TTimer = nil;
-  WatchdogThread: TCrashWatchdogThread = nil;
+  Heartbeat: TCrashHeartbeat;
+  HeartbeatTimer: TTimer;
+  WatchdogThread: TCrashWatchdogThread;
 
   { Critical section protecting LastHangBackupPath. The watchdog thread
     writes to it; the main thread (via TTimer) reads and clears it.
@@ -179,16 +179,16 @@ var
     read by the watchdog thread. Stored as LongInt (not DWORD) because
     FPC's InterlockedExchange/InterlockedExchangeAdd take LongInt.
     GetTickCount returns DWORD; we cast to LongInt for storage. }
-  MainThreadHeartbeat: LongInt = 0;
+  MainThreadHeartbeat: LongInt;
   { 0 = no hang backup done yet (or main thread recovered since last hang).
     1 = hang backup already done for the current hang. Reset to 0
     when the main thread updates the heartbeat again. }
-  HangBackupDone: LongInt = 0;
+  HangBackupDone: LongInt;
 
   { Path of the backup file created by the last hang. When the main
     thread recovers from a hang, this file is deleted because the
     user didn't actually lose any data. Guarded by HangBackupDone. }
-  LastHangBackupPath: string = '';
+  LastHangBackupPath: string;
 
 { ---------- Log path initialization ---------- }
 
@@ -199,25 +199,33 @@ begin
     InstallCrashBackup is called (after Application.CreateForm).
 
     All crash-backup artifacts (log file + untitled-tab backups) live
-    in a dedicated subfolder <AppDir_Settings>\crash_backup\. }
+    in a dedicated subfolder <AppDir_Settings>\crash_backup\.
+
+    The folder is NOT created here - that would slow down every normal
+    startup. It is created lazily by EnsureCrashBackupDir, which is
+    called only when a crash/hang actually happens. }
   LogPath := '';
   CrashBackupDir := '';
   if AppDir_Settings = '' then Exit;
 
   CrashBackupDir := AppDir_Settings + '\crash_backup';
+  LogPath := UTF8Decode(CrashBackupDir) + '\cudatext_crash_backup.log';
+end;
 
-  { Create the folder if it doesn't exist. ForceDirectories creates
-    all intermediate directories too. Wrapped in try/except because
-    directory creation can fail (permissions, disk full, etc.) - if
-    it fails, we just won't write logs/backups there, which is
-    acceptable degradation. }
+{ Ensure the crash_backup folder exists. Called lazily from the crash
+  handler and the watchdog, so the folder is only created when actually
+  needed - no startup overhead on normal runs. Returns True if the
+  folder exists (or was created); False if creation failed. }
+function EnsureCrashBackupDir: Boolean;
+begin
+  Result := False;
+  if CrashBackupDir = '' then Exit;
   try
     if not DirectoryExists(CrashBackupDir) then
       ForceDirectories(CrashBackupDir);
+    Result := DirectoryExists(CrashBackupDir);
   except
   end;
-
-  LogPath := UTF8Decode(CrashBackupDir) + '\cudatext_crash_backup.log';
 end;
 
 { ---------- Timestamp formatting ----------
@@ -267,6 +275,11 @@ var
   FullLine: AnsiString;
 begin
   if LogPath = '' then Exit;
+
+  { Lazily ensure the crash_backup folder exists. This is a no-op if
+    it already exists (DirectoryExists is a fast stat call). We do this
+    here, not at install time, so normal startups don't pay the cost. }
+  if not EnsureCrashBackupDir then Exit;
 
   FileHandle := CreateFileW(PWideChar(LogPath),
     FILE_APPEND_DATA, FILE_SHARE_READ or FILE_SHARE_WRITE, nil,
@@ -455,12 +468,12 @@ begin
 
   MatchedFrame := nil;
   ShadowIsValid := False;
-  if ShadowEd <> nil then
+  if Assigned(ShadowEd) then
   begin
     for i := 0 to AppFrameList1.Count - 1 do
     begin
       Frame := TEditorFrame(AppFrameList1.Items[i]);
-      if Frame = nil then Continue;
+      if not Assigned(Frame) then Continue;
       if (Frame.Ed1 = ShadowEd) or (Frame.Ed2 = ShadowEd) then
       begin
         ShadowIsValid := True;
@@ -473,12 +486,12 @@ begin
   Ed := nil;
   if ShadowIsValid then
     Ed := ShadowEd
-  else if AppCodetreeState.Editor <> nil then
+  else if Assigned(AppCodetreeState.Editor) then
   begin
     for i := 0 to AppFrameList1.Count - 1 do
     begin
       Frame := TEditorFrame(AppFrameList1.Items[i]);
-      if Frame = nil then Continue;
+      if not Assigned(Frame) then Continue;
       if (Frame.Ed1 = AppCodetreeState.Editor) or
          (Frame.Ed2 = AppCodetreeState.Editor) then
       begin
@@ -489,15 +502,15 @@ begin
     end;
   end;
 
-  if Ed = nil then
+  if not Assigned(Ed) then
   begin
     for i := 0 to AppFrameList1.Count - 1 do
     begin
       Frame := TEditorFrame(AppFrameList1.Items[i]);
-      if Frame <> nil then
+      if Assigned(Frame) then
       begin
         Ed := Frame.Ed1;
-        if Ed <> nil then
+        if Assigned(Ed) then
         begin
           MatchedFrame := Frame;
           Break;
@@ -506,7 +519,7 @@ begin
     end;
   end;
 
-  if Ed = nil then
+  if not Assigned(Ed) then
   begin
     LogStep('[backup] no editor found - aborting');
     Exit;
@@ -531,7 +544,7 @@ begin
       so the user can tell which tab the backup came from. If we can't
       get the caption, fall back to a generic "untitled_tab" name. }
     UntitledName := '';
-    if MatchedFrame <> nil then
+    if Assigned(MatchedFrame) then
       UntitledName := SanitizeForFilename(MatchedFrame.TabCaptionUntitled);
     if UntitledName = '' then
       UntitledName := 'untitled_tab'

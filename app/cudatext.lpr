@@ -14,7 +14,7 @@ uses
   form_lexer_style, form_lexer_stylemap, form_key_input, form_addon_report,
   form_confirm_binary, form_choose_theme, proc_globdata, fix_focus_window,
   form_unprinted, proc_editor_micromap, proc_unique_counter,
-  proc_crashbackup; //crash backup - hook installed after main form is created
+  proc_crash_backup; //crash backup - hook installed after main form is created
 
 {$R *.res}
 
