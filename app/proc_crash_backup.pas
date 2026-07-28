@@ -540,12 +540,15 @@ begin
       If that fails (e.g. settings folder not writable), fall back to
       the system temp folder.
 
-      Try to use the tab's caption (e.g. "Untitled3") in the filename
-      so the user can tell which tab the backup came from. If we can't
-      get the caption, fall back to a generic "untitled_tab" name. }
+      Use the tab's caption (e.g. "Untitled3") in the filename so the
+      user can tell which tab the backup came from. We read
+      Frame.TabCaption - for untitled tabs this contains the numbered
+      caption set at tab creation (GetUntitledNumberedCaption returns
+      e.g. "Untitled3"). If we can't get the caption, fall back to a
+      generic "untitled_tab" name. }
     UntitledName := '';
     if Assigned(MatchedFrame) then
-      UntitledName := SanitizeForFilename(MatchedFrame.TabCaptionUntitled);
+      UntitledName := SanitizeForFilename(MatchedFrame.TabCaption);
     if UntitledName = '' then
       UntitledName := 'untitled_tab'
     else
