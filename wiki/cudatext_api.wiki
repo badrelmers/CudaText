@@ -2321,6 +2321,84 @@ Possible values of "id_action":
 * FINDER_REP_ALL: Performs "replace all" action. Return value: like for FINDER_COUNT.
 * FINDER_REP_ALL_EX: Performs "replace all, extended results" action. It finds always from caret, and always forward. If found, returns list of 6-tuples of int: (x_begin, y_begin, x_end, y_end, x_after, y_after), where (x_after, y_after) is text position after the occurrence, both -1 if occurrence was not replaced. If not found because of incorrect RegEx, returns False. If not found and all Ok, returns empty list.
 
+===diff_proc===
+
+ diff_proc(id, param1, param2, algo=0, flags=0, cancel=None)
+
+Compares two texts using the built-in native diff engine (Free Pascal port of JGit's MyersDiff and HistogramDiff). Returns difflib-compatible opcodes — the same format as Python's <code>difflib.SequenceMatcher.get_opcodes()</code>.
+
+Param "id" specifies the action:
+
+* DIF_TEXTS: Line-level diff. Param "param1" and "param2" are LF-separated strings (text of file A and file B). The engine splits them into lines and compares line-by-line.
+* DIF_CHARS: Char-level diff. Param "param1" and "param2" are two strings compared at character granularity (typically single lines, but works on any strings). Uses word-tokenize + word-level Myers + byte-level prefix/suffix trim (the WinMerge approach).
+
+Param "algo" selects the diff algorithm (only used for DIF_TEXTS, ignored for DIF_CHARS):
+
+* DIFF_ALGO_MYERS: Myers O(ND) with linear-space middle-snake optimization (port of JGit's MyersDiff). The algorithm git uses for <code>git diff --myers</code>.
+* DIFF_ALGO_HISTOGRAM: Histogram diff with max_chain_length=64 fallback to Myers (port of JGit's HistogramDiff). The algorithm git uses for <code>git diff --histogram</code>. Behaves like Patience diff when unique common elements exist, with graceful fallback when they don't.
+
+Param "flags" is a bitmask of ignore options (combine with <code>|</code>):
+
+* DIFF_IGN_NONE (0): Strict equality (default).
+* DIFF_IGN_CASE (1): Case-insensitive comparison.
+* DIFF_IGN_WHITESPACE (2): All whitespace ignored.
+* DIFF_IGN_WHITESPACE_CHANGE (4): Whitespace runs treated as equal, but presence matters.
+* DIFF_IGN_WHITESPACE_EOL (8): Trailing whitespace ignored.
+* DIFF_IGN_WHITESPACE_BEGINNING (16): Leading whitespace ignored.
+* DIFF_IGN_BLANK_LINES (32): Blank lines ignored for matching.
+* DIFF_IGN_EOL (64): CR/LF vs LF treated equal.
+* DIFF_IGN_NUMBERS (128): Digit runs treated as equal (useful for comparing logs with timestamps).
+
+Param "cancel" is optional Python callable (no arguments). If provided, it is called periodically during the diff; if it returns a truthy value, the diff is aborted and the function returns None.
+
+Returns: list of 5-tuples <code>(tag, i1, i2, j1, j2)</code> where:
+
+* <code>tag</code> is a lowercase string: <code>'equal'</code>, <code>'delete'</code>, <code>'insert'</code>, or <code>'replace'</code>.
+* <code>i1, i2</code> is a half-open range into the first text (param1).
+* <code>j1, j2</code> is a half-open range into the second text (param2).
+* Adjacent tuples share boundaries; the first starts at <code>(0, 0)</code>; the last ends at <code>(len(param1), len(param2))</code>.
+
+Returns None if the diff was cancelled.
+
+For DIF_TEXTS, offsets are line indices. For DIF_CHARS, offsets are character indices.
+
+Opcode semantics:
+
+* <code>'equal'</code>: <code>i2-i1 == j2-j1</code>, content is identical.
+* <code>'delete'</code>: <code>i1 < i2</code>, <code>j1 == j2</code>, lines/chars removed from A.
+* <code>'insert'</code>: <code>i1 == i2</code>, <code>j1 < j2</code>, lines/chars added in B.
+* <code>'replace'</code>: <code>i1 < i2</code>, <code>j1 < j2</code>, A[i1:i2] replaced by B[j1:j2].
+
+Example — line-level diff:
+
+<syntaxhighlight lang="Python">
+import cudatext
+
+text_a = "a\nb\nc\n"
+text_b = "a\nX\nc\n"
+
+opcodes = cudatext.diff_proc(
+    cudatext.DIF_TEXTS,
+    text_a,
+    text_b,
+    cudatext.DIFF_ALGO_HISTOGRAM
+)
+# Result: [('equal', 0, 1, 0, 1), ('replace', 1, 2, 1, 2), ('equal', 2, 3, 2, 3)]
+</syntaxhighlight>
+
+Example — char-level diff:
+
+<syntaxhighlight lang="Python">
+import cudatext
+
+opcodes = cudatext.diff_proc(
+    cudatext.DIF_CHARS,
+    "def hello():",
+    "def goodbye():"
+)
+# Result: [('equal', 0, 4, 0, 4), ('replace', 4, 9, 4, 11), ('equal', 9, 12, 11, 14)]
+</syntaxhighlight>
+
 ===more===
 
 =Editor class=
