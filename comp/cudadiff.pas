@@ -934,6 +934,16 @@ begin
   end;
 end;
 
+{ Work item for the explicit diff stack. Replaces recursive CalculateEdits
+  calls — using a heap-allocated stack prevents stack overflow on large
+  files with many differences (TextDiff uses the same PushDiff/PopDiff
+  pattern). }
+type
+  TDiffWorkItem = record
+    BeginA, EndA, BeginB, EndB: Integer;
+  end;
+  TDiffWorkStack = array of TDiffWorkItem;
+
 function MyersDiffNonCommon(
   out AEdits: TDiffEditList;
   const ASeqA, ASeqB: TLineSequence;
@@ -945,100 +955,22 @@ function MyersDiffNonCommon(
 var
   State: TMyersState;
   MaxSize: Integer;
+  WorkStack: TDiffWorkStack;
+  WorkCount: Integer;
+  Item: TDiffWorkItem;
+  Edit: TDiffEdit;
+  K, X, D: Integer;
+  Found: Boolean;
 
-  procedure CalculateEdits(ABeginA, AEndA, ABeginB, AEndB: Integer);
-  var
-    Edit: TDiffEdit;
-    K, X, D: Integer;
-    Found: Boolean;
+  procedure PushWork(ABeginA, AEndA, ABeginB, AEndB: Integer);
   begin
-    if ACancelled then Exit;
-    if IsCancelled(ACancelFunc, ACancelData) then
-    begin
-      ACancelled := True;
-      Exit;
-    end;
-
-    if (ABeginA >= AEndA) or (ABeginB >= AEndB) then
-    begin
-      if (ABeginA < AEndA) or (ABeginB < AEndB) then
-        AEdits.Add(TDiffEdit.Create(ABeginA, AEndA, ABeginB, AEndB));
-      Exit;
-    end;
-
-    State.BeginA := ABeginA;
-    State.EndA := AEndA;
-    State.BeginB := ABeginB;
-    State.EndB := AEndB;
-
-    K := ABeginB - ABeginA;
-    X := ForwardSnake(State, K, ABeginA);
-    State.BeginA := X;
-    State.BeginB := K + X;
-
-    K := AEndB - AEndA;
-    X := BackwardSnake(State, K, AEndA);
-    State.EndA := X;
-    State.EndB := K + X;
-
-    if (State.BeginA >= State.EndA) and (State.BeginB >= State.EndB) then
-      Exit;
-
-    State.MinK := State.BeginB - State.EndA;
-    State.MaxK := State.EndB - State.BeginA;
-    State.FwdMiddleK := State.BeginB - State.BeginA;
-    State.BwdMiddleK := State.EndB - State.EndA;
-    State.FwdBeginK := State.FwdMiddleK;
-    State.FwdEndK := State.FwdMiddleK;
-    State.BwdBeginK := State.BwdMiddleK;
-    State.BwdEndK := State.BwdMiddleK;
-
-    SafeSet(State.FwdX, VIndex(State.OffsetK, State.FwdMiddleK), State.BeginA);
-    SafeSetSnake(State.FwdSnake, VIndex(State.OffsetK, State.FwdMiddleK),
-      PackSnake(State.BeginA, State.FwdMiddleK + State.BeginA));
-    SafeSet(State.BwdX, VIndex(State.OffsetK, State.BwdMiddleK), State.EndA);
-    SafeSetSnake(State.BwdSnake, VIndex(State.OffsetK, State.BwdMiddleK),
-      PackSnake(State.EndA, State.BwdMiddleK + State.EndA));
-
-    Edit := TDiffEdit.Create(0, 0, 0, 0);
-    Found := False;
-    D := 1;
-    while (D < High(Integer)) and not Found do
-    begin
-      if (D and $3FF) = 0 then
-        if IsCancelled(ACancelFunc, ACancelData) then
-        begin
-          ACancelled := True;
-          Exit;
-        end;
-      if ForwardCalculate(State, D) or BackwardCalculate(State, D) then
-      begin
-        Edit := State.MiddleEdit;
-        Found := True;
-      end
-      else
-        Inc(D);
-    end;
-
-    if not Found then
-      Exit; // safety; shouldn't happen
-
-    if (ABeginA < Edit.BeginA) or (ABeginB < Edit.BeginB) then
-    begin
-      K := Edit.BeginB - Edit.BeginA;
-      X := BackwardSnake(State, K, Edit.BeginA);
-      CalculateEdits(ABeginA, X, ABeginB, K + X);
-    end;
-
-    if not Edit.IsEmpty then
-      AEdits.Add(Edit);
-
-    if (AEndA > Edit.EndA) or (AEndB > Edit.EndB) then
-    begin
-      K := Edit.EndB - Edit.EndA;
-      X := ForwardSnake(State, K, Edit.EndA);
-      CalculateEdits(X, AEndA, K + X, AEndB);
-    end;
+    if WorkCount >= Length(WorkStack) then
+      SetLength(WorkStack, MaxI(Length(WorkStack) * 2, WorkCount + 64));
+    WorkStack[WorkCount].BeginA := ABeginA;
+    WorkStack[WorkCount].EndA := AEndA;
+    WorkStack[WorkCount].BeginB := ABeginB;
+    WorkStack[WorkCount].EndB := AEndB;
+    Inc(WorkCount);
   end;
 
 begin
@@ -1061,7 +993,142 @@ begin
   SetLength(State.BwdX, 2 * MaxSize + 1);
   SetLength(State.BwdSnake, 2 * MaxSize + 1);
 
-  CalculateEdits(ARegion.BeginA, ARegion.EndA, ARegion.BeginB, ARegion.EndB);
+  // Initialize the work stack with the top-level region.
+  SetLength(WorkStack, 64);
+  WorkCount := 0;
+  PushWork(ARegion.BeginA, ARegion.EndA, ARegion.BeginB, ARegion.EndB);
+
+  // Process work items from the stack. This replaces the recursive
+  // CalculateEdits calls — the "stack" is now on the heap, so it can
+  // grow to any size without overflowing the call stack.
+  while WorkCount > 0 do
+  begin
+    Dec(WorkCount);
+    Item := WorkStack[WorkCount];
+
+    if ACancelled then Exit;
+    if (WorkCount and $FF) = 0 then
+      if IsCancelled(ACancelFunc, ACancelData) then
+      begin
+        ACancelled := True;
+        Exit;
+      end;
+
+    // Base case: one side empty → emit as a single edit.
+    if (Item.BeginA >= Item.EndA) or (Item.BeginB >= Item.EndB) then
+    begin
+      if (Item.BeginA < Item.EndA) or (Item.BeginB < Item.EndB) then
+        AEdits.Add(TDiffEdit.Create(Item.BeginA, Item.EndA, Item.BeginB, Item.EndB));
+      Continue;
+    end;
+
+    State.BeginA := Item.BeginA;
+    State.EndA := Item.EndA;
+    State.BeginB := Item.BeginB;
+    State.EndB := Item.EndB;
+
+    // Strip common prefix.
+    K := Item.BeginB - Item.BeginA;
+    X := ForwardSnake(State, K, Item.BeginA);
+    State.BeginA := X;
+    State.BeginB := K + X;
+
+    // Strip common suffix.
+    K := Item.EndB - Item.EndA;
+    X := BackwardSnake(State, K, Item.EndA);
+    State.EndA := X;
+    State.EndB := K + X;
+
+    if (State.BeginA >= State.EndA) and (State.BeginB >= State.EndB) then
+      Continue;
+
+    State.MinK := State.BeginB - State.EndA;
+    State.MaxK := State.EndB - State.BeginA;
+    State.FwdMiddleK := State.BeginB - State.BeginA;
+    State.BwdMiddleK := State.EndB - State.EndA;
+    State.FwdBeginK := State.FwdMiddleK;
+    State.FwdEndK := State.FwdMiddleK;
+    State.BwdBeginK := State.BwdMiddleK;
+    State.BwdEndK := State.BwdMiddleK;
+
+    SafeSet(State.FwdX, VIndex(State.OffsetK, State.FwdMiddleK), State.BeginA);
+    SafeSetSnake(State.FwdSnake, VIndex(State.OffsetK, State.FwdMiddleK),
+      PackSnake(State.BeginA, State.FwdMiddleK + State.BeginA));
+    SafeSet(State.BwdX, VIndex(State.OffsetK, State.BwdMiddleK), State.EndA);
+    SafeSetSnake(State.BwdSnake, VIndex(State.OffsetK, State.BwdMiddleK),
+      PackSnake(State.EndA, State.BwdMiddleK + State.EndA));
+
+    // Find the middle snake.
+    Edit := TDiffEdit.Create(0, 0, 0, 0);
+    Found := False;
+    D := 1;
+    while (D < High(Integer)) and not Found do
+    begin
+      if (D and $3FF) = 0 then
+        if IsCancelled(ACancelFunc, ACancelData) then
+        begin
+          ACancelled := True;
+          Exit;
+        end;
+      if ForwardCalculate(State, D) or BackwardCalculate(State, D) then
+      begin
+        Edit := State.MiddleEdit;
+        Found := True;
+      end
+      else
+        Inc(D);
+    end;
+
+    if not Found then
+      Continue;
+
+    // Push the "after" half onto the stack (processed later — LIFO).
+    if (Item.EndA > Edit.EndA) or (Item.EndB > Edit.EndB) then
+    begin
+      K := Edit.EndB - Edit.EndA;
+      X := ForwardSnake(State, K, Edit.EndA);
+      PushWork(X, Item.EndA, K + X, Item.EndB);
+    end;
+
+    // Emit the middle edit itself.
+    if not Edit.IsEmpty then
+      AEdits.Add(Edit);
+
+    // Push the "before" half onto the stack (processed next — LIFO).
+    if (Item.BeginA < Edit.BeginA) or (Item.BeginB < Edit.BeginB) then
+    begin
+      K := Edit.BeginB - Edit.BeginA;
+      X := BackwardSnake(State, K, Edit.BeginA);
+      PushWork(Item.BeginA, X, Item.BeginB, K + X);
+    end;
+  end;
+
+  // The explicit-stack (LIFO) processing emits edits out of positional
+  // order. Sort by BeginA (then BeginB) so EditsToOpcodes can walk them
+  // in order. This is the same approach TextDiff uses — its PushDiff/
+  // PopDiff loop also produces out-of-order edits that are sorted by
+  // position at the end.
+  if AEdits.Count > 1 then
+  begin
+    // Simple insertion sort — edit count is typically small (O(D) where
+    // D is the edit distance, not O(N)). For very large edit counts,
+    // could switch to quicksort, but insertion sort is cache-friendly
+    // and fast for small arrays.
+    for K := 1 to AEdits.Count - 1 do
+    begin
+      Edit := AEdits.Items[K];
+      D := K - 1;
+      while (D >= 0) and
+            ((AEdits.Items[D].BeginA > Edit.BeginA) or
+             ((AEdits.Items[D].BeginA = Edit.BeginA) and
+              (AEdits.Items[D].BeginB > Edit.BeginB))) do
+      begin
+        AEdits.Items[D + 1] := AEdits.Items[D];
+        Dec(D);
+      end;
+      AEdits.Items[D + 1] := Edit;
+    end;
+  end;
 end;
 
 { ---------- HistogramDiff ---------- }
