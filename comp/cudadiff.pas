@@ -317,6 +317,37 @@ begin
   Result := AK + AOffsetK;
 end;
 
+{ Bounds-checked access to the V arrays. Returns 0 (safe default) if the
+  index is out of range, preventing access violations that would crash
+  CudaText (access violations bypass try/except and kill the process). }
+function SafeGet(const AArr: array of Integer; AIdx: Integer): Integer; inline;
+begin
+  if (AIdx < 0) or (AIdx >= Length(AArr)) then
+    Result := 0
+  else
+    Result := AArr[AIdx];
+end;
+
+function SafeGetSnake(const AArr: array of Int64; AIdx: Integer): Int64; inline;
+begin
+  if (AIdx < 0) or (AIdx >= Length(AArr)) then
+    Result := 0
+  else
+    Result := AArr[AIdx];
+end;
+
+procedure SafeSet(var AArr: array of Integer; AIdx, AValue: Integer); inline;
+begin
+  if (AIdx >= 0) and (AIdx < Length(AArr)) then
+    AArr[AIdx] := AValue;
+end;
+
+procedure SafeSetSnake(var AArr: array of Int64; AIdx: Integer; AValue: Int64); inline;
+begin
+  if (AIdx >= 0) and (AIdx < Length(AArr)) then
+    AArr[AIdx] := AValue;
+end;
+
 { ---------- TDiffEdit ---------- }
 
 function TDiffEdit.GetType: TDiffEditType;
@@ -721,19 +752,19 @@ begin
     if K > PrevBeginK then
     begin
       I := VIndex(AState.OffsetK, K - 1);
-      Left := AState.FwdX[I];
+      Left := SafeGet(AState.FwdX, I);
       LeftEnd := ForwardSnake(AState, K - 1, Left);
       if Left <> LeftEnd then
         LeftSnake := PackSnake(LeftEnd, (K - 1) + LeftEnd)
       else
-        LeftSnake := AState.FwdSnake[I];
+        LeftSnake := SafeGetSnake(AState.FwdSnake, I);
       if (K - 1 >= AState.BwdBeginK) and (K - 1 <= AState.BwdEndK) and
          (((AD - 1 + (K - 1) - AState.BwdMiddleK) mod 2) = 0) and
-         (LeftEnd >= AState.BwdX[VIndex(AState.OffsetK, K - 1)]) then
+         (LeftEnd >= SafeGet(AState.BwdX, VIndex(AState.OffsetK, K - 1))) then
       begin
         AState.MiddleEdit := TDiffEdit.Create(
-          SnakeX(LeftSnake), SnakeX(AState.BwdSnake[VIndex(AState.OffsetK, K - 1)]),
-          SnakeY(LeftSnake), SnakeY(AState.BwdSnake[VIndex(AState.OffsetK, K - 1)])
+          SnakeX(LeftSnake), SnakeX(SafeGetSnake(AState.BwdSnake, VIndex(AState.OffsetK, K - 1))),
+          SnakeY(LeftSnake), SnakeY(SafeGetSnake(AState.BwdSnake, VIndex(AState.OffsetK, K - 1)))
         );
         Exit(True);
       end;
@@ -743,19 +774,19 @@ begin
     if K < PrevEndK then
     begin
       I := VIndex(AState.OffsetK, K + 1);
-      Right := AState.FwdX[I];
+      Right := SafeGet(AState.FwdX, I);
       RightEnd := ForwardSnake(AState, K + 1, Right);
       if Right <> RightEnd then
         RightSnake := PackSnake(RightEnd, (K + 1) + RightEnd)
       else
-        RightSnake := AState.FwdSnake[I];
+        RightSnake := SafeGetSnake(AState.FwdSnake, I);
       if (K + 1 >= AState.BwdBeginK) and (K + 1 <= AState.BwdEndK) and
          (((AD - 1 + (K + 1) - AState.BwdMiddleK) mod 2) = 0) and
-         (RightEnd >= AState.BwdX[VIndex(AState.OffsetK, K + 1)]) then
+         (RightEnd >= SafeGet(AState.BwdX, VIndex(AState.OffsetK, K + 1))) then
       begin
         AState.MiddleEdit := TDiffEdit.Create(
-          SnakeX(RightSnake), SnakeX(AState.BwdSnake[VIndex(AState.OffsetK, K + 1)]),
-          SnakeY(RightSnake), SnakeY(AState.BwdSnake[VIndex(AState.OffsetK, K + 1)])
+          SnakeX(RightSnake), SnakeX(SafeGetSnake(AState.BwdSnake, VIndex(AState.OffsetK, K + 1))),
+          SnakeY(RightSnake), SnakeY(SafeGetSnake(AState.BwdSnake, VIndex(AState.OffsetK, K + 1)))
         );
         Exit(True);
       end;
@@ -775,11 +806,11 @@ begin
 
     if (K >= AState.BwdBeginK) and (K <= AState.BwdEndK) and
        (((AD + K - AState.BwdMiddleK) mod 2) = 0) and
-       (NewX >= AState.BwdX[VIndex(AState.OffsetK, K)]) then
+       (NewX >= SafeGet(AState.BwdX, VIndex(AState.OffsetK, K))) then
     begin
       AState.MiddleEdit := TDiffEdit.Create(
-        SnakeX(NewSnake), SnakeX(AState.BwdSnake[VIndex(AState.OffsetK, K)]),
-        SnakeY(NewSnake), SnakeY(AState.BwdSnake[VIndex(AState.OffsetK, K)])
+        SnakeX(NewSnake), SnakeX(SafeGetSnake(AState.BwdSnake, VIndex(AState.OffsetK, K))),
+        SnakeY(NewSnake), SnakeY(SafeGetSnake(AState.BwdSnake, VIndex(AState.OffsetK, K)))
       );
       Exit(True);
     end;
@@ -792,8 +823,8 @@ begin
         AState.MinK := K;
     end;
 
-    AState.FwdX[VIndex(AState.OffsetK, K)] := NewX;
-    AState.FwdSnake[VIndex(AState.OffsetK, K)] := NewSnake;
+    SafeSet(AState.FwdX, VIndex(AState.OffsetK, K), NewX);
+    SafeSetSnake(AState.FwdSnake, VIndex(AState.OffsetK, K), NewSnake);
 
     Dec(K, 2);
   end;
@@ -825,19 +856,19 @@ begin
     if K > PrevBeginK then
     begin
       I := VIndex(AState.OffsetK, K - 1);
-      Left := AState.BwdX[I];
+      Left := SafeGet(AState.BwdX, I);
       LeftEnd := BackwardSnake(AState, K - 1, Left);
       if Left <> LeftEnd then
         LeftSnake := PackSnake(LeftEnd, (K - 1) + LeftEnd)
       else
-        LeftSnake := AState.BwdSnake[I];
+        LeftSnake := SafeGetSnake(AState.BwdSnake, I);
       if (K - 1 >= AState.FwdBeginK) and (K - 1 <= AState.FwdEndK) and
          (((AD + (K - 1) - AState.FwdMiddleK) mod 2) = 0) and
-         (LeftEnd <= AState.FwdX[VIndex(AState.OffsetK, K - 1)]) then
+         (LeftEnd <= SafeGet(AState.FwdX, VIndex(AState.OffsetK, K - 1))) then
       begin
         AState.MiddleEdit := TDiffEdit.Create(
-          SnakeX(AState.FwdSnake[VIndex(AState.OffsetK, K - 1)]), SnakeX(LeftSnake),
-          SnakeY(AState.FwdSnake[VIndex(AState.OffsetK, K - 1)]), SnakeY(LeftSnake)
+          SnakeX(SafeGetSnake(AState.FwdSnake, VIndex(AState.OffsetK, K - 1))), SnakeX(LeftSnake),
+          SnakeY(SafeGetSnake(AState.FwdSnake, VIndex(AState.OffsetK, K - 1))), SnakeY(LeftSnake)
         );
         Exit(True);
       end;
@@ -847,19 +878,19 @@ begin
     if K < PrevEndK then
     begin
       I := VIndex(AState.OffsetK, K + 1);
-      Right := AState.BwdX[I];
+      Right := SafeGet(AState.BwdX, I);
       RightEnd := BackwardSnake(AState, K + 1, Right);
       if Right <> RightEnd then
         RightSnake := PackSnake(RightEnd, (K + 1) + RightEnd)
       else
-        RightSnake := AState.BwdSnake[I];
+        RightSnake := SafeGetSnake(AState.BwdSnake, I);
       if (K + 1 >= AState.FwdBeginK) and (K + 1 <= AState.FwdEndK) and
          (((AD + (K + 1) - AState.FwdMiddleK) mod 2) = 0) and
-         (RightEnd <= AState.FwdX[VIndex(AState.OffsetK, K + 1)]) then
+         (RightEnd <= SafeGet(AState.FwdX, VIndex(AState.OffsetK, K + 1))) then
       begin
         AState.MiddleEdit := TDiffEdit.Create(
-          SnakeX(AState.FwdSnake[VIndex(AState.OffsetK, K + 1)]), SnakeX(RightSnake),
-          SnakeY(AState.FwdSnake[VIndex(AState.OffsetK, K + 1)]), SnakeY(RightSnake)
+          SnakeX(SafeGetSnake(AState.FwdSnake, VIndex(AState.OffsetK, K + 1))), SnakeX(RightSnake),
+          SnakeY(SafeGetSnake(AState.FwdSnake, VIndex(AState.OffsetK, K + 1))), SnakeY(RightSnake)
         );
         Exit(True);
       end;
@@ -879,11 +910,11 @@ begin
 
     if (K >= AState.FwdBeginK) and (K <= AState.FwdEndK) and
        (((AD + K - AState.FwdMiddleK) mod 2) = 0) and
-       (NewX <= AState.FwdX[VIndex(AState.OffsetK, K)]) then
+       (NewX <= SafeGet(AState.FwdX, VIndex(AState.OffsetK, K))) then
     begin
       AState.MiddleEdit := TDiffEdit.Create(
-        SnakeX(AState.FwdSnake[VIndex(AState.OffsetK, K)]), SnakeX(NewSnake),
-        SnakeY(AState.FwdSnake[VIndex(AState.OffsetK, K)]), SnakeY(NewSnake)
+        SnakeX(SafeGetSnake(AState.FwdSnake, VIndex(AState.OffsetK, K))), SnakeX(NewSnake),
+        SnakeY(SafeGetSnake(AState.FwdSnake, VIndex(AState.OffsetK, K))), SnakeY(NewSnake)
       );
       Exit(True);
     end;
@@ -896,8 +927,8 @@ begin
         AState.MinK := K;
     end;
 
-    AState.BwdX[VIndex(AState.OffsetK, K)] := NewX;
-    AState.BwdSnake[VIndex(AState.OffsetK, K)] := NewSnake;
+    SafeSet(AState.BwdX, VIndex(AState.OffsetK, K), NewX);
+    SafeSetSnake(AState.BwdSnake, VIndex(AState.OffsetK, K), NewSnake);
 
     Dec(K, 2);
   end;
@@ -962,12 +993,12 @@ var
     State.BwdBeginK := State.BwdMiddleK;
     State.BwdEndK := State.BwdMiddleK;
 
-    State.FwdX[VIndex(State.OffsetK, State.FwdMiddleK)] := State.BeginA;
-    State.FwdSnake[VIndex(State.OffsetK, State.FwdMiddleK)] :=
-      PackSnake(State.BeginA, State.FwdMiddleK + State.BeginA);
-    State.BwdX[VIndex(State.OffsetK, State.BwdMiddleK)] := State.EndA;
-    State.BwdSnake[VIndex(State.OffsetK, State.BwdMiddleK)] :=
-      PackSnake(State.EndA, State.BwdMiddleK + State.EndA);
+    SafeSet(State.FwdX, VIndex(State.OffsetK, State.FwdMiddleK), State.BeginA);
+    SafeSetSnake(State.FwdSnake, VIndex(State.OffsetK, State.FwdMiddleK),
+      PackSnake(State.BeginA, State.FwdMiddleK + State.BeginA));
+    SafeSet(State.BwdX, VIndex(State.OffsetK, State.BwdMiddleK), State.EndA);
+    SafeSetSnake(State.BwdSnake, VIndex(State.OffsetK, State.BwdMiddleK),
+      PackSnake(State.EndA, State.BwdMiddleK + State.EndA));
 
     Edit := TDiffEdit.Create(0, 0, 0, 0);
     Found := False;
