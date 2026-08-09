@@ -1863,12 +1863,18 @@ begin
   Tokenize(ATextA, TokensA);
   Tokenize(ATextB, TokensB);
 
-  // Step 2: run word-level Myers diff. We reuse DoDiffLines by passing
-  // the word arrays as if they were line arrays. The algorithm doesn't
-  // care whether the "lines" are actual lines or words.
+  // Step 2: run word-level diff. Use HISTOGRAM (not MYERS) because:
+  // - Words are often repeated (identifiers, keywords, punctuation), and
+  //   Histogram's occurrence-counting handles this efficiently.
+  // - Myers O(ND) is slow when D (word edit distance) is large, which
+  //   happens on long lines with many changes. Histogram degrades more
+  //   gracefully via its chain-length cutoff + Myers fallback.
+  // - For typical code lines (10-100 words), both are fast. For long
+  //   lines (1000+ words, e.g. minified JS), Histogram is dramatically
+  //   faster.
   WordsA := TokensToStrings(TokensA);
   WordsB := TokensToStrings(TokensB);
-  WordOpcodes := DoDiffLines(WordsA, WordsB, DIFF_ALGO_MYERS, AFlags,
+  WordOpcodes := DoDiffLines(WordsA, WordsB, DIFF_ALGO_HISTOGRAM, AFlags,
     ACancelFunc, ACancelData, ACancelled);
   if ACancelled then
     Exit;
@@ -1890,6 +1896,17 @@ begin
     WAEnd := WordOpcodes[I].I2;
     WBStart := WordOpcodes[I].J1;
     WBEnd := WordOpcodes[I].J2;
+
+    // Bounds-check the word indices against the token arrays. The diff
+    // algorithm should always produce valid indices, but with
+    // {$RANGECHECKS OFF} an out-of-bounds access would silently read
+    // wrong memory and crash. Clamp to valid range as a safety net.
+    if WAStart < 0 then WAStart := 0;
+    if WAEnd > Length(TokensA) then WAEnd := Length(TokensA);
+    if WAStart > WAEnd then WAStart := WAEnd;
+    if WBStart < 0 then WBStart := 0;
+    if WBEnd > Length(TokensB) then WBEnd := Length(TokensB);
+    if WBStart > WBEnd then WBStart := WBEnd;
 
     if Tag = DIFF_TAG_EQUAL then
     begin
