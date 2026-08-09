@@ -915,8 +915,9 @@ const
   
   { diff_proc: action IDs for the id parameter }
   DIF_TEXTS              = 1;  // param1, param2 are LF-separated strings
-  // DIF_LINES            = 2;  // reserved for future (list-of-strings input)
-  // DIF_EDITORS          = 3;  // reserved for future (editor handles)
+  DIF_CHARS              = 2;  // param1, param2 are two strings compared at char level
+  // DIF_LINES            = 3;  // reserved for future (list-of-strings input)
+  // DIF_EDITORS          = 4;  // reserved for future (editor handles)
 
   { diff_proc: algorithm selectors for the algo parameter }
   DIFF_ALGO_MYERS        = 0;

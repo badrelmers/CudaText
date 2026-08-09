@@ -11130,7 +11130,9 @@ end;
 //diff_proc(id, param1, param2, algo=0, flags=0, cancel=None)
 //Compares two texts and returns difflib-compatible opcodes.
 //  id: DIF_TEXTS (1) -- param1, param2 are LF-separated strings.
+//      DIF_CHARS (2) -- param1, param2 are two strings compared at char level.
 //  algo: DIFF_ALGO_MYERS (0) or DIFF_ALGO_HISTOGRAM (1).
+//        Ignored for DIF_CHARS (char diff always uses word-Myers + byte-trim).
 //  flags: bitmask of DIFF_IGN_* values (case/whitespace/numbers/etc).
 //  cancel: optional Python callable; called periodically, return True to abort.
 //Returns: list of (tag, i1, i2, j1, j2) tuples where tag is a lowercase
@@ -11150,6 +11152,36 @@ var
   I: Integer;
   TagStr: string;
   TagPtr: PChar;
+
+  procedure BuildOpcodeList(const AOpcodes: TDiffOpcodeArray);
+  var
+    J: Integer;
+    LTagStr: string;
+    LTagPtr: PChar;
+  begin
+    with AppPython.Engine do
+    begin
+      Result := PyList_New(Length(AOpcodes));
+      if not Assigned(Result) then
+        raise EPythonError.Create(msgPythonListError);
+      for J := 0 to High(AOpcodes) do
+      begin
+        case AOpcodes[J].Tag of
+          DIFF_TAG_EQUAL:   LTagStr := 'equal';
+          DIFF_TAG_DELETE:  LTagStr := 'delete';
+          DIFF_TAG_INSERT:  LTagStr := 'insert';
+          DIFF_TAG_REPLACE: LTagStr := 'replace';
+          else              LTagStr := 'equal';
+        end;
+        LTagPtr := PChar(LTagStr);
+        PyList_SetItem(Result, J,
+          Py_BuildValue('(siiii)', LTagPtr,
+            AOpcodes[J].I1, AOpcodes[J].I2,
+            AOpcodes[J].J1, AOpcodes[J].J2));
+      end;
+    end;
+  end;
+
 begin
   CancelObj := nil;
   NAlgo := DIFF_ALGO_MYERS;
@@ -11177,25 +11209,19 @@ begin
           if Cancelled then
             Exit(ReturnNone);
 
-          // Build a Python list of 5-tuples (tag, i1, i2, j1, j2).
-          Result := PyList_New(Length(Opcodes));
-          if not Assigned(Result) then
-            raise EPythonError.Create(msgPythonListError);
-          for I := 0 to High(Opcodes) do
-          begin
-            case Opcodes[I].Tag of
-              DIFF_TAG_EQUAL:   TagStr := 'equal';
-              DIFF_TAG_DELETE:  TagStr := 'delete';
-              DIFF_TAG_INSERT:  TagStr := 'insert';
-              DIFF_TAG_REPLACE: TagStr := 'replace';
-              else              TagStr := 'equal';
-            end;
-            TagPtr := PChar(TagStr);
-            PyList_SetItem(Result, I,
-              Py_BuildValue('(siiii)', TagPtr,
-                Opcodes[I].I1, Opcodes[I].I2,
-                Opcodes[I].J1, Opcodes[I].J2));
-          end;
+          BuildOpcodeList(Opcodes);
+        end;
+      DIF_CHARS:
+        begin
+          // Char-level diff. NAlgo is ignored — char diff always uses
+          // word-Myers + byte-trim internally.
+          Opcodes := CudaDiff.DoDiffChars(Str1, Str2, NFlags,
+            @api_diff_proc_CancelCallback, CancelObj, Cancelled);
+
+          if Cancelled then
+            Exit(ReturnNone);
+
+          BuildOpcodeList(Opcodes);
         end;
       else
         begin
