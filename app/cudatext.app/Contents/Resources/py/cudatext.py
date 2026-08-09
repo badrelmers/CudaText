@@ -1052,8 +1052,6 @@ FINDER_REP_ALL_EX       = 39
 # diff_proc: action IDs for the id parameter
 DIF_TEXTS              = 1
 DIF_CHARS              = 2
-# DIF_LINES            = 3  # reserved for future (list-of-strings input)
-# DIF_EDITORS          = 4  # reserved for future (editor handles)
 
 # diff_proc: algorithm selectors for the algo parameter
 DIFF_ALGO_MYERS        = 0
@@ -1411,6 +1409,9 @@ def dlg_proc(id_dialog, id_action, prop='', index=-1, index2=-1, name=''):
 
 def finder_proc(id_finder, id_action, value="", setcaret=True):
     return ct.finder_proc(id_finder, id_action, to_str(value), setcaret)
+
+def diff_proc(id, param1, param2, algo=0, flags=0, cancel=None):
+    return ct.diff_proc(id, param1, param2, algo, flags, cancel)
 
 def esc_z(s):
     # temp solution for null chars, later replace it to full solution with app patch
