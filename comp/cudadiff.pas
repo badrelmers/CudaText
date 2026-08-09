@@ -533,20 +533,27 @@ begin
   Result := string(OutStr);
 end;
 
-{ djb2 hash of a line's bytes. Matches JGit's RawTextComparator.hashRegion. }
+{ djb2 hash of a line's bytes. Matches JGit's RawTextComparator.hashRegion.
+  Uses Cardinal (unsigned 32-bit) for the accumulator because the hash
+  is designed to wrap around — with signed Integer, the shl+add would
+  trigger ERangeError when CudaText is compiled with {$OVERFLOWCHECKS ON}.
+  Also explicitly disables overflow/range checks for this function since
+  hash wrapping is intentional behavior, not a bug. }
+{$Q-}{$R-}
 function HashLine(const ALine: string): Integer;
 var
   S: AnsiString;
   I, Len: Integer;
-  H: Integer;
+  H: Cardinal;
 begin
   S := AnsiString(ALine);
   Len := Length(S);
   H := DJB2_SEED;
   for I := 1 to Len do
     H := ((H shl 5) + H) + Ord(S[I]);
-  Result := H;
+  Result := Integer(H);
 end;
+{$Q+}{$R+}
 
 { ---------- TLineSequence ---------- }
 
@@ -1064,6 +1071,7 @@ begin
   FFallback := False;
 end;
 
+{$Q-}{$R-}
 function THistogramIndex.HashSeq(ASeq: PLineSequence; AIdx: Integer): Integer;
 var
   RawHash: Integer;
@@ -1075,6 +1083,7 @@ begin
   Mixed := Cardinal(RawHash) * HASH_MIX_CONSTANT;
   Result := Integer(Mixed shr FKeyShift);
 end;
+{$Q+}{$R+}
 
 class function THistogramIndex.RecCreate(ANext, APtr, ACnt: Integer): Int64;
 begin
