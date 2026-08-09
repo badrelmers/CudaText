@@ -101,6 +101,28 @@ function DoDiffText(
   out ACancelled: Boolean
 ): TDiffOpcodeArray;
 
+{ Compare two strings at character granularity. Returns char-level
+  opcodes (tag, a_start, a_end, b_start, b_end) where offsets are
+  character positions into ATextA / ATextB. Same difflib format as
+  DoDiffLines, just at character instead of line granularity.
+
+  Internally uses the WinMerge approach: tokenize both strings into
+  words (identifiers, whitespace, individual punctuation), run word-
+  level Myers diff, then refine each non-equal word region to exact
+  byte boundaries with prefix/suffix trimming. This is dramatically
+  faster than running Myers directly on characters for long lines
+  (words are more unique than characters, so O(ND) is much smaller).
+
+  AAlgo is ignored for DIF_CHARS — char diff always uses word-Myers +
+  byte-trim. AFlags supports the same DIFF_IGN_* options as line diff. }
+function DoDiffChars(
+  const ATextA, ATextB: string;
+  AFlags: Integer;
+  ACancelFunc: TDiffCancelFunc;
+  ACancelData: Pointer;
+  out ACancelled: Boolean
+): TDiffOpcodeArray;
+
 { Split a string on #10 keeping the terminator attached. Useful for
   callers who want to pre-split text once and reuse the line array
   across multiple DoDiffLines calls. }
@@ -1591,6 +1613,385 @@ begin
   LinesB := SplitLinesKeepEnds(ATextB);
   Result := DoDiffLines(LinesA, LinesB, AAlgo, AFlags,
     ACancelFunc, ACancelData, ACancelled);
+end;
+
+{ ---------- Character-level diff (DIF_CHARS) ---------- }
+{
+  Port of WinMerge's stringdiffs.cpp + the plugin's char_diff.py.
+
+  Algorithm:
+    1. Tokenize both strings into "words" using the regex
+       \w+|\s+|[^\w\s]  (identifiers, whitespace, individual punctuation).
+       Words are more unique than individual characters, so word-level
+       Myers O(ND) is much smaller than char-level Myers for long lines.
+    2. Run MyersDiff (the existing line-level algorithm) on the word
+       arrays. The algorithm is generic over any hashable sequence.
+    3. For each word-level opcode:
+       - 'equal': emit as char-level 'equal' using the token offsets.
+       - 'delete'/'insert'/'replace': refine to exact byte boundaries
+         using prefix/suffix trimming (compute the common prefix and
+         suffix of the two substrings, mark the middle as changed).
+    4. Merge adjacent opcodes of the same tag (the byte-trim step can
+       produce consecutive 'equal' or 'replace' opcodes that should
+       be merged for a clean difflib-style output).
+}
+
+type
+  { Token from the word tokenizer. Stores the token text (for hashing
+    and equality) and the character offset where it starts in the
+    original string (for mapping word-level opcodes back to char positions). }
+  TToken = record
+    Text: string;
+    StartOffset: Integer;  // 0-based char offset into the original string
+    Length: Integer;       // character length of this token
+  end;
+  TTokenArray = array of TToken;
+
+{ Check if a character is a "word" character (letter, digit, underscore).
+  Matches the \w class in Python's regex engine for ASCII. }
+function IsWordChar(C: AnsiChar): Boolean; inline;
+begin
+  Result := ((C >= 'A') and (C <= 'Z')) or
+            ((C >= 'a') and (C <= 'z')) or
+            ((C >= '0') and (C <= '9')) or
+            (C = '_');
+end;
+
+{ Tokenize a string into words, whitespace runs, and individual punctuation
+  characters. Port of char_diff.py's _tokenize() which uses the regex
+  \w+|\s+|[^\w\s]. Produces the same tokenization as WinMerge's
+  BuildWordsArray (which uses ICU break iterators — close enough for
+  diff purposes; the exact tokenization only affects which boundaries
+  Myers can find, not the correctness of the diff).
+
+  Also returns the character offset of each token in the original string
+  so we can map word-level opcodes back to character positions. }
+procedure Tokenize(const AText: string; out ATokens: TTokenArray);
+var
+  S: AnsiString;
+  N, I, TokenStart, TokenLen: Integer;
+  Count: Integer;
+  C: AnsiChar;
+begin
+  SetLength(ATokens, 0);
+  S := AnsiString(AText);
+  N := Length(S);
+  if N = 0 then
+    Exit;
+
+  // Pre-count tokens to size the array in one allocation.
+  // Worst case: every char is its own token (all punctuation).
+  SetLength(ATokens, N);
+  Count := 0;
+
+  I := 1;
+  while I <= N do
+  begin
+    C := S[I];
+    TokenStart := I;
+    if IsWordChar(C) then
+    begin
+      // \w+ — run of word characters
+      while (I <= N) and IsWordChar(S[I]) do
+        Inc(I);
+    end
+    else if IsWhitespaceByte(C) then
+    begin
+      // \s+ — run of whitespace
+      while (I <= N) and IsWhitespaceByte(S[I]) do
+        Inc(I);
+    end
+    else
+    begin
+      // [^\w\s] — single punctuation character
+      Inc(I);
+    end;
+    TokenLen := I - TokenStart;
+    ATokens[Count].Text := string(Copy(S, TokenStart, TokenLen));
+    // StartOffset is 0-based into the original string; S is 1-based.
+    ATokens[Count].StartOffset := TokenStart - 1;
+    ATokens[Count].Length := TokenLen;
+    Inc(Count);
+  end;
+  SetLength(ATokens, Count);
+end;
+
+{ Build a TStringArray from tokens (for passing to DoDiffLines which
+  works on string arrays). }
+function TokensToStrings(const ATokens: TTokenArray): TStringArray;
+var
+  I: Integer;
+begin
+  SetLength(Result, Length(ATokens));
+  for I := 0 to High(ATokens) do
+    Result[I] := ATokens[I].Text;
+end;
+
+{ Compute the common prefix length of two string slices.
+  Port of char_diff.py's _compute_byte_diff prefix portion. }
+function CommonPrefixLen(const AText: string; AStartA: Integer;
+  const BText: string; AStartB: Integer; AMaxLen: Integer): Integer;
+var
+  SA, SB: AnsiString;
+  I: Integer;
+begin
+  SA := AnsiString(AText);
+  SB := AnsiString(BText);
+  // AStartA/AStartB are 0-based; SA/SB are 1-based.
+  Result := 0;
+  while (Result < AMaxLen) and
+        (SA[AStartA + 1 + Result] = SB[AStartB + 1 + Result]) do
+    Inc(Result);
+end;
+
+{ Compute the common suffix length of two string slices.
+  Port of char_diff.py's _compute_byte_diff suffix portion. }
+function CommonSuffixLen(const AText: string; AStartA, ALenA: Integer;
+  const BText: string; AStartB, ALenB: Integer; AMaxLen: Integer): Integer;
+var
+  SA, SB: AnsiString;
+begin
+  SA := AnsiString(AText);
+  SB := AnsiString(BText);
+  Result := 0;
+  while (Result < AMaxLen) and
+        (SA[AStartA + ALenA - Result] = SB[AStartB + ALenB - Result]) do
+    Inc(Result);
+end;
+
+function DoDiffChars(
+  const ATextA, ATextB: string;
+  AFlags: Integer;
+  ACancelFunc: TDiffCancelFunc;
+  ACancelData: Pointer;
+  out ACancelled: Boolean
+): TDiffOpcodeArray;
+var
+  TokensA, TokensB: TTokenArray;
+  WordsA, WordsB: TStringArray;
+  WordOpcodes: TDiffOpcodeArray;
+  I, J: Integer;
+  Tag: Integer;
+  WAStart, WAEnd, WBStart, WBEnd: Integer;  // word-level ranges
+  CAStart, CAEnd, CBStart, CBEnd: Integer;  // char-level ranges
+  StrA, StrB: AnsiString;
+  PrefixLen, SuffixLen: Integer;
+  MinLen: Integer;
+  InnerLenA, InnerLenB: Integer;
+  InnerStartA, InnerStartB: Integer;
+  Result_: TDiffOpcodeArray;
+  ResultCount: Integer;
+  LastTag: Integer;
+
+  procedure Emit(ATag: Integer; AA1, AA2, AB1, AB2: Integer);
+  begin
+    // Merge with previous opcode if same tag and adjacent.
+    // The byte-trim step can produce consecutive 'equal' or 'replace'
+    // opcodes that should be merged for clean difflib-style output.
+    if (ResultCount > 0) and (Result_[ResultCount - 1].Tag = ATag) and
+       (Result_[ResultCount - 1].I2 = AA1) and
+       (Result_[ResultCount - 1].J2 = AB1) then
+    begin
+      Result_[ResultCount - 1].I2 := AA2;
+      Result_[ResultCount - 1].J2 := AB2;
+    end
+    else
+    begin
+      if ResultCount >= Length(Result_) then
+        SetLength(Result_, MaxI(Length(Result_) * 2, ResultCount + 16));
+      Result_[ResultCount].Tag := ATag;
+      Result_[ResultCount].I1 := AA1;
+      Result_[ResultCount].I2 := AA2;
+      Result_[ResultCount].J1 := AB1;
+      Result_[ResultCount].J2 := AB2;
+      Inc(ResultCount);
+    end;
+  end;
+
+begin
+  ACancelled := False;
+  SetLength(Result, 0);
+
+  // Fast path: identical strings produce a single 'equal' opcode.
+  if ATextA = ATextB then
+  begin
+    if (ATextA <> '') or (ATextB <> '') then
+    begin
+      SetLength(Result, 1);
+      Result[0].Tag := DIFF_TAG_EQUAL;
+      Result[0].I1 := 0;
+      Result[0].I2 := Length(ATextA);
+      Result[0].J1 := 0;
+      Result[0].J2 := Length(ATextB);
+    end;
+    Exit;
+  end;
+
+  // Fast path: one side empty -> single insert or delete.
+  if ATextA = '' then
+  begin
+    SetLength(Result, 1);
+    Result[0].Tag := DIFF_TAG_INSERT;
+    Result[0].I1 := 0;
+    Result[0].I2 := 0;
+    Result[0].J1 := 0;
+    Result[0].J2 := Length(ATextB);
+    Exit;
+  end;
+  if ATextB = '' then
+  begin
+    SetLength(Result, 1);
+    Result[0].Tag := DIFF_TAG_DELETE;
+    Result[0].I1 := 0;
+    Result[0].I2 := Length(ATextA);
+    Result[0].J1 := 0;
+    Result[0].J2 := 0;
+    Exit;
+  end;
+
+  // Step 1: tokenize both strings into words.
+  Tokenize(ATextA, TokensA);
+  Tokenize(ATextB, TokensB);
+
+  // Step 2: run word-level Myers diff. We reuse DoDiffLines by passing
+  // the word arrays as if they were line arrays. The algorithm doesn't
+  // care whether the "lines" are actual lines or words.
+  WordsA := TokensToStrings(TokensA);
+  WordsB := TokensToStrings(TokensB);
+  WordOpcodes := DoDiffLines(WordsA, WordsB, DIFF_ALGO_MYERS, AFlags,
+    ACancelFunc, ACancelData, ACancelled);
+  if ACancelled then
+    Exit;
+
+  StrA := AnsiString(ATextA);
+  StrB := AnsiString(ATextB);
+
+  // Step 3: convert word-level opcodes to char-level opcodes.
+  // For 'equal' opcodes, map word boundaries to char offsets directly.
+  // For non-equal opcodes, refine with byte-level prefix/suffix trim.
+  SetLength(Result_, MaxI(16, Length(WordOpcodes)));
+  ResultCount := 0;
+  LastTag := -1;
+
+  for I := 0 to High(WordOpcodes) do
+  begin
+    Tag := WordOpcodes[I].Tag;
+    WAStart := WordOpcodes[I].I1;
+    WAEnd := WordOpcodes[I].I2;
+    WBStart := WordOpcodes[I].J1;
+    WBEnd := WordOpcodes[I].J2;
+
+    if Tag = DIFF_TAG_EQUAL then
+    begin
+      // Word range is identical in both — emit as char-level 'equal'.
+      // Char start = first token's StartOffset.
+      // Char end = last token's StartOffset + last token's Length.
+      if (WAEnd > WAStart) and (WBEnd > WBStart) then
+      begin
+        CAStart := TokensA[WAStart].StartOffset;
+        CAEnd := TokensA[WAEnd - 1].StartOffset + TokensA[WAEnd - 1].Length;
+        CBStart := TokensB[WBStart].StartOffset;
+        CBEnd := TokensB[WBEnd - 1].StartOffset + TokensB[WBEnd - 1].Length;
+        Emit(DIFF_TAG_EQUAL, CAStart, CAEnd, CBStart, CBEnd);
+      end;
+    end
+    else
+    begin
+      // Non-equal word range: refine to byte boundaries.
+      // Get the char range covered by this word opcode.
+      if WAEnd > WAStart then
+      begin
+        CAStart := TokensA[WAStart].StartOffset;
+        CAEnd := TokensA[WAEnd - 1].StartOffset + TokensA[WAEnd - 1].Length;
+      end
+      else
+      begin
+        // No A tokens in this range — insert at the boundary.
+        // Use the char offset of the token BEFORE the insert point,
+        // or 0 if inserting at the very start.
+        if WAStart > 0 then
+          CAStart := TokensA[WAStart - 1].StartOffset + TokensA[WAStart - 1].Length
+        else
+          CAStart := 0;
+        CAEnd := CAStart;
+      end;
+      if WBEnd > WBStart then
+      begin
+        CBStart := TokensB[WBStart].StartOffset;
+        CBEnd := TokensB[WBEnd - 1].StartOffset + TokensB[WBEnd - 1].Length;
+      end
+      else
+      begin
+        if WBStart > 0 then
+          CBStart := TokensB[WBStart - 1].StartOffset + TokensB[WBStart - 1].Length
+        else
+          CBStart := 0;
+        CBEnd := CBStart;
+      end;
+
+      InnerLenA := CAEnd - CAStart;
+      InnerLenB := CBEnd - CBStart;
+
+      if (InnerLenA = 0) and (InnerLenB = 0) then
+        Continue; // nothing to emit
+
+      // Compute common prefix.
+      if (InnerLenA > 0) and (InnerLenB > 0) then
+      begin
+        MinLen := MinI(InnerLenA, InnerLenB);
+        PrefixLen := 0;
+        while (PrefixLen < MinLen) and
+              (StrA[CAStart + 1 + PrefixLen] = StrB[CBStart + 1 + PrefixLen]) do
+          Inc(PrefixLen);
+      end
+      else
+        PrefixLen := 0;
+
+      // Compute common suffix.
+      if (InnerLenA > PrefixLen) and (InnerLenB > PrefixLen) then
+      begin
+        MinLen := MinI(InnerLenA - PrefixLen, InnerLenB - PrefixLen);
+        SuffixLen := 0;
+        while (SuffixLen < MinLen) and
+              (StrA[CAEnd - SuffixLen] = StrB[CBEnd - SuffixLen]) do
+          Inc(SuffixLen);
+      end
+      else
+        SuffixLen := 0;
+
+      // Emit equal prefix (if any).
+      if PrefixLen > 0 then
+        Emit(DIFF_TAG_EQUAL,
+             CAStart, CAStart + PrefixLen,
+             CBStart, CBStart + PrefixLen);
+
+      // Emit the changed middle region (if any).
+      InnerStartA := CAStart + PrefixLen;
+      InnerStartB := CBStart + PrefixLen;
+      if (InnerLenA - PrefixLen - SuffixLen > 0) and
+         (InnerLenB - PrefixLen - SuffixLen > 0) then
+        Emit(DIFF_TAG_REPLACE,
+             InnerStartA, CAEnd - SuffixLen,
+             InnerStartB, CBEnd - SuffixLen)
+      else if (InnerLenA - PrefixLen - SuffixLen > 0) then
+        Emit(DIFF_TAG_DELETE,
+             InnerStartA, CAEnd - SuffixLen,
+             InnerStartB, CBEnd - SuffixLen)
+      else if (InnerLenB - PrefixLen - SuffixLen > 0) then
+        Emit(DIFF_TAG_INSERT,
+             InnerStartA, CAEnd - SuffixLen,
+             InnerStartB, CBEnd - SuffixLen);
+
+      // Emit equal suffix (if any).
+      if SuffixLen > 0 then
+        Emit(DIFF_TAG_EQUAL,
+             CAEnd - SuffixLen, CAEnd,
+             CBEnd - SuffixLen, CBEnd);
+    end;
+  end;
+
+  SetLength(Result_, ResultCount);
+  Result := Result_;
 end;
 
 end.

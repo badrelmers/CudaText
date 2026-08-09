@@ -1051,8 +1051,9 @@ FINDER_REP_ALL_EX       = 39
 
 # diff_proc: action IDs for the id parameter
 DIF_TEXTS              = 1
-# DIF_LINES            = 2  # reserved for future (list-of-strings input)
-# DIF_EDITORS          = 3  # reserved for future (editor handles)
+DIF_CHARS              = 2
+# DIF_LINES            = 3  # reserved for future (list-of-strings input)
+# DIF_EDITORS          = 4  # reserved for future (editor handles)
 
 # diff_proc: algorithm selectors for the algo parameter
 DIFF_ALGO_MYERS        = 0
