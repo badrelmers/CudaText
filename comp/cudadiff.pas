@@ -130,6 +130,16 @@ function SplitLinesKeepEnds(const AText: string): TStringArray;
 
 implementation
 
+{ CudaText is compiled with {$RANGECHECKS ON} and {$OVERFLOWCHECKS ON}
+  by default (see proc_str.pas which turns them off locally). The diff
+  algorithms use intentional integer wrapping (djb2 hash, Knuth
+  multiplication, bit-packing) and negative-array-index-via-offset
+  patterns (Myers V arrays) that would trigger ERangeError under those
+  checks. Disable both for the entire unit, same as CudaText's own
+  proc_str.pas does. }
+{$RANGECHECKS OFF}
+{$OVERFLOWCHECKS OFF}
+
 uses
   SysUtils;
 
@@ -535,11 +545,7 @@ end;
 
 { djb2 hash of a line's bytes. Matches JGit's RawTextComparator.hashRegion.
   Uses Cardinal (unsigned 32-bit) for the accumulator because the hash
-  is designed to wrap around — with signed Integer, the shl+add would
-  trigger ERangeError when CudaText is compiled with {$OVERFLOWCHECKS ON}.
-  Also explicitly disables overflow/range checks for this function since
-  hash wrapping is intentional behavior, not a bug. }
-{$Q-}{$R-}
+  is designed to wrap around. }
 function HashLine(const ALine: string): Integer;
 var
   S: AnsiString;
@@ -553,7 +559,6 @@ begin
     H := ((H shl 5) + H) + Ord(S[I]);
   Result := Integer(H);
 end;
-{$Q+}{$R+}
 
 { ---------- TLineSequence ---------- }
 
@@ -1071,19 +1076,15 @@ begin
   FFallback := False;
 end;
 
-{$Q-}{$R-}
 function THistogramIndex.HashSeq(ASeq: PLineSequence; AIdx: Integer): Integer;
 var
   RawHash: Integer;
   Mixed: Cardinal;
 begin
   RawHash := ASeq^.HashAt(AIdx);
-  // Force 32-bit wraparound: assign to Cardinal variable first, which
-  // truncates the product to 32 bits before the right-shift.
   Mixed := Cardinal(RawHash) * HASH_MIX_CONSTANT;
   Result := Integer(Mixed shr FKeyShift);
 end;
-{$Q+}{$R+}
 
 class function THistogramIndex.RecCreate(ANext, APtr, ACnt: Integer): Int64;
 begin
