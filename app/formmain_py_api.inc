@@ -11102,6 +11102,111 @@ begin
 end;
 
 
+//Top-level callback for diff_proc cancellation. Must NOT be a nested
+//function because CudaDiff.DoDiffLines expects a plain procedural
+//function pointer (TDiffCancelFunc), and FPC's objfpc mode does not
+//allow assigning nested functions to non-nested function types.
+//The Python callable object is passed through AData as a PPyObject.
+function api_diff_proc_CancelCallback(AData: Pointer): Boolean;
+var
+  P: PPyObject;
+  Res: PPyObject;
+begin
+  Result := False;
+  P := PPyObject(AData);
+  if P = nil then Exit;
+  with AppPython.Engine do
+  begin
+    if PyCallable_Check(P) = 0 then Exit;
+    Res := PyObject_CallObject(P, nil);
+    if Res <> nil then
+    begin
+      Result := PyObject_IsTrue(Res) <> 0;
+      Py_DECREF(Res);
+    end;
+  end;
+end;
+
+//diff_proc(id, param1, param2, algo=0, flags=0, cancel=None)
+//Compares two texts and returns difflib-compatible opcodes.
+//  id: DIF_TEXTS (1) -- param1, param2 are LF-separated strings.
+//  algo: DIFF_ALGO_MYERS (0) or DIFF_ALGO_HISTOGRAM (1).
+//  flags: bitmask of DIFF_IGN_* values (case/whitespace/numbers/etc).
+//  cancel: optional Python callable; called periodically, return True to abort.
+//Returns: list of (tag, i1, i2, j1, j2) tuples where tag is a lowercase
+//  string 'equal'/'delete'/'insert'/'replace'. Format matches
+//  difflib.SequenceMatcher.get_opcodes() exactly.
+//Returns None if the diff was cancelled.
+function api_diff_proc(Self, Args: PPyObject): PPyObject; cdecl;
+var
+  IdAction: Integer;
+  Ptr1, Ptr2: PChar;
+  Str1, Str2: string;
+  NAlgo, NFlags: Integer;
+  CancelObj: PPyObject;
+  LinesA, LinesB: TStringArray;
+  Opcodes: TDiffOpcodeArray;
+  Cancelled: Boolean;
+  I: Integer;
+  TagStr: string;
+  TagPtr: PChar;
+begin
+  CancelObj := nil;
+  NAlgo := DIFF_ALGO_MYERS;
+  NFlags := 0;
+
+  with AppPython.Engine do
+  begin
+    Result := ReturnNone;
+
+    if not Bool(PyArg_ParseTuple(Args, 'iss|iiO:diff_proc',
+      @IdAction, @Ptr1, @Ptr2, @NAlgo, @NFlags, @CancelObj)) then
+      Exit;
+
+    Str1 := string(Ptr1);
+    Str2 := string(Ptr2);
+
+    case IdAction of
+      DIF_TEXTS:
+        begin
+          LinesA := CudaDiff.SplitLinesKeepEnds(Str1);
+          LinesB := CudaDiff.SplitLinesKeepEnds(Str2);
+          Opcodes := CudaDiff.DoDiffLines(LinesA, LinesB, NAlgo, NFlags,
+            @api_diff_proc_CancelCallback, CancelObj, Cancelled);
+
+          if Cancelled then
+            Exit(ReturnNone);
+
+          // Build a Python list of 5-tuples (tag, i1, i2, j1, j2).
+          Result := PyList_New(Length(Opcodes));
+          if not Assigned(Result) then
+            raise EPythonError.Create(msgPythonListError);
+          for I := 0 to High(Opcodes) do
+          begin
+            case Opcodes[I].Tag of
+              DIFF_TAG_EQUAL:   TagStr := 'equal';
+              DIFF_TAG_DELETE:  TagStr := 'delete';
+              DIFF_TAG_INSERT:  TagStr := 'insert';
+              DIFF_TAG_REPLACE: TagStr := 'replace';
+              else              TagStr := 'equal';
+            end;
+            TagPtr := PChar(TagStr);
+            PyList_SetItem(Result, I,
+              Py_BuildValue('(siiii)', TagPtr,
+                Opcodes[I].I1, Opcodes[I].I2,
+                Opcodes[I].J1, Opcodes[I].J2));
+          end;
+        end;
+      else
+        begin
+          MsgLogConsole('ERROR: diff_proc gets unknown id: ' + IntToStr(IdAction));
+          Exit(ReturnNone);
+        end;
+    end;
+  end;
+end;
+
+
 //func at end (uses funcs above)
 procedure TfmMain.PythonModuleInitialization(Sender: TObject);
 begin
@@ -11199,6 +11304,7 @@ begin
     AddMethod('image_proc', @api_image_proc, '');
     AddMethod('button_proc', @api_button_proc, '');
     AddMethod('finder_proc', @api_finder_proc, '');
+    AddMethod('diff_proc', @api_diff_proc, '');
   end;
 end;
 

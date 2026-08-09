@@ -912,6 +912,34 @@ const
   BITMAP_SET_SIZE = 2;
   BITMAP_GET_SIZE = 3;
   BITMAP_GET_CANVAS = 4;
+  
+  { diff_proc: action IDs for the id parameter }
+  DIF_TEXTS              = 1;  // param1, param2 are LF-separated strings
+  // DIF_LINES            = 2;  // reserved for future (list-of-strings input)
+  // DIF_EDITORS          = 3;  // reserved for future (editor handles)
+
+  { diff_proc: algorithm selectors for the algo parameter }
+  DIFF_ALGO_MYERS        = 0;
+  DIFF_ALGO_HISTOGRAM    = 1;
+
+  { diff_proc: bitmask flags for the flags parameter.
+    Combine with 'or', e.g. DIFF_IGN_CASE or DIFF_IGN_WHITESPACE_EOL. }
+  DIFF_IGN_NONE                 = 0;
+  DIFF_IGN_CASE                 = 1;      // case-insensitive comparison
+  DIFF_IGN_WHITESPACE           = 2;      // all whitespace ignored
+  DIFF_IGN_WHITESPACE_CHANGE    = 4;      // runs equal, presence matters
+  DIFF_IGN_WHITESPACE_EOL       = 8;      // trailing whitespace ignored
+  DIFF_IGN_WHITESPACE_BEGINNING = 16;     // leading whitespace ignored
+  DIFF_IGN_BLANK_LINES          = 32;     // blank lines ignored for matching
+  DIFF_IGN_EOL                  = 64;     // CR/LF vs LF treated equal
+  DIFF_IGN_NUMBERS              = 128;    // digit runs treated as equal (for logs)
+
+  { diff_proc: opcode tag values (internal; wrapper converts to lowercase
+    strings 'equal'/'delete'/'insert'/'replace' before returning to Python). }
+  DIFF_TAG_EQUAL   = 0;
+  DIFF_TAG_DELETE  = 1;
+  DIFF_TAG_INSERT  = 2;
+  DIFF_TAG_REPLACE = 3;
 
 implementation
 
