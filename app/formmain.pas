@@ -1335,7 +1335,8 @@ uses
   ATStringProc_HtmlColor,
   {$endif}
   ATSynEdit_ClipRecents,
-  ATSynEdit_CanvasProc_FillRect;
+  ATSynEdit_CanvasProc_FillRect,
+  CudaDiff;
 
 {$R *.lfm}
 
