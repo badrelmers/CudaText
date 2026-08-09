@@ -11198,23 +11198,28 @@ begin
     Str1 := string(Ptr1);
     Str2 := string(Ptr2);
 
-    case IdAction of
-      DIF_TEXTS:
-        begin
-          LinesA := CudaDiff.SplitLinesKeepEnds(Str1);
-          LinesB := CudaDiff.SplitLinesKeepEnds(Str2);
-          Opcodes := CudaDiff.DoDiffLines(LinesA, LinesB, NAlgo, NFlags,
-            @api_diff_proc_CancelCallback, CancelObj, Cancelled);
+    // Wrap the diff in try/except so that if the native code crashes
+    // (e.g. access violation from an edge case), CudaText doesn't crash.
+    // Instead, return None — the Python caller (Differ plugin) handles
+    // None by falling back to a single REPLACE covering everything.
+    try
+      case IdAction of
+        DIF_TEXTS:
+          begin
+            LinesA := CudaDiff.SplitLinesKeepEnds(Str1);
+            LinesB := CudaDiff.SplitLinesKeepEnds(Str2);
+            Opcodes := CudaDiff.DoDiffLines(LinesA, LinesB, NAlgo, NFlags,
+              @api_diff_proc_CancelCallback, CancelObj, Cancelled);
 
-          if Cancelled then
-            Exit(ReturnNone);
+            if Cancelled then
+              Exit(ReturnNone);
 
-          BuildOpcodeList(Opcodes);
-        end;
-      DIF_CHARS:
+            BuildOpcodeList(Opcodes);
+          end;
+        DIF_CHARS:
         begin
           // Char-level diff. NAlgo is ignored — char diff always uses
-          // word-Myers + byte-trim internally.
+          // word-Histogram + byte-trim internally.
           Opcodes := CudaDiff.DoDiffChars(Str1, Str2, NFlags,
             @api_diff_proc_CancelCallback, CancelObj, Cancelled);
 
@@ -11228,6 +11233,16 @@ begin
           MsgLogConsole('ERROR: diff_proc gets unknown id: ' + IntToStr(IdAction));
           Exit(ReturnNone);
         end;
+    end;
+    except
+      on E: Exception do
+      begin
+        // Log the error and return None. The Python caller handles None
+        // by falling back to a single REPLACE (marks the whole region as
+        // changed). This prevents CudaText from crashing on edge cases.
+        MsgLogConsole('ERROR: diff_proc exception: ' + E.Message);
+        Exit(ReturnNone);
+      end;
     end;
   end;
 end;
