@@ -2059,18 +2059,29 @@ begin
   Tokenize(ATextA, TokensA);
   Tokenize(ATextB, TokensB);
 
-  // Step 2: run word-level diff. Use HISTOGRAM (not MYERS) because:
-  // - Words are often repeated (identifiers, keywords, punctuation), and
-  //   Histogram's occurrence-counting handles this efficiently.
-  // - Myers O(ND) is slow when D (word edit distance) is large, which
-  //   happens on long lines with many changes. Histogram degrades more
-  //   gracefully via its chain-length cutoff + Myers fallback.
-  // - For typical code lines (10-100 words), both are fast. For long
-  //   lines (1000+ words, e.g. minified JS), Histogram is dramatically
-  //   faster.
+  // Step 2: WinMerge's size limit (stringdiffs.cpp line 398).
+  // If either word array exceeds 20480 words, skip word-level diff
+  // and mark the entire line as one diff span. This prevents
+  // pathological slowdowns on extremely long lines (e.g. minified JS).
+  if (Length(TokensA) > 20480) or (Length(TokensB) > 20480) then
+  begin
+    SetLength(Result, 1);
+    Result[0].Tag := DIFF_TAG_REPLACE;
+    Result[0].I1 := 0;
+    Result[0].I2 := Length(ATextA);
+    Result[0].J1 := 0;
+    Result[0].J2 := Length(ATextB);
+    Exit;
+  end;
+
+  // Step 3: run word-level diff using Myers with pointer arithmetic.
+  // Myers O(ND) with the pointer-arity + explicit-stack optimizations
+  // is fast for typical word counts (10-1000 words per line).
+  // For very long lines (5000+ words), Myers may be slower than O(NP),
+  // but the size limit above caps the worst case.
   WordsA := TokensToStrings(TokensA);
   WordsB := TokensToStrings(TokensB);
-  WordOpcodes := DoDiffLines(WordsA, WordsB, DIFF_ALGO_HISTOGRAM, AFlags,
+  WordOpcodes := DoDiffLines(WordsA, WordsB, DIFF_ALGO_MYERS, AFlags,
     ACancelFunc, ACancelData, ACancelled);
   if ACancelled then
     Exit;
