@@ -221,17 +221,27 @@ type
   end;
 
   { Scratch state for MyersDiff, reused across recursion levels to
-    avoid repeated heap allocation. }
+    avoid repeated heap allocation. Uses raw pointers (PInteger / PInt64)
+    for the V arrays instead of dynamic arrays — this eliminates the
+    bounds-checking overhead that SafeGet/SafeSet introduced (26.6s on
+    the 3MB HTML test). The pointer is adjusted by OffsetK so that
+    negative k indices work without bounds checks, exactly like
+    LGenerics' LcsMyersImpl does with PSizeInt. }
   TMyersState = record
     SeqA, SeqB: PLineSequence;
     CancelFunc: TDiffCancelFunc;
     CancelData: Pointer;
     Cancelled: Pointer;        // ^Boolean
 
-    FwdX: array of Integer;
-    FwdSnake: array of Int64;
-    BwdX: array of Integer;
-    BwdSnake: array of Int64;
+    // V arrays — allocated once at top level, accessed via pointers.
+    FwdXBuf: array of Integer;   // raw storage
+    BwdXBuf: array of Integer;
+    FwdSnakeBuf: array of Int64;
+    BwdSnakeBuf: array of Int64;
+    FwdX: PInteger;    // pointer into FwdXBuf, adjusted by OffsetK
+    BwdX: PInteger;    // pointer into BwdXBuf, adjusted by OffsetK
+    FwdSnake: PInt64;  // pointer into FwdSnakeBuf, adjusted by OffsetK
+    BwdSnake: PInt64;  // pointer into BwdSnakeBuf, adjusted by OffsetK
     OffsetK: Integer;
 
     BeginA, EndA, BeginB, EndB: Integer;
@@ -620,6 +630,9 @@ end;
 
 function TLineSequence.EqualsAt(AIdxThis: Integer;
   const AOther: TLineSequence; AIdxOther: Integer): Boolean;
+var
+  PA, PB: PAnsiChar;
+  Len, I: Integer;
 begin
   // CRITICAL: hash check FIRST (fast integer compare), then string equality
   // to verify the match. A hash collision without this check produces a
@@ -628,7 +641,35 @@ begin
     Exit(False);
   if FHasNormalization then
     Exit(FNormalized[AIdxThis] = AOther.FNormalized[AIdxOther]);
-  Exit(FLines[AIdxThis] = AOther.FLines[AIdxOther]);
+  // Fast pointer-based string comparison instead of Pascal's AnsiString
+  // comparison. Pascal's string = operator does a call to fpc_AnsStr_Compare
+  // which has overhead. Pointer comparison with MoveCompare is faster
+  // for the hot path (called billions of times in the Myers snake loops).
+  PA := Pointer(FLines[AIdxThis]);
+  PB := Pointer(AOther.FLines[AIdxOther]);
+  if PA = PB then
+    Exit(True);  // same pointer (e.g. comparing a sequence with itself)
+  Len := Length(FLines[AIdxThis]);
+  if Len <> Length(AOther.FLines[AIdxOther]) then
+    Exit(False);
+  if Len = 0 then
+    Exit(True);
+  // Compare 4 bytes at a time using PInteger
+  I := 0;
+  while I + 4 <= Len do
+  begin
+    if PInteger(PA + I)^ <> PInteger(PB + I)^ then
+      Exit(False);
+    Inc(I, 4);
+  end;
+  // Compare remaining bytes
+  while I < Len do
+  begin
+    if PA[I] <> PB[I] then
+      Exit(False);
+    Inc(I);
+  end;
+  Result := True;
 end;
 
 function TLineSequence.HashAt(AIdx: Integer): Integer;
@@ -727,19 +768,32 @@ begin
 end;
 
 { Forward EditPaths: extend forward D-paths by one step.
-  Returns True if the forward and backward fronts meet (middle snake found). }
+  Returns True if the forward and backward fronts meet (middle snake found).
+  Uses pointer arithmetic (PInteger/PInt64) for V array access — no bounds
+  checking needed because the arrays are sized (2*MaxSize+1) at the top
+  level, which is always sufficient for any sub-region's k range. }
 function ForwardCalculate(var AState: TMyersState; AD: Integer): Boolean;
 var
   K, I, Left, Right, NewX: Integer;
   LeftEnd, RightEnd: Integer;
   LeftSnake, RightSnake, NewSnake: Int64;
   PrevBeginK, PrevEndK: Integer;
+  FwdX: PInteger;
+  FwdSnake: PInt64;
+  BwdX: PInteger;
+  BwdSnake: PInt64;
 begin
   Result := False;
   PrevBeginK := AState.FwdBeginK;
   PrevEndK := AState.FwdEndK;
   AState.FwdBeginK := ForceKIntoRange(AState.FwdMiddleK - AD, AState.MinK, AState.MaxK);
   AState.FwdEndK := ForceKIntoRange(AState.FwdMiddleK + AD, AState.MinK, AState.MaxK);
+
+  // Cache pointers in locals for faster access in the loop.
+  FwdX := AState.FwdX;
+  FwdSnake := AState.FwdSnake;
+  BwdX := AState.BwdX;
+  BwdSnake := AState.BwdSnake;
 
   K := AState.FwdEndK;
   while K >= AState.FwdBeginK do
@@ -751,20 +805,19 @@ begin
 
     if K > PrevBeginK then
     begin
-      I := VIndex(AState.OffsetK, K - 1);
-      Left := SafeGet(AState.FwdX, I);
+      Left := FwdX[K - 1];
       LeftEnd := ForwardSnake(AState, K - 1, Left);
       if Left <> LeftEnd then
         LeftSnake := PackSnake(LeftEnd, (K - 1) + LeftEnd)
       else
-        LeftSnake := SafeGetSnake(AState.FwdSnake, I);
+        LeftSnake := FwdSnake[K - 1];
       if (K - 1 >= AState.BwdBeginK) and (K - 1 <= AState.BwdEndK) and
          (((AD - 1 + (K - 1) - AState.BwdMiddleK) mod 2) = 0) and
-         (LeftEnd >= SafeGet(AState.BwdX, VIndex(AState.OffsetK, K - 1))) then
+         (LeftEnd >= BwdX[K - 1]) then
       begin
         AState.MiddleEdit := TDiffEdit.Create(
-          SnakeX(LeftSnake), SnakeX(SafeGetSnake(AState.BwdSnake, VIndex(AState.OffsetK, K - 1))),
-          SnakeY(LeftSnake), SnakeY(SafeGetSnake(AState.BwdSnake, VIndex(AState.OffsetK, K - 1)))
+          SnakeX(LeftSnake), SnakeX(BwdSnake[K - 1]),
+          SnakeY(LeftSnake), SnakeY(BwdSnake[K - 1])
         );
         Exit(True);
       end;
@@ -773,20 +826,19 @@ begin
 
     if K < PrevEndK then
     begin
-      I := VIndex(AState.OffsetK, K + 1);
-      Right := SafeGet(AState.FwdX, I);
+      Right := FwdX[K + 1];
       RightEnd := ForwardSnake(AState, K + 1, Right);
       if Right <> RightEnd then
         RightSnake := PackSnake(RightEnd, (K + 1) + RightEnd)
       else
-        RightSnake := SafeGetSnake(AState.FwdSnake, I);
+        RightSnake := FwdSnake[K + 1];
       if (K + 1 >= AState.BwdBeginK) and (K + 1 <= AState.BwdEndK) and
          (((AD - 1 + (K + 1) - AState.BwdMiddleK) mod 2) = 0) and
-         (RightEnd >= SafeGet(AState.BwdX, VIndex(AState.OffsetK, K + 1))) then
+         (RightEnd >= BwdX[K + 1]) then
       begin
         AState.MiddleEdit := TDiffEdit.Create(
-          SnakeX(RightSnake), SnakeX(SafeGetSnake(AState.BwdSnake, VIndex(AState.OffsetK, K + 1))),
-          SnakeY(RightSnake), SnakeY(SafeGetSnake(AState.BwdSnake, VIndex(AState.OffsetK, K + 1)))
+          SnakeX(RightSnake), SnakeX(BwdSnake[K + 1]),
+          SnakeY(RightSnake), SnakeY(BwdSnake[K + 1])
         );
         Exit(True);
       end;
@@ -806,11 +858,11 @@ begin
 
     if (K >= AState.BwdBeginK) and (K <= AState.BwdEndK) and
        (((AD + K - AState.BwdMiddleK) mod 2) = 0) and
-       (NewX >= SafeGet(AState.BwdX, VIndex(AState.OffsetK, K))) then
+       (NewX >= BwdX[K]) then
     begin
       AState.MiddleEdit := TDiffEdit.Create(
-        SnakeX(NewSnake), SnakeX(SafeGetSnake(AState.BwdSnake, VIndex(AState.OffsetK, K))),
-        SnakeY(NewSnake), SnakeY(SafeGetSnake(AState.BwdSnake, VIndex(AState.OffsetK, K)))
+        SnakeX(NewSnake), SnakeX(BwdSnake[K]),
+        SnakeY(NewSnake), SnakeY(BwdSnake[K])
       );
       Exit(True);
     end;
@@ -823,8 +875,8 @@ begin
         AState.MinK := K;
     end;
 
-    SafeSet(AState.FwdX, VIndex(AState.OffsetK, K), NewX);
-    SafeSetSnake(AState.FwdSnake, VIndex(AState.OffsetK, K), NewSnake);
+    FwdX[K] := NewX;
+    FwdSnake[K] := NewSnake;
 
     Dec(K, 2);
   end;
@@ -838,12 +890,22 @@ var
   LeftEnd, RightEnd: Integer;
   LeftSnake, RightSnake, NewSnake: Int64;
   PrevBeginK, PrevEndK: Integer;
+  FwdX: PInteger;
+  FwdSnake: PInt64;
+  BwdX: PInteger;
+  BwdSnake: PInt64;
 begin
   Result := False;
   PrevBeginK := AState.BwdBeginK;
   PrevEndK := AState.BwdEndK;
   AState.BwdBeginK := ForceKIntoRange(AState.BwdMiddleK - AD, AState.MinK, AState.MaxK);
   AState.BwdEndK := ForceKIntoRange(AState.BwdMiddleK + AD, AState.MinK, AState.MaxK);
+
+  // Cache pointers in locals for faster access in the loop.
+  FwdX := AState.FwdX;
+  FwdSnake := AState.FwdSnake;
+  BwdX := AState.BwdX;
+  BwdSnake := AState.BwdSnake;
 
   K := AState.BwdEndK;
   while K >= AState.BwdBeginK do
@@ -855,20 +917,19 @@ begin
 
     if K > PrevBeginK then
     begin
-      I := VIndex(AState.OffsetK, K - 1);
-      Left := SafeGet(AState.BwdX, I);
+      Left := BwdX[K - 1];
       LeftEnd := BackwardSnake(AState, K - 1, Left);
       if Left <> LeftEnd then
         LeftSnake := PackSnake(LeftEnd, (K - 1) + LeftEnd)
       else
-        LeftSnake := SafeGetSnake(AState.BwdSnake, I);
+        LeftSnake := BwdSnake[K - 1];
       if (K - 1 >= AState.FwdBeginK) and (K - 1 <= AState.FwdEndK) and
          (((AD + (K - 1) - AState.FwdMiddleK) mod 2) = 0) and
-         (LeftEnd <= SafeGet(AState.FwdX, VIndex(AState.OffsetK, K - 1))) then
+         (LeftEnd <= FwdX[K - 1]) then
       begin
         AState.MiddleEdit := TDiffEdit.Create(
-          SnakeX(SafeGetSnake(AState.FwdSnake, VIndex(AState.OffsetK, K - 1))), SnakeX(LeftSnake),
-          SnakeY(SafeGetSnake(AState.FwdSnake, VIndex(AState.OffsetK, K - 1))), SnakeY(LeftSnake)
+          SnakeX(FwdSnake[K - 1]), SnakeX(LeftSnake),
+          SnakeY(FwdSnake[K - 1]), SnakeY(LeftSnake)
         );
         Exit(True);
       end;
@@ -877,20 +938,19 @@ begin
 
     if K < PrevEndK then
     begin
-      I := VIndex(AState.OffsetK, K + 1);
-      Right := SafeGet(AState.BwdX, I);
+      Right := BwdX[K + 1];
       RightEnd := BackwardSnake(AState, K + 1, Right);
       if Right <> RightEnd then
         RightSnake := PackSnake(RightEnd, (K + 1) + RightEnd)
       else
-        RightSnake := SafeGetSnake(AState.BwdSnake, I);
+        RightSnake := BwdSnake[K + 1];
       if (K + 1 >= AState.FwdBeginK) and (K + 1 <= AState.FwdEndK) and
          (((AD + (K + 1) - AState.FwdMiddleK) mod 2) = 0) and
-         (RightEnd <= SafeGet(AState.FwdX, VIndex(AState.OffsetK, K + 1))) then
+         (RightEnd <= FwdX[K + 1]) then
       begin
         AState.MiddleEdit := TDiffEdit.Create(
-          SnakeX(SafeGetSnake(AState.FwdSnake, VIndex(AState.OffsetK, K + 1))), SnakeX(RightSnake),
-          SnakeY(SafeGetSnake(AState.FwdSnake, VIndex(AState.OffsetK, K + 1))), SnakeY(RightSnake)
+          SnakeX(FwdSnake[K + 1]), SnakeX(RightSnake),
+          SnakeY(FwdSnake[K + 1]), SnakeY(RightSnake)
         );
         Exit(True);
       end;
@@ -910,11 +970,11 @@ begin
 
     if (K >= AState.FwdBeginK) and (K <= AState.FwdEndK) and
        (((AD + K - AState.FwdMiddleK) mod 2) = 0) and
-       (NewX <= SafeGet(AState.FwdX, VIndex(AState.OffsetK, K))) then
+       (NewX <= FwdX[K]) then
     begin
       AState.MiddleEdit := TDiffEdit.Create(
-        SnakeX(SafeGetSnake(AState.FwdSnake, VIndex(AState.OffsetK, K))), SnakeX(NewSnake),
-        SnakeY(SafeGetSnake(AState.FwdSnake, VIndex(AState.OffsetK, K))), SnakeY(NewSnake)
+        SnakeX(FwdSnake[K]), SnakeX(NewSnake),
+        SnakeY(FwdSnake[K]), SnakeY(NewSnake)
       );
       Exit(True);
     end;
@@ -927,8 +987,8 @@ begin
         AState.MinK := K;
     end;
 
-    SafeSet(AState.BwdX, VIndex(AState.OffsetK, K), NewX);
-    SafeSetSnake(AState.BwdSnake, VIndex(AState.OffsetK, K), NewSnake);
+    BwdX[K] := NewX;
+    BwdSnake[K] := NewSnake;
 
     Dec(K, 2);
   end;
@@ -988,10 +1048,20 @@ begin
   if MaxSize = 0 then
     Exit;
   State.OffsetK := MaxSize;
-  SetLength(State.FwdX, 2 * MaxSize + 1);
-  SetLength(State.FwdSnake, 2 * MaxSize + 1);
-  SetLength(State.BwdX, 2 * MaxSize + 1);
-  SetLength(State.BwdSnake, 2 * MaxSize + 1);
+  // Allocate V arrays once at top level. Size is 2*MaxSize+1, which is
+  // always sufficient for any sub-region's k range (k is in [-MaxSize, +MaxSize]).
+  // Using pointer arithmetic (adjusted by OffsetK) eliminates bounds-checking
+  // overhead — direct memory access like LGenerics' LcsMyersImpl.
+  SetLength(State.FwdXBuf, 2 * MaxSize + 1);
+  SetLength(State.BwdXBuf, 2 * MaxSize + 1);
+  SetLength(State.FwdSnakeBuf, 2 * MaxSize + 1);
+  SetLength(State.BwdSnakeBuf, 2 * MaxSize + 1);
+  // Set pointers to the middle of each buffer, so Ptr[K] works for
+  // any K in [-MaxSize, +MaxSize] without bounds checking.
+  State.FwdX := PInteger(@State.FwdXBuf[0]) + State.OffsetK;
+  State.BwdX := PInteger(@State.BwdXBuf[0]) + State.OffsetK;
+  State.FwdSnake := PInt64(@State.FwdSnakeBuf[0]) + State.OffsetK;
+  State.BwdSnake := PInt64(@State.BwdSnakeBuf[0]) + State.OffsetK;
 
   // Initialize the work stack with the top-level region.
   SetLength(WorkStack, 64);
@@ -1066,12 +1136,12 @@ begin
     State.BwdBeginK := State.BwdMiddleK;
     State.BwdEndK := State.BwdMiddleK;
 
-    SafeSet(State.FwdX, VIndex(State.OffsetK, State.FwdMiddleK), State.BeginA);
-    SafeSetSnake(State.FwdSnake, VIndex(State.OffsetK, State.FwdMiddleK),
-      PackSnake(State.BeginA, State.FwdMiddleK + State.BeginA));
-    SafeSet(State.BwdX, VIndex(State.OffsetK, State.BwdMiddleK), State.EndA);
-    SafeSetSnake(State.BwdSnake, VIndex(State.OffsetK, State.BwdMiddleK),
-      PackSnake(State.EndA, State.BwdMiddleK + State.EndA));
+    State.FwdX[State.FwdMiddleK] := State.BeginA;
+    State.FwdSnake[State.FwdMiddleK] :=
+      PackSnake(State.BeginA, State.FwdMiddleK + State.BeginA);
+    State.BwdX[State.BwdMiddleK] := State.EndA;
+    State.BwdSnake[State.BwdMiddleK] :=
+      PackSnake(State.EndA, State.BwdMiddleK + State.EndA);
 
     // Find the middle snake.
     Edit := TDiffEdit.Create(0, 0, 0, 0);
@@ -1509,6 +1579,160 @@ begin
   end;
 end;
 
+{ ---------- Discard non-matching lines preprocessing ---------- }
+{
+  This is the key optimization that makes Myers fast on real-world files.
+  Port of Meld's MyersSequenceMatcher.preprocess_discard_nonmatching_lines.
+
+  For files where most lines are unchanged (e.g. HTML where 90% of lines
+  are identical), the edit distance D is small but the sequences are long.
+  Myers O(ND) is fast when D is small, but the constant factor is O(N+M)
+  per D iteration (the snake loops scan all lines). By discarding lines
+  that don't appear in the other file at all, we reduce N and M to just
+  the changed lines, making the algorithm dramatically faster.
+
+  Example: 30K+33K lines with 3K changes → filtered to ~3K+3K lines,
+  a 10x reduction in problem size, 100x reduction in D-loop work.
+
+  The filtered diff produces matching blocks in the compressed index
+  space. We then expand these back to the original index space by
+  inserting "equal" blocks for the discarded lines.
+}
+
+type
+  { Maps filtered indices back to original indices. }
+  TIndexMap = record
+    FOrigToFiltered: array of Integer;  // -1 = discarded
+    FFilteredToOrig: array of Integer;  // filtered index → original index
+    FDiscardedCount: Integer;
+  end;
+
+{ Build an index map that discards lines from ASeqA which don't appear in
+  ASeqB (and vice versa). Only worth doing if more than 10 lines would be
+  discarded (matches Meld's heuristic). Uses a simple hash table for the
+  "does this hash appear in the other sequence" lookup — O(1) instead
+  of O(N) linear search. }
+procedure BuildDiscardMap(
+  const ASeqA, ASeqB: TLineSequence;
+  ARegion: TDiffEdit;
+  out AMapA, AMapB: TIndexMap;
+  out ADidDiscard: Boolean
+);
+var
+  I, J, LenA, LenB, HashVal, TableSize, TableMask, Bucket: Integer;
+  HashTable: array of Integer;  // open-addressing hash table
+  FilteredCountA, FilteredCountB: Integer;
+  S: AnsiString;
+begin
+  LenA := ARegion.LengthA;
+  LenB := ARegion.LengthB;
+  ADidDiscard := False;
+
+  // Size hash tables to ~2x the number of unique hashes for good load factor.
+  // Use power-of-2 size for fast modulo (mask instead of mod).
+  TableSize := 1;
+  while TableSize < (LenA + LenB) * 2 do
+    TableSize := TableSize shl 1;
+  if TableSize < 16 then
+    TableSize := 16;
+  TableMask := TableSize - 1;
+
+  // Build hash table for B's hashes.
+  // Table stores hash values; 0 = empty slot (we offset all stored values by 1).
+  SetLength(HashTable, TableSize);
+  for I := 0 to TableSize - 1 do
+    HashTable[I] := 0;
+
+  for I := ARegion.BeginB to ARegion.EndB - 1 do
+  begin
+    HashVal := ASeqB.HashAt(I);
+    // Offset by 1 so 0 means empty
+    Inc(HashVal);
+    // Find slot (open addressing, linear probing)
+    Bucket := (HashVal * $9e370001) and TableMask;
+    while HashTable[Bucket] <> 0 do
+    begin
+      if HashTable[Bucket] = HashVal then
+        Break;  // already in table
+      Bucket := (Bucket + 1) and TableMask;
+    end;
+    HashTable[Bucket] := HashVal;
+  end;
+
+  // Build map for A: keep only lines whose hash appears in B's table
+  SetLength(AMapA.FOrigToFiltered, LenA);
+  SetLength(AMapA.FFilteredToOrig, LenA);
+  FilteredCountA := 0;
+  for I := 0 to LenA - 1 do
+  begin
+    HashVal := ASeqA.HashAt(ARegion.BeginA + I);
+    Inc(HashVal);
+    Bucket := (HashVal * $9e370001) and TableMask;
+    while HashTable[Bucket] <> 0 do
+    begin
+      if HashTable[Bucket] = HashVal then
+        Break;
+      Bucket := (Bucket + 1) and TableMask;
+    end;
+    if HashTable[Bucket] = HashVal then
+    begin
+      AMapA.FOrigToFiltered[I] := FilteredCountA;
+      AMapA.FFilteredToOrig[FilteredCountA] := I;
+      Inc(FilteredCountA);
+    end
+    else
+      AMapA.FOrigToFiltered[I] := -1;
+  end;
+  SetLength(AMapA.FFilteredToOrig, FilteredCountA);
+
+  // Rebuild hash table for A's hashes
+  for I := 0 to TableSize - 1 do
+    HashTable[I] := 0;
+
+  for I := ARegion.BeginA to ARegion.EndA - 1 do
+  begin
+    HashVal := ASeqA.HashAt(I);
+    Inc(HashVal);
+    Bucket := (HashVal * $9e370001) and TableMask;
+    while HashTable[Bucket] <> 0 do
+    begin
+      if HashTable[Bucket] = HashVal then
+        Break;
+      Bucket := (Bucket + 1) and TableMask;
+    end;
+    HashTable[Bucket] := HashVal;
+  end;
+
+  // Build map for B: keep only lines whose hash appears in A's table
+  SetLength(AMapB.FOrigToFiltered, LenB);
+  SetLength(AMapB.FFilteredToOrig, LenB);
+  FilteredCountB := 0;
+  for I := 0 to LenB - 1 do
+  begin
+    HashVal := ASeqB.HashAt(ARegion.BeginB + I);
+    Inc(HashVal);
+    Bucket := (HashVal * $9e370001) and TableMask;
+    while HashTable[Bucket] <> 0 do
+    begin
+      if HashTable[Bucket] = HashVal then
+        Break;
+      Bucket := (Bucket + 1) and TableMask;
+    end;
+    if HashTable[Bucket] = HashVal then
+    begin
+      AMapB.FOrigToFiltered[I] := FilteredCountB;
+      AMapB.FFilteredToOrig[FilteredCountB] := I;
+      Inc(FilteredCountB);
+    end
+    else
+      AMapB.FOrigToFiltered[I] := -1;
+  end;
+  SetLength(AMapB.FFilteredToOrig, FilteredCountB);
+
+  // Only use discarding if worthwhile (matches Meld's heuristic: >10 lines discarded)
+  ADidDiscard := (LenA - FilteredCountA > 10) or (LenB - FilteredCountB > 10);
+end;
+
 { ---------- Common preprocessing ---------- }
 
 function ReduceCommonStartEnd(
@@ -1647,6 +1871,15 @@ var
   Region, Reduced: TDiffEdit;
   Edits: TDiffEditList;
   RegionType: TDiffEditType;
+  MapA, MapB: TIndexMap;
+  DidDiscard: Boolean;
+  FilteredLinesA, FilteredLinesB: TStringArray;
+  FilteredSeqA, FilteredSeqB: TLineSequence;
+  FilteredRegion: TDiffEdit;
+  FilteredOps, ExpandedOps: TDiffOpcodeArray;
+  I, J, K: Integer;
+  OrigA, OrigB, NextOrigA, NextOrigB: Integer;
+  Op: TDiffOpcode;
 begin
   ACancelled := False;
   SetLength(Result, 0);
@@ -1675,6 +1908,132 @@ begin
       end
       else
       begin
+        // For Myers, try the "discard non-matching lines" preprocessing.
+        // This is the key optimization that makes Myers fast on large files
+        // where most lines are unchanged. Port of Meld's preprocessing pass.
+        if AAlgo = DIFF_ALGO_MYERS then
+        begin
+          BuildDiscardMap(SeqA, SeqB, Reduced, MapA, MapB, DidDiscard);
+          if DidDiscard and (Length(MapA.FFilteredToOrig) > 0) and
+             (Length(MapB.FFilteredToOrig) > 0) then
+          begin
+            // Build filtered line arrays
+            SetLength(FilteredLinesA, Length(MapA.FFilteredToOrig));
+            for I := 0 to High(MapA.FFilteredToOrig) do
+              FilteredLinesA[I] := SeqA.FLines[Reduced.BeginA + MapA.FFilteredToOrig[I]];
+            SetLength(FilteredLinesB, Length(MapB.FFilteredToOrig));
+            for I := 0 to High(MapB.FFilteredToOrig) do
+              FilteredLinesB[I] := SeqB.FLines[Reduced.BeginB + MapB.FFilteredToOrig[I]];
+
+            // Run Myers on the filtered sequences
+            FilteredSeqA.Init(FilteredLinesA, AFlags);
+            FilteredSeqB.Init(FilteredLinesB, AFlags);
+            FilteredRegion := TDiffEdit.Create(0, FilteredSeqA.Size, 0, FilteredSeqB.Size);
+            MyersDiffNonCommon(Edits, FilteredSeqA, FilteredSeqB, FilteredRegion,
+              ACancelFunc, ACancelData, ACancelled);
+            if ACancelled then
+              Exit;
+
+            // Convert filtered edits to filtered opcodes
+            NormalizeEdits(Edits, FilteredSeqA, FilteredSeqB);
+            FilteredOps := EditsToOpcodes(Edits, FilteredSeqA.Size, FilteredSeqB.Size);
+
+            // Expand filtered opcodes back to original index space.
+            // Each opcode in filtered space maps to a range in original space.
+            // Between filtered opcodes, the discarded lines become "equal" blocks.
+            SetLength(ExpandedOps, Length(FilteredOps) + Length(MapA.FOrigToFiltered) + Length(MapB.FOrigToFiltered) + 2);
+            K := 0;
+            OrigA := Reduced.BeginA;
+            OrigB := Reduced.BeginB;
+
+            for I := 0 to High(FilteredOps) do
+            begin
+              Op := FilteredOps[I];
+              // Map filtered indices to original indices
+              if Op.I1 > 0 then
+                NextOrigA := Reduced.BeginA + MapA.FFilteredToOrig[Op.I1]
+              else
+                NextOrigA := Reduced.BeginA;
+              if Op.J1 > 0 then
+                NextOrigB := Reduced.BeginB + MapB.FFilteredToOrig[Op.J1]
+              else
+                NextOrigB := Reduced.BeginB;
+
+              // Emit "equal" for discarded lines before this opcode
+              if (NextOrigA > OrigA) or (NextOrigB > OrigB) then
+              begin
+                ExpandedOps[K].Tag := DIFF_TAG_EQUAL;
+                ExpandedOps[K].I1 := OrigA;
+                ExpandedOps[K].I2 := NextOrigA;
+                ExpandedOps[K].J1 := OrigB;
+                ExpandedOps[K].J2 := NextOrigB;
+                Inc(K);
+              end;
+
+              // Map the opcode's end indices
+              if Op.I2 > 0 then
+                OrigA := Reduced.BeginA + MapA.FFilteredToOrig[Op.I2 - 1] + 1
+              else
+                OrigA := NextOrigA;
+              if Op.J2 > 0 then
+                OrigB := Reduced.BeginB + MapB.FFilteredToOrig[Op.J2 - 1] + 1
+              else
+                OrigB := NextOrigB;
+
+              // Emit the opcode itself (with mapped indices)
+              ExpandedOps[K].Tag := Op.Tag;
+              ExpandedOps[K].I1 := NextOrigA;
+              ExpandedOps[K].I2 := OrigA;
+              ExpandedOps[K].J1 := NextOrigB;
+              ExpandedOps[K].J2 := OrigB;
+              Inc(K);
+            end;
+
+            // Emit trailing "equal" for discarded lines after the last opcode
+            if (Reduced.EndA > OrigA) or (Reduced.EndB > OrigB) then
+            begin
+              ExpandedOps[K].Tag := DIFF_TAG_EQUAL;
+              ExpandedOps[K].I1 := OrigA;
+              ExpandedOps[K].I2 := Reduced.EndA;
+              ExpandedOps[K].J1 := OrigB;
+              ExpandedOps[K].J2 := Reduced.EndB;
+              Inc(K);
+            end;
+
+            SetLength(ExpandedOps, K);
+
+            // Add prefix/suffix equal blocks and return
+            SetLength(Result, Length(ExpandedOps) + 2);
+            K := 0;
+            if (Reduced.BeginA > 0) or (Reduced.BeginB > 0) then
+            begin
+              Result[K].Tag := DIFF_TAG_EQUAL;
+              Result[K].I1 := 0;
+              Result[K].I2 := Reduced.BeginA;
+              Result[K].J1 := 0;
+              Result[K].J2 := Reduced.BeginB;
+              Inc(K);
+            end;
+            for I := 0 to High(ExpandedOps) do
+            begin
+              Result[K] := ExpandedOps[I];
+              Inc(K);
+            end;
+            if (SeqA.Size > Reduced.EndA) or (SeqB.Size > Reduced.EndB) then
+            begin
+              Result[K].Tag := DIFF_TAG_EQUAL;
+              Result[K].I1 := Reduced.EndA;
+              Result[K].I2 := SeqA.Size;
+              Result[K].J1 := Reduced.EndB;
+              Result[K].J2 := SeqB.Size;
+              Inc(K);
+            end;
+            SetLength(Result, K);
+            Exit;
+          end;
+        end;
+
+        // Normal path (no discarding, or Histogram which doesn't need it)
         case AAlgo of
           DIFF_ALGO_MYERS:
             MyersDiffNonCommon(Edits, SeqA, SeqB, Reduced,
