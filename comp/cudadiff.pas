@@ -1062,7 +1062,12 @@ begin
     Edit := TDiffEdit.Create(0, 0, 0, 0);
     Found := False;
     D := 1;
-    while (D < High(Integer)) and not Found do
+    // Safety limit: D can never exceed the combined length of the region.
+    // Without this, if SafeGet returns 0 for out-of-bounds indices (which
+    // can happen if the V arrays aren't perfectly sized), the "meets"
+    // condition may never fire and D increments toward High(Integer),
+    // causing an effectively infinite loop (hours of hang).
+    while (D <= MaxSize) and not Found do
     begin
       if (D and $3FF) = 0 then
         if IsCancelled(ACancelFunc, ACancelData) then
