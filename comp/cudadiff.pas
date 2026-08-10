@@ -1001,7 +1001,11 @@ begin
   // Process work items from the stack. This replaces the recursive
   // CalculateEdits calls — the "stack" is now on the heap, so it can
   // grow to any size without overflowing the call stack.
-  while WorkCount > 0 do
+  // Safety limit: the work stack can never have more items than the
+  // total number of lines (each item represents at least 1 line). If
+  // it exceeds that, something is wrong — bail out to prevent an
+  // infinite loop from hanging CudaText.
+  while (WorkCount > 0) and (WorkCount <= MaxSize + 1) do
   begin
     Dec(WorkCount);
     Item := WorkStack[WorkCount];
@@ -1039,8 +1043,19 @@ begin
     State.EndA := X;
     State.EndB := K + X;
 
-    if (State.BeginA >= State.EndA) and (State.BeginB >= State.EndB) then
+    // After trimming, check if either side is empty. This is the same
+    // check TextDiff does (Diff_NP.pas line 365-380): if len1=0, emit
+    // as add; if len2=0, emit as delete. Without this check, the k range
+    // computation below produces invalid values (MinK > MaxK) which
+    // causes ForceKIntoRange to return garbage, leading to an infinite
+    // loop in the work stack.
+    if (State.BeginA >= State.EndA) or (State.BeginB >= State.EndB) then
+    begin
+      if (State.BeginA < State.EndA) or (State.BeginB < State.EndB) then
+        AEdits.Add(TDiffEdit.Create(State.BeginA, State.EndA,
+          State.BeginB, State.EndB));
       Continue;
+    end;
 
     State.MinK := State.BeginB - State.EndA;
     State.MaxK := State.EndB - State.BeginA;
@@ -1378,7 +1393,7 @@ end;
 
 function THistogramIndex.FindLongestCommonSequence: TDiffEdit;
 var
-  BPtr: Integer;
+  BPtr, NewBPtr: Integer;
 begin
   if not ScanA then
   begin
@@ -1391,8 +1406,16 @@ begin
   FCnt := FMaxChainLength + 1;
 
   BPtr := FRegion.BeginB;
+  // Safety: if TryLongestCommonSequence ever returns a value <= BPtr
+  // (doesn't advance), force advance to prevent infinite loop.
   while BPtr < FRegion.EndB do
-    BPtr := TryLongestCommonSequence(BPtr);
+  begin
+    NewBPtr := TryLongestCommonSequence(BPtr);
+    if NewBPtr <= BPtr then
+      BPtr := BPtr + 1
+    else
+      BPtr := NewBPtr;
+  end;
 
   // If common elements exist but all have occurrence count > max_chain_length,
   // fall back to Myers. JGit signals this by returning null; we use FFallback.
