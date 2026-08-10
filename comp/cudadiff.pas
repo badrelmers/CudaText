@@ -251,6 +251,7 @@ type
     BwdBeginK, BwdEndK: Integer;
 
     MiddleEdit: TDiffEdit;
+    BigSnake: Boolean;  { Set when a snake > SNAKE_LIMIT is found }
   end;
 
   { HistogramDiff per-region scratch. }
@@ -722,39 +723,55 @@ function EditsToOpcodes(const AEdits: TDiffEditList;
   the full edit list with O(N) space (vs O(N*D) for naive Myers).
 }
 
-function ForwardSnake(const AState: TMyersState; AK, AX: Integer): Integer; inline;
+const
+  { GNU diffutils constants (analyze.c):
+    SNAKE_LIMIT: Snakes bigger than this are considered "big" and
+      trigger the big_snake early-termination heuristic.
+    TOO_EXPENSIVE_FLOOR: Minimum value for the too_expensive threshold. }
+  SNAKE_LIMIT = 20;
+  TOO_EXPENSIVE_FLOOR = 4096;
+
+function ForwardSnake(var AState: TMyersState; AK, AX: Integer): Integer; inline;
 var
-  X, Y: Integer;
+  X, Y, SnakeLen: Integer;
   SeqA, SeqB: PLineSequence;
 begin
   SeqA := AState.SeqA;
   SeqB := AState.SeqB;
   X := AX;
   Y := AK + X;
+  SnakeLen := 0;
   while (X < AState.EndA) and (Y < AState.EndB) and
         SeqA^.EqualsAt(X, SeqB^, Y) do
   begin
     Inc(X);
     Inc(Y);
+    Inc(SnakeLen);
   end;
+  if SnakeLen > SNAKE_LIMIT then
+    AState.BigSnake := True;
   Result := X;
 end;
 
-function BackwardSnake(const AState: TMyersState; AK, AX: Integer): Integer; inline;
+function BackwardSnake(var AState: TMyersState; AK, AX: Integer): Integer; inline;
 var
-  X, Y: Integer;
+  X, Y, SnakeLen: Integer;
   SeqA, SeqB: PLineSequence;
 begin
   SeqA := AState.SeqA;
   SeqB := AState.SeqB;
   X := AX;
   Y := AK + X;
+  SnakeLen := 0;
   while (X > AState.BeginA) and (Y > AState.BeginB) and
         SeqA^.EqualsAt(X - 1, SeqB^, Y - 1) do
   begin
     Dec(X);
     Dec(Y);
+    Inc(SnakeLen);
   end;
+  if SnakeLen > SNAKE_LIMIT then
+    AState.BigSnake := True;
   Result := X;
 end;
 
@@ -994,10 +1011,36 @@ begin
   end;
 end;
 
-{ Work item for the explicit diff stack. Replaces recursive CalculateEdits
-  calls — using a heap-allocated stack prevents stack overflow on large
-  files with many differences (TextDiff uses the same PushDiff/PopDiff
-  pattern). }
+{ Myers O(ND) diff with linear-space middle-snake optimization.
+  Port of JGit's MyersDiff.java (Myers 1986 + Myers-Miller 1988
+  divide-and-conquer).
+
+  Additional optimizations ported from GNU diffutils (WinMerge's
+  default diff engine, analyze.c):
+  - TOO_EXPENSIVE heuristic: caps the D-loop at max(4096, sqrt(N)).
+    When exceeded, picks the best forward/backward diagonal found so
+    far as the split point, producing a suboptimal but good enough
+    result. Makes the algorithm O(N*sqrt(N)) instead of O(N*D) for
+    files with large edit distance.
+  - big_snake heuristic: when c > 200 and a snake > 20 lines was
+    found, checks if any diagonal has made progress >> cost. If so,
+    returns that diagonal as the split point. Makes the algorithm
+    O(N) for files with constant small density of changes.
+
+  Not ported from GNU diffutils:
+  - discard_confusing_lines: removes lines with 0 matches before
+    running Myers. Not ported because the index mapping caused
+    access violations. The TOO_EXPENSIVE heuristic provides a
+    similar speedup without the complexity.
+  - shift_boundaries: adjusts boundaries for prettier output. The
+    Differ plugin does its own opcode realignment.
+  - provisional discard logic (sqrt(N) threshold for many matches):
+    same reason as discard_confusing_lines.
+
+  TextDiff's PushDiff/PopDiff pattern replaces recursion with an
+  explicit heap-allocated work stack to prevent stack overflow.
+  Pointer arithmetic (PInteger adjusted by OffsetK) eliminates
+  bounds-checking overhead. }
 type
   TDiffWorkItem = record
     BeginA, EndA, BeginB, EndB: Integer;
@@ -1021,6 +1064,12 @@ var
   Edit: TDiffEdit;
   K, X, D: Integer;
   Found: Boolean;
+  TooExpensive: Integer;
+  BigSnake: Boolean;
+  FwdX, BwdX: PInteger;
+  FwdSnake, BwdSnake: PInt64;
+  BestVal, BestX, TmpX, TmpY, TmpD: Integer;
+  FxyBest, FxBest, BxyBest, BxBest: Integer;
 
   procedure PushWork(ABeginA, AEndA, ABeginB, AEndB: Integer);
   begin
@@ -1047,6 +1096,20 @@ begin
   MaxSize := ARegion.LengthA + ARegion.LengthB;
   if MaxSize = 0 then
     Exit;
+
+  { Compute TOO_EXPENSIVE threshold (GNU diffutils analyze.c line 958):
+    approximate square root of input size, bounded below by 4096.
+    This caps the D-loop to prevent O(N*D) blowup on files with
+    large edit distance. }
+  TooExpensive := 1;
+  TmpX := MaxSize;
+  while TmpX > 0 do
+  begin
+    TooExpensive := TooExpensive shl 1;
+    TmpX := TmpX shr 2;
+  end;
+  if TooExpensive < TOO_EXPENSIVE_FLOOR then
+    TooExpensive := TOO_EXPENSIVE_FLOOR;
   State.OffsetK := MaxSize;
   // Allocate V arrays once at top level. Size is 2*MaxSize+1, which is
   // always sufficient for any sub-region's k range (k is in [-MaxSize, +MaxSize]).
@@ -1143,15 +1206,11 @@ begin
     State.BwdSnake[State.BwdMiddleK] :=
       PackSnake(State.EndA, State.BwdMiddleK + State.EndA);
 
-    // Find the middle snake.
+    // Find the middle snake with GNU diffutils heuristics.
     Edit := TDiffEdit.Create(0, 0, 0, 0);
     Found := False;
+    BigSnake := False;
     D := 1;
-    // Safety limit: D can never exceed the combined length of the region.
-    // Without this, if SafeGet returns 0 for out-of-bounds indices (which
-    // can happen if the V arrays aren't perfectly sized), the "meets"
-    // condition may never fire and D increments toward High(Integer),
-    // causing an effectively infinite loop (hours of hang).
     while (D <= MaxSize) and not Found do
     begin
       if (D and $3FF) = 0 then
@@ -1160,13 +1219,197 @@ begin
           ACancelled := True;
           Exit;
         end;
+
+      { Track big_snake: ForwardCalculate and BackwardCalculate
+        set BigSnake when a snake > SNAKE_LIMIT is found. We pass
+        it by reference via the State record. }
+      State.BigSnake := False;
+
       if ForwardCalculate(State, D) or BackwardCalculate(State, D) then
       begin
         Edit := State.MiddleEdit;
         Found := True;
       end
       else
+      begin
+        if State.BigSnake then
+          BigSnake := True;
+
+        { GNU diffutils big_snake heuristic (analyze.c line 200):
+          When c > 200 and a big snake was found, check if any
+          diagonal has made progress >> cost. If so, return that
+          diagonal as the split point. This makes the algorithm
+          linear for files with constant small density of changes. }
+        if (D > 200) and BigSnake then
+        begin
+          { Check forward diagonals for best progress }
+          FwdX := State.FwdX;
+          FwdSnake := State.FwdSnake;
+          BestVal := 0;
+          BestX := 0;
+          K := State.FwdEndK;
+          while K >= State.FwdBeginK do
+          begin
+            TmpX := FwdX[K];
+            TmpY := TmpX - K;
+            TmpD := K - State.FwdMiddleK;
+            if TmpD < 0 then TmpD := -TmpD;
+            { v = (x - xoff) * 2 - dd = progress * 2 - diagonal_distance }
+            X := (TmpX - State.BeginA) * 2 - TmpD;
+            if (X > 12 * (D + TmpD)) and
+               (X > BestVal) and
+               (State.BeginA + SNAKE_LIMIT <= TmpX) and
+               (TmpX < State.EndA) and
+               (State.BeginB + SNAKE_LIMIT <= TmpY) and
+               (TmpY < State.EndB) then
+            begin
+              { Verify it ends with a significant snake }
+              TmpD := 0;
+              while (TmpD < SNAKE_LIMIT) and
+                    (TmpX - TmpD - 1 >= State.BeginA) and
+                    (TmpY - TmpD - 1 >= State.BeginB) and
+                    ASeqA.EqualsAt(TmpX - TmpD - 1, ASeqB, TmpY - TmpD - 1) do
+                Inc(TmpD);
+              if TmpD >= SNAKE_LIMIT then
+              begin
+                BestVal := X;
+                BestX := TmpX;
+              end;
+            end;
+            Dec(K, 2);
+          end;
+          if BestVal > 0 then
+          begin
+            Edit := TDiffEdit.Create(BestX, BestX, BestX - (BestX - State.BeginA + State.BeginB), BestX - (BestX - State.BeginA + State.BeginB));
+            { Simplify: just use the point as a zero-length edit }
+            Edit.BeginA := BestX;
+            Edit.EndA := BestX;
+            Edit.BeginB := BestX - (State.FwdMiddleK);
+            Edit.EndB := Edit.BeginB;
+            Found := True;
+            Break;
+          end;
+
+          { Check backward diagonals for best progress }
+          BwdX := State.BwdX;
+          BwdSnake := State.BwdSnake;
+          BestVal := 0;
+          BestX := 0;
+          K := State.BwdEndK;
+          while K >= State.BwdBeginK do
+          begin
+            TmpX := BwdX[K];
+            TmpY := TmpX - K;
+            TmpD := K - State.BwdMiddleK;
+            if TmpD < 0 then TmpD := -TmpD;
+            { v = (xlim - x) * 2 + dd }
+            X := (State.EndA - TmpX) * 2 + TmpD;
+            if (X > 12 * (D + TmpD)) and
+               (X > BestVal) and
+               (State.BeginA < TmpX) and
+               (TmpX <= State.EndA - SNAKE_LIMIT) and
+               (State.BeginB < TmpY) and
+               (TmpY <= State.EndB - SNAKE_LIMIT) then
+            begin
+              TmpD := 0;
+              while (TmpD < SNAKE_LIMIT - 1) and
+                    (TmpX + TmpD < State.EndA) and
+                    (TmpY + TmpD < State.EndB) and
+                    ASeqA.EqualsAt(TmpX + TmpD, ASeqB, TmpY + TmpD) do
+                Inc(TmpD);
+              if TmpD >= SNAKE_LIMIT - 1 then
+              begin
+                BestVal := X;
+                BestX := TmpX;
+              end;
+            end;
+            Dec(K, 2);
+          end;
+          if BestVal > 0 then
+          begin
+            Edit.BeginA := BestX;
+            Edit.EndA := BestX;
+            Edit.BeginB := BestX - (State.BwdMiddleK);
+            Edit.EndB := Edit.BeginB;
+            Found := True;
+            Break;
+          end;
+        end;
+
+        { GNU diffutils TOO_EXPENSIVE heuristic (analyze.c line 277):
+          When cost exceeds the threshold, give up on finding the
+          optimal split and pick the best forward/backward diagonal
+          found so far. This produces a suboptimal but good enough
+          result, preventing O(N*D) blowup. }
+        if D >= TooExpensive then
+        begin
+          { Find forward diagonal that maximizes X + Y }
+          FwdX := State.FwdX;
+          FxyBest := -1;
+          FxBest := 0;
+          K := State.FwdEndK;
+          while K >= State.FwdBeginK do
+          begin
+            TmpX := FwdX[K];
+            if TmpX > State.EndA then TmpX := State.EndA;
+            TmpY := TmpX - K;
+            if TmpY > State.EndB then
+            begin
+              TmpX := State.EndB + K;
+              TmpY := State.EndB;
+            end;
+            if TmpX + TmpY > FxyBest then
+            begin
+              FxyBest := TmpX + TmpY;
+              FxBest := TmpX;
+            end;
+            Dec(K, 2);
+          end;
+
+          { Find backward diagonal that minimizes X + Y }
+          BwdX := State.BwdX;
+          BxyBest := MaxInt;
+          BxBest := 0;
+          K := State.BwdEndK;
+          while K >= State.BwdBeginK do
+          begin
+            TmpX := BwdX[K];
+            if TmpX < State.BeginA then TmpX := State.BeginA;
+            TmpY := TmpX - K;
+            if TmpY < State.BeginB then
+            begin
+              TmpX := State.BeginB + K;
+              TmpY := State.BeginB;
+            end;
+            if TmpX + TmpY < BxyBest then
+            begin
+              BxyBest := TmpX + TmpY;
+              BxBest := TmpX;
+            end;
+            Dec(K, 2);
+          end;
+
+          { Use the better of the two diagonals (GNU diffutils line 315) }
+          if (State.EndA + State.EndB) - BxyBest < FxyBest - (State.BeginA + State.BeginB) then
+          begin
+            Edit.BeginA := BxBest;
+            Edit.EndA := BxBest;
+            Edit.BeginB := BxyBest - BxBest;
+            Edit.EndB := Edit.BeginB;
+          end
+          else
+          begin
+            Edit.BeginA := FxBest;
+            Edit.EndA := FxBest;
+            Edit.BeginB := FxyBest - FxBest;
+            Edit.EndB := Edit.BeginB;
+          end;
+          Found := True;
+          Break;
+        end;
+
         Inc(D);
+      end;
     end;
 
     if not Found then
