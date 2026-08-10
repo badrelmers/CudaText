@@ -1949,13 +1949,19 @@ begin
             for I := 0 to High(FilteredOps) do
             begin
               Op := FilteredOps[I];
-              // Map filtered indices to original indices
-              if Op.I1 > 0 then
+              // Map filtered indices to original indices, with bounds checking.
+              // Op.I1/Op.I2 can equal FilteredSeqA.Size (the sentinel position
+              // at the end of the last opcode), which is beyond FFilteredToOrig.
+              if (Op.I1 > 0) and (Op.I1 < Length(MapA.FFilteredToOrig)) then
                 NextOrigA := Reduced.BeginA + MapA.FFilteredToOrig[Op.I1]
+              else if Op.I1 >= Length(MapA.FFilteredToOrig) then
+                NextOrigA := Reduced.EndA
               else
                 NextOrigA := Reduced.BeginA;
-              if Op.J1 > 0 then
+              if (Op.J1 > 0) and (Op.J1 < Length(MapB.FFilteredToOrig)) then
                 NextOrigB := Reduced.BeginB + MapB.FFilteredToOrig[Op.J1]
+              else if Op.J1 >= Length(MapB.FFilteredToOrig) then
+                NextOrigB := Reduced.EndB
               else
                 NextOrigB := Reduced.BeginB;
 
@@ -1970,13 +1976,17 @@ begin
                 Inc(K);
               end;
 
-              // Map the opcode's end indices
-              if Op.I2 > 0 then
+              // Map the opcode's end indices, with bounds checking
+              if (Op.I2 > 0) and (Op.I2 - 1 < Length(MapA.FFilteredToOrig)) then
                 OrigA := Reduced.BeginA + MapA.FFilteredToOrig[Op.I2 - 1] + 1
+              else if Op.I2 >= Length(MapA.FFilteredToOrig) then
+                OrigA := Reduced.EndA
               else
                 OrigA := NextOrigA;
-              if Op.J2 > 0 then
+              if (Op.J2 > 0) and (Op.J2 - 1 < Length(MapB.FFilteredToOrig)) then
                 OrigB := Reduced.BeginB + MapB.FFilteredToOrig[Op.J2 - 1] + 1
+              else if Op.J2 >= Length(MapB.FFilteredToOrig) then
+                OrigB := Reduced.EndB
               else
                 OrigB := NextOrigB;
 
