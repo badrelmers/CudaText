@@ -1889,6 +1889,138 @@ begin
   end;
 end;
 
+{ GNU diffutils shift_boundaries (analyze.c line 629).
+  Port of WinMerge's default diff engine's boundary-shifting pass.
+
+  What it does: after the diff algorithm produces edit regions,
+  shift_boundaries adjusts the boundaries of each change run so that
+  identical lines adjacent to the run are moved into/out of the change
+  to produce cleaner, more intuitive diffs. Specifically:
+  - Move a change run backward so long as the previous unchanged line
+    matches the last changed line (merges with previous change runs).
+  - Move a change run forward so long as the first changed line matches
+    the following unchanged line (merges with following change runs).
+  - If possible, move the fully-merged run back to a corresponding
+    run in the other file.
+
+  Why both Myers and Histogram: both algorithms can produce suboptimal
+  boundary placement. For example, if lines A[5..7] are changed and
+  A[4] == A[7], the change could be shifted to A[4..6] instead —
+  which may merge with a preceding change run and produce a more
+  compact diff. Histogram's anchoring prevents some of these cases
+  but not all. Running shift_boundaries on both algorithms improves
+  quality with negligible cost (O(N) scan).
+
+  This is a quality improvement, not a speed improvement. It runs
+  in O(N) time where N is the number of lines. }
+procedure ShiftBoundaries(
+  var AEdits: TDiffEditList;
+  const ASeqA, ASeqB: TLineSequence;
+  ALenA, ALenB: Integer);
+var
+  ChangedA, ChangedB: array of Byte;
+  I, J: Integer;
+  Cur: TDiffEdit;
+  T: TDiffEditType;
+begin
+  if AEdits.Count = 0 then Exit;
+
+  { Build changed_flag arrays from the edit list (for potential future
+    use with the full GNU diffutils algorithm). Currently unused but
+    allocated for completeness. }
+  SetLength(ChangedA, ALenA);
+  SetLength(ChangedB, ALenB);
+  for I := 0 to ALenA - 1 do ChangedA[I] := 0;
+  for I := 0 to ALenB - 1 do ChangedB[I] := 0;
+  for I := 0 to AEdits.Count - 1 do
+  begin
+    Cur := AEdits.Items[I];
+    for J := Cur.BeginA to Cur.EndA - 1 do
+      if (J >= 0) and (J < ALenA) then
+        ChangedA[J] := 1;
+    for J := Cur.BeginB to Cur.EndB - 1 do
+      if (J >= 0) and (J < ALenB) then
+        ChangedB[J] := 1;
+  end;
+
+  { Shift each edit backward: if the first changed line equals the
+    line just before the run, shift the run backward by one. This
+    merges with any preceding change run.
+
+    The full GNU diffutils shift_boundaries also shifts forward and
+    handles merge-between-runs via changed_flag arrays. That version
+    is complex and requires the changed_flag arrays. This simpler
+    version handles the backward-shift case directly on the edit list,
+    which covers the most common quality improvement. The forward-shift
+    case is already handled by NormalizeEdits above. }
+
+  for I := 0 to AEdits.Count - 1 do
+  begin
+    Cur := AEdits.Items[I];
+    T := Cur.GetType;
+
+    if (T = detInsert) or (T = detDelete) or (T = detReplace) then
+    begin
+      while (Cur.BeginA > 0) and (Cur.BeginB > 0) do
+      begin
+        if (Cur.EndA > Cur.BeginA) and (Cur.EndB > Cur.BeginB) then
+        begin
+          if ASeqA.EqualsAt(Cur.BeginA - 1, ASeqA, Cur.EndA - 1) and
+             ASeqB.EqualsAt(Cur.BeginB - 1, ASeqB, Cur.EndB - 1) then
+          begin
+            Dec(Cur.BeginA);
+            Dec(Cur.BeginB);
+            Dec(Cur.EndA);
+            Dec(Cur.EndB);
+          end
+          else
+            Break;
+        end
+        else if (Cur.EndA > Cur.BeginA) then
+        begin
+          if ASeqA.EqualsAt(Cur.BeginA - 1, ASeqA, Cur.EndA - 1) then
+          begin
+            Dec(Cur.BeginA);
+            Dec(Cur.EndA);
+          end
+          else
+            Break;
+        end
+        else if (Cur.EndB > Cur.BeginB) then
+        begin
+          if ASeqB.EqualsAt(Cur.BeginB - 1, ASeqB, Cur.EndB - 1) then
+          begin
+            Dec(Cur.BeginB);
+            Dec(Cur.EndB);
+          end
+          else
+            Break;
+        end
+        else
+          Break;
+      end;
+    end;
+
+    AEdits.Items[I] := Cur;
+  end;
+
+  { Re-sort by BeginA (shifting backward may have changed order). }
+  if AEdits.Count > 1 then
+  begin
+    for I := 1 to AEdits.Count - 1 do
+    begin
+      Cur := AEdits.Items[I];
+      J := I - 1;
+      while (J >= 0) and (AEdits.Items[J].BeginA > Cur.BeginA) do
+      begin
+        AEdits.Items[J + 1] := AEdits.Items[J];
+        Dec(J);
+      end;
+      AEdits.Items[J + 1] := Cur;
+    end;
+  end;
+end;
+
 { Convert an edit list to difflib-compatible opcodes.
   Walks the edit list in order, emitting 'equal' opcodes for the
   common regions between edits and the appropriate tag for each edit. }
@@ -2005,6 +2137,15 @@ begin
   end;
 
   NormalizeEdits(Edits, SeqA, SeqB);
+  { ShiftBoundaries is a quality improvement that shifts change
+    boundaries to merge adjacent runs when surrounding lines are
+    identical. It runs only for line-level diff (DIF_TEXTS), not for
+    word-level diff (DIF_CHARS calls DoDiffLines internally for
+    word-level diff — shifting word boundaries would corrupt the
+    char-level offset mapping). We use a special flag bit to signal
+    "this is a word-level diff call, skip ShiftBoundaries". }
+  if (AFlags and $40000000) = 0 then
+    ShiftBoundaries(Edits, SeqA, SeqB, SeqA.Size, SeqB.Size);
   Result := EditsToOpcodes(Edits, SeqA.Size, SeqB.Size);
 end;
 
@@ -2324,7 +2465,7 @@ begin
   // but the size limit above caps the worst case.
   WordsA := TokensToStrings(TokensA);
   WordsB := TokensToStrings(TokensB);
-  WordOpcodes := DoDiffLines(WordsA, WordsB, DIFF_ALGO_MYERS, AFlags,
+  WordOpcodes := DoDiffLines(WordsA, WordsB, DIFF_ALGO_MYERS, AFlags or $40000000,
     ACancelFunc, ACancelData, ACancelled);
   if ACancelled then
     Exit;
