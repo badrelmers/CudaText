@@ -254,6 +254,20 @@ type
     BigSnake: Boolean;  { Set when a snake > SNAKE_LIMIT is found }
   end;
 
+  { Result of discard_confusing_lines preprocessing for one side.
+    FDiscarded[I] is True when line (ARegionBegin + I) was discarded
+    (matches nothing in the other file, or matches too many lines and
+    survived the provisional-cancel rules).
+    FKeptIdx[J] gives the offset (relative to ARegionBegin) of the J-th
+    kept line, for J in [0..FKeptCount-1]. Used to translate virtual
+    indices back to real ones after Myers runs on the kept subset. }
+  TDiscardMap = record
+    FDiscarded: array of Boolean;
+    FKeptIdx: array of Integer;
+    FKeptCount: Integer;
+    FRegionLen: Integer;
+  end;
+
   { HistogramDiff per-region scratch. }
   THistogramIndex = record
     FMaxChainLength: Integer;
@@ -658,6 +672,15 @@ end;
 
 { ---------- Forward declarations for diff algorithms ---------- }
 
+function MyersDiffCore(
+  out AEdits: TDiffEditList;
+  const ASeqA, ASeqB: TLineSequence;
+  ARegion: TDiffEdit;
+  ACancelFunc: TDiffCancelFunc;
+  ACancelData: Pointer;
+  var ACancelled: Boolean
+): Boolean; forward;
+
 function MyersDiffNonCommon(
   out AEdits: TDiffEditList;
   const ASeqA, ASeqB: TLineSequence;
@@ -1008,16 +1031,18 @@ end;
     found, checks if any diagonal has made progress >> cost. If so,
     returns that diagonal as the split point. Makes the algorithm
     O(N) for files with constant small density of changes.
+  - discard_confusing_lines (analyze.c lines 414-614): preprocesses
+    both sequences to remove lines that obviously don't match (nmatch
+    == 0) or that match too many lines (nmatch > sqrt(N)*5, marked
+    "provisionally discardable"). Myers then runs on the smaller
+    "undiscarded" subset, with discarded lines emitted as standalone
+    INSERT/DELETE edits. Provides huge speedups on files with many
+    unique lines (e.g. log files with timestamps) by avoiding the
+    O(N*D) trap entirely.
 
   Not ported from GNU diffutils:
-  - discard_confusing_lines: removes lines with 0 matches before
-    running Myers. Not ported because the index mapping caused
-    access violations. The TOO_EXPENSIVE heuristic provides a
-    similar speedup without the complexity.
   - shift_boundaries: adjusts boundaries for prettier output. The
     Differ plugin does its own opcode realignment.
-  - provisional discard logic (sqrt(N) threshold for many matches):
-    same reason as discard_confusing_lines.
 
   TextDiff's PushDiff/PopDiff pattern replaces recursion with an
   explicit heap-allocated work stack to prevent stack overflow.
@@ -1029,7 +1054,499 @@ type
   end;
   TDiffWorkStack = array of TDiffWorkItem;
 
-function MyersDiffNonCommon(
+{ ---------- discard_confusing_lines (port of analyze.c) ---------- }
+{
+  Direct port of WinMerge/GNU diffutils analyze.c:discard_confusing_lines
+  (lines 414-614). Builds equivalence classes for lines in both sequences
+  within the region, counts how many lines of each side fall into each
+  class, then marks lines as discardable when they match 0 lines on the
+  other side, or as "provisionally discardable" when they match too many
+  (nmatch > sqrt(N)*5).
+
+  The provisional-discard run rules (analyze.c lines 483-593) are ported
+  verbatim — they cancel provisional discards in subruns that don't meet
+  length/position thresholds, preventing the algorithm from discarding
+  useful context lines.
+
+  Output: ADiscardA / ADiscardB describe which lines were discarded and
+  provide the virtual->real index mapping for the kept lines.
+}
+
+type
+  { Hash map entry for equivalence class lookup. One per line in both
+    sequences within the region. Chains via Next for hash-bucket collision
+    resolution. }
+  TEquivEntry = record
+    Hash: Integer;
+    Side: Byte;        // 0 = A, 1 = B
+    LocalIdx: Integer; // offset within the side's region (0..Len-1)
+    EquivClass: Integer;
+    Next: Integer;     // index of next entry in same hash bucket, -1 if none
+  end;
+
+{ Compute log2(table size) for a power-of-2 table. Used to derive the
+  Knuth-mix shift count from the bucket count. }
+function EquivTableBits(ATableSize: Integer): Integer;
+var
+  B: Integer;
+begin
+  B := 0;
+  while (1 shl B) < ATableSize do
+    Inc(B);
+  Result := B;
+end;
+
+{ Build equivalence-class assignments for both sides of a region.
+  EquivsA[i] / EquivsB[i] get the class ID for the i-th line in each
+  side's region (i is a 0-based offset from ARegion.BeginA/BeginB).
+  Returns EquivMax = one more than the largest class ID used.
+
+  Lines that compare equal across sides get the same class ID; lines
+  with the same hash but different content get different class IDs
+  (verified via EqualsAt to avoid hash-collision false matches). }
+{$PUSH}
+{$RANGECHECKS OFF}  { Cardinal*Cardinal Knuth mix wraps on assignment. }
+procedure BuildEquivClasses(
+  const ASeqA, ASeqB: TLineSequence;
+  ARegion: TDiffEdit;
+  var AEquivsA: array of Integer;
+  var AEquivsB: array of Integer;
+  var AEquivMax: Integer);
+var
+  LenA, LenB, Total, I, J, Hash, Bucket, ClassId, TableSize, Mask, EntryIdx: Integer;
+  Entries: array of TEquivEntry;
+  Buckets: array of Integer;
+  TBits: Integer;
+  MatchFound: Boolean;
+begin
+  LenA := ARegion.LengthA;
+  LenB := ARegion.LengthB;
+  Total := LenA + LenB;
+  // Caller pre-allocates AEquivsA / AEquivsB to LenA / LenB.
+  if Total = 0 then
+  begin
+    AEquivMax := 1;
+    Exit;
+  end;
+
+  // Size the hash table to next power of 2 >= 2*Total (load factor ~0.5).
+  TableSize := 16;
+  while TableSize < Total * 2 do
+    TableSize := TableSize shl 1;
+  Mask := TableSize - 1;
+  TBits := EquivTableBits(TableSize);
+  SetLength(Buckets, TableSize);
+  for I := 0 to TableSize - 1 do
+    Buckets[I] := -1;
+
+  // Allocate one entry per line in both sequences.
+  SetLength(Entries, Total);
+  EntryIdx := 0;
+
+  // Fill entries for side A.
+  for I := 0 to LenA - 1 do
+  begin
+    Hash := ASeqA.HashAt(ARegion.BeginA + I);
+    Entries[EntryIdx].Hash := Hash;
+    Entries[EntryIdx].Side := 0;
+    Entries[EntryIdx].LocalIdx := I;
+    Entries[EntryIdx].EquivClass := -1;
+    Bucket := (Cardinal(Hash) * $9e370001) shr (32 - TBits);
+    Bucket := Bucket and Mask;
+    Entries[EntryIdx].Next := Buckets[Bucket];
+    Buckets[Bucket] := EntryIdx;
+    Inc(EntryIdx);
+  end;
+
+  // Fill entries for side B.
+  for I := 0 to LenB - 1 do
+  begin
+    Hash := ASeqB.HashAt(ARegion.BeginB + I);
+    Entries[EntryIdx].Hash := Hash;
+    Entries[EntryIdx].Side := 1;
+    Entries[EntryIdx].LocalIdx := I;
+    Entries[EntryIdx].EquivClass := -1;
+    Bucket := (Cardinal(Hash) * $9e370001) shr (32 - TBits);
+    Bucket := Bucket and Mask;
+    Entries[EntryIdx].Next := Buckets[Bucket];
+    Buckets[Bucket] := EntryIdx;
+    Inc(EntryIdx);
+  end;
+
+  // Walk all entries, assigning equivalence classes.
+  // Class 0 is reserved for "no match" (a line whose equivs[i] == 0 is
+  // always discarded because nmatch == 0 — see analyze.c line 473).
+  ClassId := 1;
+  for I := 0 to Total - 1 do
+  begin
+    if Entries[I].EquivClass <> -1 then
+      Continue;
+
+    // Start a new equivalence class.
+    Entries[I].EquivClass := ClassId;
+
+    // Walk the hash bucket chain to find same-hash entries and verify
+    // content equality. Same-hash different-content entries will fail
+    // the EqualsAt check and remain unassigned — they get their own
+    // class when their outer-loop iteration arrives.
+    Bucket := (Cardinal(Entries[I].Hash) * $9e370001) shr (32 - TBits);
+    Bucket := Bucket and Mask;
+    J := Buckets[Bucket];
+    while J <> -1 do
+    begin
+      if (J <> I) and (Entries[J].EquivClass = -1) and
+         (Entries[J].Hash = Entries[I].Hash) then
+      begin
+        // Verify content equality.
+        if (Entries[I].Side = 0) and (Entries[J].Side = 0) then
+          MatchFound := ASeqA.EqualsAt(
+            ARegion.BeginA + Entries[I].LocalIdx,
+            ASeqA, ARegion.BeginA + Entries[J].LocalIdx)
+        else if (Entries[I].Side = 1) and (Entries[J].Side = 1) then
+          MatchFound := ASeqB.EqualsAt(
+            ARegion.BeginB + Entries[I].LocalIdx,
+            ASeqB, ARegion.BeginB + Entries[J].LocalIdx)
+        else if Entries[I].Side = 0 then
+          // I in A, J in B
+          MatchFound := ASeqA.EqualsAt(
+            ARegion.BeginA + Entries[I].LocalIdx,
+            ASeqB, ARegion.BeginB + Entries[J].LocalIdx)
+        else
+          // I in B, J in A
+          MatchFound := ASeqA.EqualsAt(
+            ARegion.BeginA + Entries[J].LocalIdx,
+            ASeqB, ARegion.BeginB + Entries[I].LocalIdx);
+        if MatchFound then
+          Entries[J].EquivClass := ClassId;
+      end;
+      J := Entries[J].Next;
+    end;
+
+    Inc(ClassId);
+  end;
+
+  // Emit equivs arrays.
+  for I := 0 to Total - 1 do
+  begin
+    if Entries[I].Side = 0 then
+      AEquivsA[Entries[I].LocalIdx] := Entries[I].EquivClass
+    else
+      AEquivsB[Entries[I].LocalIdx] := Entries[I].EquivClass;
+  end;
+
+  AEquivMax := ClassId;
+end;
+{$POP}
+
+{ Apply the provisional-discard run rules (analyze.c lines 483-593).
+  Walks the discards[] array (0=keep, 1=discard, 2=provisional) and
+  cancels provisional discards that don't meet the run-length thresholds.
+  Mutates ADiscards in place. }
+procedure CancelProvisionalRuns(var ADiscards: array of Byte; AEnd: Integer);
+var
+  I, J, Length_, Provisional, Minimum, Tem, Consec: Integer;
+begin
+  I := 0;
+  while I < AEnd do
+  begin
+    // Standalone provisionals (not in a run with nonprovisionals) get cancelled.
+    if ADiscards[I] = 2 then
+    begin
+      ADiscards[I] := 0;
+      Inc(I);
+      Continue;
+    end;
+    if ADiscards[I] = 0 then
+    begin
+      Inc(I);
+      Continue;
+    end;
+
+    // Found a nonprovisional discard (value 1) at I.
+    // Find end of run; count provisionals.
+    J := I;
+    Provisional := 0;
+    while (J < AEnd) and (ADiscards[J] <> 0) do
+    begin
+      if ADiscards[J] = 2 then
+        Inc(Provisional);
+      Inc(J);
+    end;
+
+    // Cancel provisional discards at end of run.
+    while (J > I) and (ADiscards[J - 1] = 2) do
+    begin
+      Dec(J);
+      ADiscards[J] := 0;
+      Dec(Provisional);
+    end;
+
+    Length_ := J - I;
+
+    // If 1/4 of the run is provisional, cancel all provisionals in the run.
+    if Provisional * 4 > Length_ then
+    begin
+      while J > I do
+      begin
+        Dec(J);
+        if ADiscards[J] = 2 then
+          ADiscards[J] := 0;
+      end;
+    end
+    else
+    begin
+      // MINIMUM = approximate sqrt(Length/4) + 1.
+      // A subrun of two or more provisionals can stand when LENGTH >= 16.
+      // A subrun of 4 or more can stand when LENGTH >= 64.
+      Minimum := 1;
+      Tem := Length_ div 4;
+      while Tem > 0 do
+      begin
+        Tem := Tem shr 2;
+        if Tem > 0 then
+          Minimum := Minimum * 2;
+      end;
+      Inc(Minimum);
+
+      // Cancel any subrun of MINIMUM or more provisionals within the run.
+      Consec := 0;
+      J := 0;
+      while J < Length_ do
+      begin
+        if ADiscards[I + J] <> 2 then
+          Consec := 0
+        else
+        begin
+          Inc(Consec);
+          if Minimum = Consec then
+            // Back up to start of subrun, to cancel it all.
+            J := J - Consec
+          else if Minimum < Consec then
+            ADiscards[I + J] := 0;
+        end;
+        Inc(J);
+      end;
+
+      // Scan from beginning of run: cancel provisionals until we find
+      // 3+ nonprovisionals in a row, or until the first nonprovisional
+      // at least 8 lines in. Until that point, cancel any provisionals.
+      Consec := 0;
+      for J := 0 to Length_ - 1 do
+      begin
+        if (J >= 8) and (ADiscards[I + J] = 1) then
+          Break;
+        if ADiscards[I + J] = 2 then
+        begin
+          Consec := 0;
+          ADiscards[I + J] := 0;
+        end
+        else if ADiscards[I + J] = 0 then
+          Consec := 0
+        else
+          Inc(Consec);
+        if Consec = 3 then
+          Break;
+      end;
+
+      // I advances to the last line of the run.
+      I := I + Length_ - 1;
+
+      // Same scan, from end backwards.
+      Consec := 0;
+      for J := 0 to Length_ - 1 do
+      begin
+        if (J >= 8) and (ADiscards[I - J] = 1) then
+          Break;
+        if ADiscards[I - J] = 2 then
+        begin
+          Consec := 0;
+          ADiscards[I - J] := 0;
+        end
+        else if ADiscards[I - J] = 0 then
+          Consec := 0
+        else
+          Inc(Consec);
+        if Consec = 3 then
+          Break;
+      end;
+    end;
+
+    Inc(I);
+  end;
+end;
+
+{ Port of analyze.c:discard_confusing_lines (lines 414-614).
+  Produces ADiscardA / ADiscardB describing which lines were discarded
+  and the virtual->real index mapping for kept lines. }
+procedure DiscardConfusingLines(
+  const ASeqA, ASeqB: TLineSequence;
+  ARegion: TDiffEdit;
+  out ADiscardA, ADiscardB: TDiscardMap);
+var
+  EquivsA, EquivsB: array of Integer;
+  EquivMax, I, J, LenA, LenB, Many, Tem: Integer;
+  EquivCountA, EquivCountB: array of Integer;
+  DiscardedA, DiscardedB: array of Byte;  // 0=keep, 1=discard, 2=provisional
+begin
+  LenA := ARegion.LengthA;
+  LenB := ARegion.LengthB;
+  SetLength(ADiscardA.FDiscarded, LenA);
+  SetLength(ADiscardA.FKeptIdx, LenA);
+  ADiscardA.FKeptCount := 0;
+  ADiscardA.FRegionLen := LenA;
+  SetLength(ADiscardB.FDiscarded, LenB);
+  SetLength(ADiscardB.FKeptIdx, LenB);
+  ADiscardB.FKeptCount := 0;
+  ADiscardB.FRegionLen := LenB;
+
+  if (LenA = 0) or (LenB = 0) then
+  begin
+    // Nothing to discard when one side is empty — keep everything.
+    for I := 0 to LenA - 1 do
+    begin
+      ADiscardA.FDiscarded[I] := False;
+      ADiscardA.FKeptIdx[I] := I;
+    end;
+    ADiscardA.FKeptCount := LenA;
+    for I := 0 to LenB - 1 do
+    begin
+      ADiscardB.FDiscarded[I] := False;
+      ADiscardB.FKeptIdx[I] := I;
+    end;
+    ADiscardB.FKeptCount := LenB;
+    Exit;
+  end;
+
+  SetLength(EquivsA, LenA);
+  SetLength(EquivsB, LenB);
+  BuildEquivClasses(ASeqA, ASeqB, ARegion, EquivsA, EquivsB, EquivMax);
+
+  // equiv_count[F][I] = # lines in file F with equivalence class I.
+  SetLength(EquivCountA, EquivMax);
+  SetLength(EquivCountB, EquivMax);
+  for I := 0 to EquivMax - 1 do
+  begin
+    EquivCountA[I] := 0;
+    EquivCountB[I] := 0;
+  end;
+  for I := 0 to LenA - 1 do
+    Inc(EquivCountA[EquivsA[I]]);
+  for I := 0 to LenB - 1 do
+    Inc(EquivCountB[EquivsB[I]]);
+
+  SetLength(DiscardedA, LenA);
+  SetLength(DiscardedB, LenB);
+  for I := 0 to LenA - 1 do
+    DiscardedA[I] := 0;
+  for I := 0 to LenB - 1 do
+    DiscardedB[I] := 0;
+
+  // Mark discardable lines on side A. For each line in A, look at the
+  // count of matching lines in B (via the shared equiv class).
+  // MANY = 5 * approximate sqrt(LenA/64) — threshold for "too many matches".
+  Many := 5;
+  Tem := LenA div 64;
+  while Tem > 0 do
+  begin
+    Tem := Tem shr 2;
+    if Tem > 0 then
+      Many := Many * 2;
+  end;
+  for I := 0 to LenA - 1 do
+  begin
+    if EquivsA[I] = 0 then
+      Continue;
+    J := EquivCountB[EquivsA[I]];
+    if J = 0 then
+      DiscardedA[I] := 1
+    else if J > Many then
+      DiscardedA[I] := 2;
+  end;
+
+  // Side B.
+  Many := 5;
+  Tem := LenB div 64;
+  while Tem > 0 do
+  begin
+    Tem := Tem shr 2;
+    if Tem > 0 then
+      Many := Many * 2;
+  end;
+  for I := 0 to LenB - 1 do
+  begin
+    if EquivsB[I] = 0 then
+      Continue;
+    J := EquivCountA[EquivsB[I]];
+    if J = 0 then
+      DiscardedB[I] := 1
+    else if J > Many then
+      DiscardedB[I] := 2;
+  end;
+
+  // Apply provisional-cancel run rules.
+  CancelProvisionalRuns(DiscardedA, LenA);
+  CancelProvisionalRuns(DiscardedB, LenB);
+
+  // Actually discard: build kept-index arrays.
+  J := 0;
+  for I := 0 to LenA - 1 do
+  begin
+    if DiscardedA[I] = 0 then
+    begin
+      ADiscardA.FDiscarded[I] := False;
+      ADiscardA.FKeptIdx[J] := I;
+      Inc(J);
+    end
+    else
+      ADiscardA.FDiscarded[I] := True;
+  end;
+  ADiscardA.FKeptCount := J;
+
+  J := 0;
+  for I := 0 to LenB - 1 do
+  begin
+    if DiscardedB[I] = 0 then
+    begin
+      ADiscardB.FDiscarded[I] := False;
+      ADiscardB.FKeptIdx[J] := I;
+      Inc(J);
+    end
+    else
+      ADiscardB.FDiscarded[I] := True;
+  end;
+  ADiscardB.FKeptCount := J;
+end;
+
+{ Build a virtual TLineSequence containing only the kept lines from
+  ASource[ABegin..ABegin+ADiscard.FRegionLen). Reuses hashes and
+  normalized copies from ASource so no rehashing is needed. }
+procedure BuildVirtualSequence(
+  const ASource: TLineSequence;
+  ABegin: Integer;
+  const ADiscard: TDiscardMap;
+  out AVirt: TLineSequence);
+var
+  I, RealIdx: Integer;
+begin
+  AVirt.FHasNormalization := ASource.FHasNormalization;
+  SetLength(AVirt.FLines, ADiscard.FKeptCount);
+  if AVirt.FHasNormalization then
+    SetLength(AVirt.FNormalized, ADiscard.FKeptCount)
+  else
+    AVirt.FNormalized := nil;
+  SetLength(AVirt.FHashes, ADiscard.FKeptCount);
+  for I := 0 to ADiscard.FKeptCount - 1 do
+  begin
+    RealIdx := ABegin + ADiscard.FKeptIdx[I];
+    AVirt.FLines[I] := ASource.FLines[RealIdx];
+    if AVirt.FHasNormalization then
+      AVirt.FNormalized[I] := ASource.FNormalized[RealIdx];
+    AVirt.FHashes[I] := ASource.FHashes[RealIdx];
+  end;
+end;
+
+
+function MyersDiffCore(
   out AEdits: TDiffEditList;
   const ASeqA, ASeqB: TLineSequence;
   ARegion: TDiffEdit;
@@ -1440,6 +1957,180 @@ begin
       end;
       AEdits.Items[D + 1] := Edit;
     end;
+  end;
+end;
+
+{ MyersDiffNonCommon: entry point for Myers diff with discard_confusing_lines
+  preprocessing.
+
+  This wrapper decides whether to apply discard_confusing_lines (analyze.c
+  line 942) before running MyersDiffCore. The discard step removes lines
+  that obviously don't match (nmatch == 0) or that match too many lines
+  (provisionally discardable), reducing the input size for Myers and
+  avoiding the O(N*D) trap on files with many unique lines (e.g. log
+  files with timestamps that change on every line).
+
+  Threshold: only apply discard when the region has >= 256 lines on
+  either side. Below that, the overhead of building equiv classes and
+  virtual sequences outweighs the benefit, and Myers is fast enough.
+
+  After Myers runs on the virtual (kept) sequences, the resulting edits
+  are translated back to real line indices, and discarded lines are
+  emitted as standalone INSERT (side B) / DELETE (side A) edits. The
+  final edit list is then sorted by BeginA/BeginB for EditsToOpcodes. }
+function MyersDiffNonCommon(
+  out AEdits: TDiffEditList;
+  const ASeqA, ASeqB: TLineSequence;
+  ARegion: TDiffEdit;
+  ACancelFunc: TDiffCancelFunc;
+  ACancelData: Pointer;
+  var ACancelled: Boolean
+): Boolean;
+const
+  { Below this threshold, skip discard preprocessing — Myers is fast
+    enough on small inputs and the equiv-class overhead isn't worth it. }
+  DISCARD_MIN_LINES = 256;
+var
+  DiscardA, DiscardB: TDiscardMap;
+  VirtSeqA, VirtSeqB: TLineSequence;
+  VirtRegion: TDiffEdit;
+  VirtEdits: TDiffEditList;
+  UseDiscard: Boolean;
+  I, J: Integer;
+  LenA, LenB: Integer;
+  Edit: TDiffEdit;
+  ChangedA, ChangedB: array of Boolean;
+  IA, IB, StartA, StartB: Integer;
+  RealBegin, RealEnd: Integer;
+begin
+  Result := True;
+  ACancelled := False;
+  AEdits.Init;
+  LenA := ARegion.LengthA;
+  LenB := ARegion.LengthB;
+
+  // Decide whether to apply discard_confusing_lines preprocessing.
+  UseDiscard := (LenA >= DISCARD_MIN_LINES) or
+                (LenB >= DISCARD_MIN_LINES);
+
+  if not UseDiscard then
+  begin
+    // Small input — run Myers directly on the original sequences.
+    Exit(MyersDiffCore(AEdits, ASeqA, ASeqB, ARegion,
+      ACancelFunc, ACancelData, ACancelled));
+  end;
+
+  // Run discard_confusing_lines on both sides.
+  DiscardConfusingLines(ASeqA, ASeqB, ARegion, DiscardA, DiscardB);
+
+  // If discard didn't remove anything, skip the virtual-sequence path.
+  if (DiscardA.FKeptCount = ARegion.LengthA) and
+     (DiscardB.FKeptCount = ARegion.LengthB) then
+  begin
+    Exit(MyersDiffCore(AEdits, ASeqA, ASeqB, ARegion,
+      ACancelFunc, ACancelData, ACancelled));
+  end;
+
+  // Build virtual sequences containing only kept lines.
+  BuildVirtualSequence(ASeqA, ARegion.BeginA, DiscardA, VirtSeqA);
+  BuildVirtualSequence(ASeqB, ARegion.BeginB, DiscardB, VirtSeqB);
+
+  // Handle degenerate cases where one side is entirely discarded.
+  if (VirtSeqA.Size = 0) and (VirtSeqB.Size = 0) then
+  begin
+    // Both sides entirely discarded — entire region is a REPLACE.
+    AEdits.Add(ARegion);
+    Exit;
+  end;
+
+  if VirtSeqA.Size = 0 then
+  begin
+    // All of A was discarded. Run Myers on B's kept lines vs nothing
+    // isn't useful — just emit: kept B lines as INSERT, discarded A
+    // lines as DELETE. But wait, the kept B lines might still match
+    // discarded A lines (rare but possible). For correctness, fall
+    // back to core on the original sequences.
+    Exit(MyersDiffCore(AEdits, ASeqA, ASeqB, ARegion,
+      ACancelFunc, ACancelData, ACancelled));
+  end;
+  if VirtSeqB.Size = 0 then
+  begin
+    Exit(MyersDiffCore(AEdits, ASeqA, ASeqB, ARegion,
+      ACancelFunc, ACancelData, ACancelled));
+  end;
+
+  // Run Myers on the virtual sequences.
+  VirtRegion := TDiffEdit.Create(0, VirtSeqA.Size, 0, VirtSeqB.Size);
+  VirtEdits.Init;
+  MyersDiffCore(VirtEdits, VirtSeqA, VirtSeqB, VirtRegion,
+    ACancelFunc, ACancelData, ACancelled);
+  if ACancelled then
+    Exit;
+
+  // Translate virtual edits back to real line indices using the
+  // build_script approach from GNU diffutils (analyze.c line 793).
+  //
+  // Build changedA[] / changedB[] boolean arrays (indexed by real offset
+  // within the region). Mark:
+  //   - Discarded lines as changed (they're standalone INSERT/DELETE)
+  //   - Virtual edit lines as changed (mapped back via FKeptIdx)
+  // Then walk both arrays in lock-step, grouping consecutive changed
+  // lines into TDiffEdit records. Unchanged lines on both sides become
+  // EQUAL gaps (handled by EditsToOpcodes).
+  SetLength(ChangedA, LenA + 1);  // +1 for sentinel
+  SetLength(ChangedB, LenB + 1);
+  for I := 0 to LenA do ChangedA[I] := False;
+  for I := 0 to LenB do ChangedB[I] := False;
+
+  // Mark discarded lines as changed.
+  for I := 0 to LenA - 1 do
+    if DiscardA.FDiscarded[I] then
+      ChangedA[I] := True;
+  for I := 0 to LenB - 1 do
+    if DiscardB.FDiscarded[I] then
+      ChangedB[I] := True;
+
+  // Mark virtual edit lines as changed (map virtual indices back to real).
+  for I := 0 to VirtEdits.Count - 1 do
+  begin
+    Edit := VirtEdits.Items[I];
+    // A side: map virtual [BeginA, EndA) to real offsets.
+    if Edit.BeginA < Edit.EndA then
+    begin
+      RealBegin := DiscardA.FKeptIdx[Edit.BeginA];
+      RealEnd := DiscardA.FKeptIdx[Edit.EndA - 1] + 1;
+      for J := RealBegin to RealEnd - 1 do
+        ChangedA[J] := True;
+    end;
+    // B side: map virtual [BeginB, EndB) to real offsets.
+    if Edit.BeginB < Edit.EndB then
+    begin
+      RealBegin := DiscardB.FKeptIdx[Edit.BeginB];
+      RealEnd := DiscardB.FKeptIdx[Edit.EndB - 1] + 1;
+      for J := RealBegin to RealEnd - 1 do
+        ChangedB[J] := True;
+    end;
+  end;
+
+  // Walk changedA[] and changedB[] in lock-step, emitting TDiffEdit
+  // records for runs of changed lines. This is a direct port of
+  // build_script (analyze.c line 793).
+  IA := 0;
+  IB := 0;
+  while (IA < LenA) or (IB < LenB) do
+  begin
+    if ChangedA[IA] or ChangedB[IB] then
+    begin
+      StartA := IA;
+      StartB := IB;
+      while ChangedA[IA] do Inc(IA);
+      while ChangedB[IB] do Inc(IB);
+      AEdits.Add(TDiffEdit.Create(
+        ARegion.BeginA + StartA, ARegion.BeginA + IA,
+        ARegion.BeginB + StartB, ARegion.BeginB + IB));
+    end;
+    if IA < LenA then Inc(IA);
+    if IB < LenB then Inc(IB);
   end;
 end;
 
