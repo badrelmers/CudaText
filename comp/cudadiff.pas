@@ -901,7 +901,7 @@ begin
     end;
 
     if (K >= AState.BwdBeginK) and (K <= AState.BwdEndK) and
-       (((AD + K - AState.BwdMiddleK) mod 2) = 0) and
+       (((AD - 1 + K - AState.BwdMiddleK) mod 2) = 0) and
        (NewX >= BwdX[K]) then
     begin
       AState.MiddleEdit := TDiffEdit.Create(
@@ -1871,87 +1871,18 @@ begin
   end;
 end;
 
-{ Normalize edit list: merge adjacent INSERT+DELETE pairs into REPLACE,
-  then shift pure INSERT/DELETE to latest position (JGit normalize).
-  
-  The merge step fixes a fundamental Myers O(ND) behavior: Myers finds
-  the shortest edit script, but when multiple shortest scripts exist,
-  it may match trivial lines (empty lines, whitespace) as anchors,
-  fragmenting what should be a single INSERT into INSERT+EQUAL(trivial)
-  +DELETE. difflib (Ratcliff-Obershelp) doesn't have this problem
-  because it finds longest matching blocks first.
-  
-  The merge: if edit[i] is INSERT (BeginA==EndA, pure insert from B)
-  and edit[i+1] is DELETE (BeginB==EndB, pure delete from A), or vice
-  versa, merge them into one REPLACE spanning both A and B ranges.
-  The gap (EQUAL region) between them is absorbed into the REPLACE.
-  This is standard diff normalization, NOT the VS Code _realign_opcodes
-  heuristic (which only merges trivial gaps <= 4 non-ws chars). We merge
-  ALL adjacent INSERT+DELETE pairs regardless of gap size. }
+{ JGit's normalize pass: shift pure INSERT/DELETE edits to their latest
+  possible position. Produces consistent diff output regardless of
+  which path the algorithm took through ties. }
 procedure NormalizeEdits(var AEdits: TDiffEditList;
   const ASeqA, ASeqB: TLineSequence);
 var
   I: Integer;
-  Cur, Next, Prev: TDiffEdit;
+  Cur, Prev: TDiffEdit;
   MaxA, MaxB: Integer;
   T: TDiffEditType;
-  GapA, GapB, NonWsLen: Integer;
 begin
   if AEdits.Count = 0 then Exit;
-
-  { Pass 1: Merge adjacent non-EQUAL edits separated by a trivial gap
-    into a single REPLACE. This fixes the Myers trivial-anchor
-    fragmentation where Myers matches a trivial line (empty, whitespace)
-    as an anchor, producing REPLACE+EQUAL(trivial)+REPLACE or
-    REPLACE+EQUAL(trivial)+DELETE instead of a single REPLACE or INSERT.
-
-    The gap is the EQUAL region between two consecutive edits. A gap is
-    "trivial" if it contains <= 4 non-whitespace characters total in A
-    (matching VS Code's removeVeryShortMatchingLinesBetweenDiffs threshold).
-    Only trivial gaps are merged — non-trivial gaps (containing meaningful
-    code lines like 'def on_change_slow') are preserved as separate EQUAL
-    blocks.
-
-    This is the root-cause fix for the drift bug. The drift was caused by
-    Myers matching trivial lines (like '\n') as anchors, fragmenting what
-    should be a single INSERT into REPLACE+EQUAL(trivial)+REPLACE+...
-    Python difflib doesn't have this bug because it uses Ratcliff-Obershelp
-    (finds longest match first). }
-  I := 0;
-  while I < AEdits.Count - 1 do
-  begin
-    Cur := AEdits.Items[I];
-    Next := AEdits.Items[I + 1];
-    GapA := Next.BeginA - Cur.EndA;
-    GapB := Next.BeginB - Cur.EndB;
-    if (GapA >= 0) and (GapB >= 0) then
-    begin
-      { Count non-whitespace chars in the gap (A side) }
-      NonWsLen := 0;
-      MaxA := GapA - 1;
-      while MaxA >= 0 do
-      begin
-        Inc(NonWsLen, NonWsCharCount(ASeqA.FLines[Cur.EndA + MaxA]));
-        Dec(MaxA);
-      end;
-      { Merge if gap is trivial (<= 4 non-ws chars) }
-      if NonWsLen <= 4 then
-      begin
-        AEdits.Items[I] := TDiffEdit.Create(
-          MinI(Cur.BeginA, Next.BeginA),
-          MaxI(Cur.EndA, Next.EndA),
-          MinI(Cur.BeginB, Next.BeginB),
-          MaxI(Cur.EndB, Next.EndB));
-        AEdits.DeleteAt(I + 1);
-        if I > 0 then
-          Dec(I);
-        Continue;
-      end;
-    end;
-    Inc(I);
-  end;
-
-  { Pass 2: Shift pure INSERT/DELETE edits forward (JGit NormalizeEdits). }
   Prev := TDiffEdit.Create(0, 0, 0, 0);
   for I := AEdits.Count - 1 downto 0 do
   begin
