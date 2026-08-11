@@ -199,7 +199,6 @@ type
     FCount: Integer;
     procedure Init;
     procedure Add(const AEdit: TDiffEdit);
-    procedure DeleteAt(AIndex: Integer);
     function GetItem(AIndex: Integer): TDiffEdit;
     procedure SetItem(AIndex: Integer; const AEdit: TDiffEdit);
     function Count: Integer;
@@ -233,9 +232,6 @@ type
     with PSizeInt. }
   TMyersState = record
     SeqA, SeqB: PLineSequence;
-    CancelFunc: TDiffCancelFunc;
-    CancelData: Pointer;
-    Cancelled: Pointer;        // ^Boolean
 
     // V arrays — allocated once at top level, accessed via pointers.
     FwdXBuf: array of Integer;   // raw storage
@@ -304,22 +300,6 @@ begin
   Result := (C = ' ') or (C = #9) or (C = #10) or (C = #13);
 end;
 
-{ Count non-whitespace characters in a string. Used by NormalizeEdits
-  to determine if an EQUAL block between INSERT and DELETE is "trivial"
-  (<= 4 non-whitespace chars), in which case it should be merged into
-  a single REPLACE. Matches VS Code's _realign_opcodes threshold. }
-function NonWsCharCount(const ALine: string): Integer;
-var
-  S: AnsiString;
-  I: Integer;
-begin
-  S := AnsiString(ALine);
-  Result := 0;
-  for I := 1 to Length(S) do
-    if not IsWhitespaceByte(S[I]) then
-      Inc(Result);
-end;
-
 function IsCancelled(ACancelFunc: TDiffCancelFunc; ACancelData: Pointer): Boolean; inline;
 begin
   if Assigned(ACancelFunc) then
@@ -346,11 +326,6 @@ begin
   Result := Integer(Cardinal(Int64(ASnake) and $FFFFFFFF));
 end;
 {$POP}
-
-function VIndex(AOffsetK, AK: Integer): Integer; inline;
-begin
-  Result := AK + AOffsetK;
-end;
 
 { ---------- TDiffEdit ---------- }
 
@@ -439,16 +414,6 @@ end;
 function TDiffEditList.GetItem(AIndex: Integer): TDiffEdit;
 begin
   Result := FItems[AIndex];
-end;
-
-procedure TDiffEditList.DeleteAt(AIndex: Integer);
-var
-  I: Integer;
-begin
-  if (AIndex < 0) or (AIndex >= FCount) then Exit;
-  for I := AIndex to FCount - 2 do
-    FItems[I] := FItems[I + 1];
-  Dec(FCount);
 end;
 
 procedure TDiffEditList.SetItem(AIndex: Integer; const AEdit: TDiffEdit);
@@ -1097,9 +1062,6 @@ begin
 
   State.SeqA := @ASeqA;
   State.SeqB := @ASeqB;
-  State.CancelFunc := ACancelFunc;
-  State.CancelData := ACancelData;
-  State.Cancelled := @ACancelled;
 
   MaxSize := ARegion.LengthA + ARegion.LengthB;
   if MaxSize = 0 then
@@ -2189,38 +2151,6 @@ begin
   SetLength(Result, Length(ATokens));
   for I := 0 to High(ATokens) do
     Result[I] := ATokens[I].Text;
-end;
-
-{ Compute the common prefix length of two string slices.
-  Port of char_diff.py's _compute_byte_diff prefix portion. }
-function CommonPrefixLen(const AText: string; AStartA: Integer;
-  const BText: string; AStartB: Integer; AMaxLen: Integer): Integer;
-var
-  SA, SB: AnsiString;
-  I: Integer;
-begin
-  SA := AnsiString(AText);
-  SB := AnsiString(BText);
-  // AStartA/AStartB are 0-based; SA/SB are 1-based.
-  Result := 0;
-  while (Result < AMaxLen) and
-        (SA[AStartA + 1 + Result] = SB[AStartB + 1 + Result]) do
-    Inc(Result);
-end;
-
-{ Compute the common suffix length of two string slices.
-  Port of char_diff.py's _compute_byte_diff suffix portion. }
-function CommonSuffixLen(const AText: string; AStartA, ALenA: Integer;
-  const BText: string; AStartB, ALenB: Integer; AMaxLen: Integer): Integer;
-var
-  SA, SB: AnsiString;
-begin
-  SA := AnsiString(AText);
-  SB := AnsiString(BText);
-  Result := 0;
-  while (Result < AMaxLen) and
-        (SA[AStartA + ALenA - Result] = SB[AStartB + ALenB - Result]) do
-    Inc(Result);
 end;
 
 function DoDiffChars(
