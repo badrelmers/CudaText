@@ -130,15 +130,17 @@ function SplitLinesKeepEnds(const AText: string): TStringArray;
 
 implementation
 
-{ CudaText is compiled with {$RANGECHECKS ON} and {$OVERFLOWCHECKS ON}
-  by default (see proc_str.pas which turns them off locally). The diff
-  algorithms use intentional integer wrapping (djb2 hash, Knuth
-  multiplication, bit-packing) and negative-array-index-via-offset
-  patterns (Myers V arrays) that would trigger ERangeError under those
-  checks. Disable both for the entire unit, same as CudaText's own
-  proc_str.pas does. }
-{$RANGECHECKS OFF}
-{$OVERFLOWCHECKS OFF}
+{ Free Pascal on 64-bit evaluates 32-bit arithmetic in 64-bit signed
+  and then range-checks the assignment back to the 32-bit variable.
+  This means Cardinal wraparound (djb2 in HashLine, Knuth mix in
+  HashSeq) trips ERangeError under RANGECHECKS ON — not EIntOverflow,
+  since the 64-bit intermediate never overflows. The Int64-to-Integer
+  narrowing in SnakeX/SnakeY/RecNext/RecPtr/RecCnt is also
+  range-checked. Those sites disable RANGECHECKS locally below via
+  PUSH/POP blocks. The Myers V arrays use raw PInteger/PInt64 offsets,
+  which are never range-checked, so they need no directive.
+  OVERFLOWCHECKS is left at the project default everywhere — nothing
+  in this unit needs it off. }
 
 uses
   SysUtils;
@@ -223,11 +225,12 @@ type
 
   { Scratch state for MyersDiff, reused across recursion levels to
     avoid repeated heap allocation. Uses raw pointers (PInteger / PInt64)
-    for the V arrays instead of dynamic arrays — this eliminates the
-    bounds-checking overhead that SafeGet/SafeSet introduced (26.6s on
-    the 3MB HTML test). The pointer is adjusted by OffsetK so that
-    negative k indices work without bounds checks, exactly like
-    LGenerics' LcsMyersImpl does with PSizeInt. }
+    for the V arrays instead of dynamic arrays — raw pointer indexing
+    is never range-checked, which eliminates per-access bounds-check
+    overhead (26.6s on the 3MB HTML test with checked arrays). The
+    pointer is adjusted by OffsetK so that negative k indices work
+    without bounds checks, exactly like LGenerics' LcsMyersImpl does
+    with PSizeInt. }
   TMyersState = record
     SeqA, SeqB: PLineSequence;
     CancelFunc: TDiffCancelFunc;
@@ -325,6 +328,9 @@ begin
     Result := False;
 end;
 
+{$PUSH}
+{$RANGECHECKS OFF}  { Cardinal(AY) cast can be out of Integer range;
+                       Int64-to-Integer narrowing in SnakeX/SnakeY. }
 function PackSnake(AX, AY: Integer): Int64; inline;
 begin
   Result := (Int64(AX) shl 32) or Int64(Cardinal(AY));
@@ -339,41 +345,11 @@ function SnakeY(ASnake: Int64): Integer; inline;
 begin
   Result := Integer(Cardinal(Int64(ASnake) and $FFFFFFFF));
 end;
+{$POP}
 
 function VIndex(AOffsetK, AK: Integer): Integer; inline;
 begin
   Result := AK + AOffsetK;
-end;
-
-{ Bounds-checked access to the V arrays. Returns 0 (safe default) if the
-  index is out of range, preventing access violations that would crash
-  CudaText (access violations bypass try/except and kill the process). }
-function SafeGet(const AArr: array of Integer; AIdx: Integer): Integer; inline;
-begin
-  if (AIdx < 0) or (AIdx >= Length(AArr)) then
-    Result := 0
-  else
-    Result := AArr[AIdx];
-end;
-
-function SafeGetSnake(const AArr: array of Int64; AIdx: Integer): Int64; inline;
-begin
-  if (AIdx < 0) or (AIdx >= Length(AArr)) then
-    Result := 0
-  else
-    Result := AArr[AIdx];
-end;
-
-procedure SafeSet(var AArr: array of Integer; AIdx, AValue: Integer); inline;
-begin
-  if (AIdx >= 0) and (AIdx < Length(AArr)) then
-    AArr[AIdx] := AValue;
-end;
-
-procedure SafeSetSnake(var AArr: array of Int64; AIdx: Integer; AValue: Int64); inline;
-begin
-  if (AIdx >= 0) and (AIdx < Length(AArr)) then
-    AArr[AIdx] := AValue;
 end;
 
 { ---------- TDiffEdit ---------- }
@@ -615,6 +591,10 @@ end;
 { djb2 hash of a line's bytes. Matches JGit's RawTextComparator.hashRegion.
   Uses Cardinal (unsigned 32-bit) for the accumulator because the hash
   is designed to wrap around. }
+{$PUSH}
+{$RANGECHECKS OFF}  { Cardinal wraparound on the djb2 accumulator: the
+                       64-bit intermediate range-checks against
+                       Cardinal's range on assignment back to H. }
 function HashLine(const ALine: string): Integer;
 var
   S: AnsiString;
@@ -628,6 +608,7 @@ begin
     H := ((H shl 5) + H) + Ord(S[I]);
   Result := Integer(H);
 end;
+{$POP}
 
 { ---------- TLineSequence ---------- }
 
@@ -1534,6 +1515,9 @@ begin
   FFallback := False;
 end;
 
+{$PUSH}
+{$RANGECHECKS OFF}  { Cardinal*Cardinal Knuth multiplicative mix wraps
+                       on the assignment to Mixed. }
 function THistogramIndex.HashSeq(ASeq: PLineSequence; AIdx: Integer): Integer;
 var
   RawHash: Integer;
@@ -1543,6 +1527,7 @@ begin
   Mixed := Cardinal(RawHash) * HASH_MIX_CONSTANT;
   Result := Integer(Mixed shr FKeyShift);
 end;
+{$POP}
 
 class function THistogramIndex.RecCreate(ANext, APtr, ACnt: Integer): Int64;
 begin
@@ -1551,6 +1536,8 @@ begin
             Int64(ACnt);
 end;
 
+{$PUSH}
+{$RANGECHECKS OFF}  { Int64-to-Integer narrowing on the return. }
 class function THistogramIndex.RecNext(ARec: Int64): Integer;
 begin
   Result := Int64(ARec) shr REC_NEXT_SHIFT;
@@ -1565,6 +1552,7 @@ class function THistogramIndex.RecCnt(ARec: Int64): Integer;
 begin
   Result := Int64(ARec) and REC_CNT_MASK;
 end;
+{$POP}
 
 class function THistogramIndex.TableBits(ASz: Integer): Integer;
 var
@@ -2375,9 +2363,10 @@ begin
     WBEnd := WordOpcodes[I].J2;
 
     // Bounds-check the word indices against the token arrays. The diff
-    // algorithm should always produce valid indices, but with
-    // {$RANGECHECKS OFF} an out-of-bounds access would silently read
-    // wrong memory and crash. Clamp to valid range as a safety net.
+    // algorithm should always produce valid indices; this clamp is
+    // defence-in-depth so a bug in the algorithm produces an empty
+    // word range instead of an ERangeError or wrong memory being
+    // read.
     if WAStart < 0 then WAStart := 0;
     if WAEnd > Length(TokensA) then WAEnd := Length(TokensA);
     if WAStart > WAEnd then WAStart := WAEnd;
