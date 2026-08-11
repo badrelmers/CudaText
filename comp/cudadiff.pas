@@ -1871,67 +1871,77 @@ begin
   end;
 end;
 
-{ JGit's normalize pass + VS Code's _realign_opcodes Pass 1.
-  Two transformations:
-  1. Shift pure INSERT/DELETE edits to their latest possible position
-     (JGit's NormalizeEdits from DiffAlgorithm.java).
-  2. Merge INSERT+EQUAL(trivial)+DELETE (or DELETE+EQUAL(trivial)+INSERT)
-     into a single REPLACE. This fixes the LCS tie-breaking issue where
-     Myers matches a trivial line (empty, whitespace) instead of a
-     meaningful line, causing identical lines to show as one added +
-     one deleted instead of paired. Ported from VS Code's
-     heuristicSequenceOptimizations.ts and the Differ plugin's
-     _realign_opcodes Pass 1. }
+{ Normalize edit list: merge adjacent INSERT+DELETE pairs into REPLACE,
+  then shift pure INSERT/DELETE to latest position (JGit normalize).
+  
+  The merge step fixes a fundamental Myers O(ND) behavior: Myers finds
+  the shortest edit script, but when multiple shortest scripts exist,
+  it may match trivial lines (empty lines, whitespace) as anchors,
+  fragmenting what should be a single INSERT into INSERT+EQUAL(trivial)
+  +DELETE. difflib (Ratcliff-Obershelp) doesn't have this problem
+  because it finds longest matching blocks first.
+  
+  The merge: if edit[i] is INSERT (BeginA==EndA, pure insert from B)
+  and edit[i+1] is DELETE (BeginB==EndB, pure delete from A), or vice
+  versa, merge them into one REPLACE spanning both A and B ranges.
+  The gap (EQUAL region) between them is absorbed into the REPLACE.
+  This is standard diff normalization, NOT the VS Code _realign_opcodes
+  heuristic (which only merges trivial gaps <= 4 non-ws chars). We merge
+  ALL adjacent INSERT+DELETE pairs regardless of gap size. }
 procedure NormalizeEdits(var AEdits: TDiffEditList;
   const ASeqA, ASeqB: TLineSequence);
 var
   I: Integer;
-  Cur, Prev: TDiffEdit;
+  Cur, Next, Prev: TDiffEdit;
   MaxA, MaxB: Integer;
   T: TDiffEditType;
-  NonWsLen: Integer;
-  GapBeginA, GapEndA, GapBeginB, GapEndB: Integer;
+  GapA, GapB, NonWsLen: Integer;
 begin
   if AEdits.Count = 0 then Exit;
 
-  { Pass 1: Merge INSERT+GAP(trivial)+DELETE (or DELETE+GAP(trivial)+INSERT)
-    into a single REPLACE. This is the same logic as the Differ plugin's
-    _realign_opcodes Pass 1, ported to work on TDiffEdit records.
-    
-    The "gap" between two consecutive edits is the EQUAL region that
-    EditsToOpcodes generates. We check if this gap is trivial
-    (<= 4 non-whitespace characters in A) and if so, merge the two
-    edits plus the gap into one REPLACE. }
+  { Pass 1: Merge adjacent non-EQUAL edits separated by a trivial gap
+    into a single REPLACE. This fixes the Myers trivial-anchor
+    fragmentation where Myers matches a trivial line (empty, whitespace)
+    as an anchor, producing REPLACE+EQUAL(trivial)+REPLACE or
+    REPLACE+EQUAL(trivial)+DELETE instead of a single REPLACE or INSERT.
 
+    The gap is the EQUAL region between two consecutive edits. A gap is
+    "trivial" if it contains <= 4 non-whitespace characters total in A
+    (matching VS Code's removeVeryShortMatchingLinesBetweenDiffs threshold).
+    Only trivial gaps are merged — non-trivial gaps (containing meaningful
+    code lines like 'def on_change_slow') are preserved as separate EQUAL
+    blocks.
+
+    This is the root-cause fix for the drift bug. The drift was caused by
+    Myers matching trivial lines (like '\n') as anchors, fragmenting what
+    should be a single INSERT into REPLACE+EQUAL(trivial)+REPLACE+...
+    Python difflib doesn't have this bug because it uses Ratcliff-Obershelp
+    (finds longest match first). }
   I := 0;
   while I < AEdits.Count - 1 do
   begin
     Cur := AEdits.Items[I];
-    { Check if we have INSERT+DELETE or DELETE+INSERT consecutive pair }
-    if ((Cur.GetType = detInsert) and (AEdits.Items[I + 1].GetType = detDelete)) or
-       ((Cur.GetType = detDelete) and (AEdits.Items[I + 1].GetType = detInsert)) then
+    Next := AEdits.Items[I + 1];
+    GapA := Next.BeginA - Cur.EndA;
+    GapB := Next.BeginB - Cur.EndB;
+    if (GapA >= 0) and (GapB >= 0) then
     begin
-      { Calculate the gap between the two edits }
-      GapBeginA := Cur.EndA;
-      GapEndA := AEdits.Items[I + 1].BeginA;
-      GapBeginB := Cur.EndB;
-      GapEndB := AEdits.Items[I + 1].BeginB;
-
-      { Check if the gap is trivial (<= 4 non-whitespace chars in A) }
+      { Count non-whitespace chars in the gap (A side) }
       NonWsLen := 0;
-      MaxA := GapEndA - 1;
-      while MaxA >= GapBeginA do
+      MaxA := GapA - 1;
+      while MaxA >= 0 do
       begin
-        NonWsLen := NonWsLen + NonWsCharCount(ASeqA.FLines[MaxA]);
+        Inc(NonWsLen, NonWsCharCount(ASeqA.FLines[Cur.EndA + MaxA]));
         Dec(MaxA);
       end;
-
+      { Merge if gap is trivial (<= 4 non-ws chars) }
       if NonWsLen <= 4 then
       begin
-        { Merge the two edits plus the gap into one REPLACE }
-        Prev := AEdits.Items[I + 1];
         AEdits.Items[I] := TDiffEdit.Create(
-          Cur.BeginA, Prev.EndA, Cur.BeginB, Prev.EndB);
+          MinI(Cur.BeginA, Next.BeginA),
+          MaxI(Cur.EndA, Next.EndA),
+          MinI(Cur.BeginB, Next.BeginB),
+          MaxI(Cur.EndB, Next.EndB));
         AEdits.DeleteAt(I + 1);
         if I > 0 then
           Dec(I);
