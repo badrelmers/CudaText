@@ -197,6 +197,7 @@ type
     FCount: Integer;
     procedure Init;
     procedure Add(const AEdit: TDiffEdit);
+    procedure DeleteAt(AIndex: Integer);
     function GetItem(AIndex: Integer): TDiffEdit;
     procedure SetItem(AIndex: Integer; const AEdit: TDiffEdit);
     function Count: Integer;
@@ -298,6 +299,22 @@ end;
 function IsWhitespaceByte(C: AnsiChar): Boolean; inline;
 begin
   Result := (C = ' ') or (C = #9) or (C = #10) or (C = #13);
+end;
+
+{ Count non-whitespace characters in a string. Used by NormalizeEdits
+  to determine if an EQUAL block between INSERT and DELETE is "trivial"
+  (<= 4 non-whitespace chars), in which case it should be merged into
+  a single REPLACE. Matches VS Code's _realign_opcodes threshold. }
+function NonWsCharCount(const ALine: string): Integer;
+var
+  S: AnsiString;
+  I: Integer;
+begin
+  S := AnsiString(ALine);
+  Result := 0;
+  for I := 1 to Length(S) do
+    if not IsWhitespaceByte(S[I]) then
+      Inc(Result);
 end;
 
 function IsCancelled(ACancelFunc: TDiffCancelFunc; ACancelData: Pointer): Boolean; inline;
@@ -446,6 +463,16 @@ end;
 function TDiffEditList.GetItem(AIndex: Integer): TDiffEdit;
 begin
   Result := FItems[AIndex];
+end;
+
+procedure TDiffEditList.DeleteAt(AIndex: Integer);
+var
+  I: Integer;
+begin
+  if (AIndex < 0) or (AIndex >= FCount) then Exit;
+  for I := AIndex to FCount - 2 do
+    FItems[I] := FItems[I + 1];
+  Dec(FCount);
 end;
 
 procedure TDiffEditList.SetItem(AIndex: Integer; const AEdit: TDiffEdit);
@@ -1844,9 +1871,17 @@ begin
   end;
 end;
 
-{ JGit's normalize pass: shift pure INSERT/DELETE edits to their latest
-  possible position. Produces consistent diff output regardless of
-  which path the algorithm took through ties. }
+{ JGit's normalize pass + VS Code's _realign_opcodes Pass 1.
+  Two transformations:
+  1. Shift pure INSERT/DELETE edits to their latest possible position
+     (JGit's NormalizeEdits from DiffAlgorithm.java).
+  2. Merge INSERT+EQUAL(trivial)+DELETE (or DELETE+EQUAL(trivial)+INSERT)
+     into a single REPLACE. This fixes the LCS tie-breaking issue where
+     Myers matches a trivial line (empty, whitespace) instead of a
+     meaningful line, causing identical lines to show as one added +
+     one deleted instead of paired. Ported from VS Code's
+     heuristicSequenceOptimizations.ts and the Differ plugin's
+     _realign_opcodes Pass 1. }
 procedure NormalizeEdits(var AEdits: TDiffEditList;
   const ASeqA, ASeqB: TLineSequence);
 var
@@ -1854,8 +1889,59 @@ var
   Cur, Prev: TDiffEdit;
   MaxA, MaxB: Integer;
   T: TDiffEditType;
+  NonWsLen: Integer;
+  GapBeginA, GapEndA, GapBeginB, GapEndB: Integer;
 begin
   if AEdits.Count = 0 then Exit;
+
+  { Pass 1: Merge INSERT+GAP(trivial)+DELETE (or DELETE+GAP(trivial)+INSERT)
+    into a single REPLACE. This is the same logic as the Differ plugin's
+    _realign_opcodes Pass 1, ported to work on TDiffEdit records.
+    
+    The "gap" between two consecutive edits is the EQUAL region that
+    EditsToOpcodes generates. We check if this gap is trivial
+    (<= 4 non-whitespace characters in A) and if so, merge the two
+    edits plus the gap into one REPLACE. }
+
+  I := 0;
+  while I < AEdits.Count - 1 do
+  begin
+    Cur := AEdits.Items[I];
+    { Check if we have INSERT+DELETE or DELETE+INSERT consecutive pair }
+    if ((Cur.GetType = detInsert) and (AEdits.Items[I + 1].GetType = detDelete)) or
+       ((Cur.GetType = detDelete) and (AEdits.Items[I + 1].GetType = detInsert)) then
+    begin
+      { Calculate the gap between the two edits }
+      GapBeginA := Cur.EndA;
+      GapEndA := AEdits.Items[I + 1].BeginA;
+      GapBeginB := Cur.EndB;
+      GapEndB := AEdits.Items[I + 1].BeginB;
+
+      { Check if the gap is trivial (<= 4 non-whitespace chars in A) }
+      NonWsLen := 0;
+      MaxA := GapEndA - 1;
+      while MaxA >= GapBeginA do
+      begin
+        NonWsLen := NonWsLen + NonWsCharCount(ASeqA.FLines[MaxA]);
+        Dec(MaxA);
+      end;
+
+      if NonWsLen <= 4 then
+      begin
+        { Merge the two edits plus the gap into one REPLACE }
+        Prev := AEdits.Items[I + 1];
+        AEdits.Items[I] := TDiffEdit.Create(
+          Cur.BeginA, Prev.EndA, Cur.BeginB, Prev.EndB);
+        AEdits.DeleteAt(I + 1);
+        if I > 0 then
+          Dec(I);
+        Continue;
+      end;
+    end;
+    Inc(I);
+  end;
+
+  { Pass 2: Shift pure INSERT/DELETE edits forward (JGit NormalizeEdits). }
   Prev := TDiffEdit.Create(0, 0, 0, 0);
   for I := AEdits.Count - 1 downto 0 do
   begin
