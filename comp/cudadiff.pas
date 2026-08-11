@@ -704,6 +704,33 @@ const
   SNAKE_LIMIT = 20;
   TOO_EXPENSIVE_FLOOR = 4096;
 
+{ Create a middle edit from forward and backward snake endpoints.
+  When the forward path meets the backward path on a diagonal, the
+  condition is NewX >= BwdX[K] (or LeftEnd >= BwdX[K-1] etc.). The
+  >= means forward X may strictly exceed backward X — in that case
+  the edit would be (BeginA=X1, EndA=X2) with X1 > X2, which is
+  invalid (negative-length range). EditsToOpcodes then walks the
+  edit list expecting BeginA <= EndA, and an inverted edit produces
+  wrong opcodes that visibly drift in side-by-side rendering.
+
+  JGit handles this in EditPaths.makeEdit() by clamping:
+    if x1 > x2: x1 = x2
+    if y1 > y2: y1 = y2
+  which collapses the overshoot to a zero-length edit on that axis.
+  This is the same clamp, ported faithfully. }
+function MakeMiddleEdit(AFwdSnake, ABwdSnake: Int64): TDiffEdit; inline;
+var
+  X1, X2, Y1, Y2: Integer;
+begin
+  X1 := SnakeX(AFwdSnake);
+  X2 := SnakeX(ABwdSnake);
+  Y1 := SnakeY(AFwdSnake);
+  Y2 := SnakeY(ABwdSnake);
+  if X1 > X2 then X1 := X2;
+  if Y1 > Y2 then Y1 := Y2;
+  Result := TDiffEdit.Create(X1, X2, Y1, Y2);
+end;
+
 function ForwardSnake(var AState: TMyersState; AK, AX: Integer): Integer; inline;
 var
   X, Y, SnakeLen: Integer;
@@ -805,10 +832,7 @@ begin
          (((AD - 1 + (K - 1) - AState.BwdMiddleK) mod 2) = 0) and
          (LeftEnd >= BwdX[K - 1]) then
       begin
-        AState.MiddleEdit := TDiffEdit.Create(
-          SnakeX(LeftSnake), SnakeX(BwdSnake[K - 1]),
-          SnakeY(LeftSnake), SnakeY(BwdSnake[K - 1])
-        );
+        AState.MiddleEdit := MakeMiddleEdit(LeftSnake, BwdSnake[K - 1]);
         Exit(True);
       end;
       Left := LeftEnd;
@@ -826,10 +850,7 @@ begin
          (((AD - 1 + (K + 1) - AState.BwdMiddleK) mod 2) = 0) and
          (RightEnd >= BwdX[K + 1]) then
       begin
-        AState.MiddleEdit := TDiffEdit.Create(
-          SnakeX(RightSnake), SnakeX(BwdSnake[K + 1]),
-          SnakeY(RightSnake), SnakeY(BwdSnake[K + 1])
-        );
+        AState.MiddleEdit := MakeMiddleEdit(RightSnake, BwdSnake[K + 1]);
         Exit(True);
       end;
       Right := RightEnd + 1;
@@ -850,10 +871,7 @@ begin
        (((AD - 1 + K - AState.BwdMiddleK) mod 2) = 0) and
        (NewX >= BwdX[K]) then
     begin
-      AState.MiddleEdit := TDiffEdit.Create(
-        SnakeX(NewSnake), SnakeX(BwdSnake[K]),
-        SnakeY(NewSnake), SnakeY(BwdSnake[K])
-      );
+      AState.MiddleEdit := MakeMiddleEdit(NewSnake, BwdSnake[K]);
       Exit(True);
     end;
 
@@ -917,10 +935,7 @@ begin
          (((AD + (K - 1) - AState.FwdMiddleK) mod 2) = 0) and
          (LeftEnd <= FwdX[K - 1]) then
       begin
-        AState.MiddleEdit := TDiffEdit.Create(
-          SnakeX(FwdSnake[K - 1]), SnakeX(LeftSnake),
-          SnakeY(FwdSnake[K - 1]), SnakeY(LeftSnake)
-        );
+        AState.MiddleEdit := MakeMiddleEdit(FwdSnake[K - 1], LeftSnake);
         Exit(True);
       end;
       Left := LeftEnd - 1;
@@ -938,10 +953,7 @@ begin
          (((AD + (K + 1) - AState.FwdMiddleK) mod 2) = 0) and
          (RightEnd <= FwdX[K + 1]) then
       begin
-        AState.MiddleEdit := TDiffEdit.Create(
-          SnakeX(FwdSnake[K + 1]), SnakeX(RightSnake),
-          SnakeY(FwdSnake[K + 1]), SnakeY(RightSnake)
-        );
+        AState.MiddleEdit := MakeMiddleEdit(FwdSnake[K + 1], RightSnake);
         Exit(True);
       end;
       Right := RightEnd;
@@ -962,10 +974,7 @@ begin
        (((AD + K - AState.FwdMiddleK) mod 2) = 0) and
        (NewX <= FwdX[K]) then
     begin
-      AState.MiddleEdit := TDiffEdit.Create(
-        SnakeX(FwdSnake[K]), SnakeX(NewSnake),
-        SnakeY(FwdSnake[K]), SnakeY(NewSnake)
-      );
+      AState.MiddleEdit := MakeMiddleEdit(FwdSnake[K], NewSnake);
       Exit(True);
     end;
 
