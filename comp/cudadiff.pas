@@ -71,11 +71,6 @@ type
   end;
   TDiffOpcodeArray = array of TDiffOpcode;
 
-  { Dynamic array of Boolean, used for changed_flag arrays in
-    shift_boundaries. Named type (not anonymous) so it can be used
-    as a var/out parameter that supports SetLength. }
-  TBoolArray = array of Boolean;
-
   { Cancellation callback. Return True to abort the diff.
     UserData is passed through unchanged from the caller. }
   TDiffCancelFunc = function(AUserData: Pointer): Boolean;
@@ -709,7 +704,7 @@ function ReduceCommonStartEnd(
   AEdit: TDiffEdit
 ): TDiffEdit; forward;
 
-procedure ShiftBoundariesOnEdits(var AEdits: TDiffEditList;
+procedure NormalizeEdits(var AEdits: TDiffEditList;
   const ASeqA, ASeqB: TLineSequence); forward;
 
 function EditsToOpcodes(const AEdits: TDiffEditList;
@@ -2004,7 +1999,7 @@ var
   I, J: Integer;
   LenA, LenB: Integer;
   Edit: TDiffEdit;
-  ChangedA, ChangedB: TBoolArray;
+  ChangedA, ChangedB: array of Boolean;
   IA, IB, StartA, StartB: Integer;
   RealBegin, RealEnd: Integer;
 begin
@@ -2082,12 +2077,10 @@ begin
   // Then walk both arrays in lock-step, grouping consecutive changed
   // lines into TDiffEdit records. Unchanged lines on both sides become
   // EQUAL gaps (handled by EditsToOpcodes).
-  // +4 sentinel elements (matching EditsToChangedFlags sizing) so
-  // ShiftBoundaries' J index can safely advance past the end.
-  SetLength(ChangedA, LenA + 4);
-  SetLength(ChangedB, LenB + 4);
-  for I := 0 to LenA + 3 do ChangedA[I] := False;
-  for I := 0 to LenB + 3 do ChangedB[I] := False;
+  SetLength(ChangedA, LenA + 1);  // +1 for sentinel
+  SetLength(ChangedB, LenB + 1);
+  for I := 0 to LenA do ChangedA[I] := False;
+  for I := 0 to LenB do ChangedB[I] := False;
 
   // Mark discarded lines as changed.
   for I := 0 to LenA - 1 do
@@ -2119,11 +2112,6 @@ begin
     end;
   end;
 
-  // NOTE: shift_boundaries is NOT applied here. It's applied once
-  // globally in DoDiffLines via ShiftBoundariesOnEdits, which works
-  // on the final edit list. Applying it here AND in DoDiffLines would
-  // double-apply the shift, producing corrupted output.
-
   // Walk changedA[] and changedB[] in lock-step, emitting TDiffEdit
   // records for runs of changed lines. This is a direct port of
   // build_script (analyze.c line 793).
@@ -2141,9 +2129,8 @@ begin
         ARegion.BeginA + StartA, ARegion.BeginA + IA,
         ARegion.BeginB + StartB, ARegion.BeginB + IB));
     end;
-    // Only advance past UNCHANGED lines (matching C build_script).
-    if not ChangedA[IA] then Inc(IA);
-    if not ChangedB[IB] then Inc(IB);
+    if IA < LenA then Inc(IA);
+    if IB < LenB then Inc(IB);
   end;
 end;
 
@@ -2534,215 +2521,48 @@ begin
   end;
 end;
 
-{ ---------- shift_boundaries (port of analyze.c) ---------- }
-{
-  Port of WinMerge/GNU diffutils analyze.c:shift_boundaries
-  (lines 628-726). Adjusts inserts/deletes of identical lines to join
-  changes as much as possible.
-
-  When a run of changed lines has an identical (same equivalence class)
-  line at one end and an excluded identical line at the other, the
-  boundary is shifted to include the following identical line rather
-  than the preceding one. This produces cleaner diffs that group
-  changes together.
-
-  This subsumes JGit's NormalizeEdits, which only shifted pure
-  INSERT/DELETE edits forward. This implementation handles all edit
-  types (including REPLACE), shifts both backward and forward, and
-  aligns corresponding change runs across the two files.
-
-  Implementation note: analyze.c operates on changed_flag[] arrays
-  with a j-index tracking cross-file correspondence. We tried porting
-  that directly but the j-index can get out of sync when the changed
-  arrays are built from an edit list (vs. from compareseq's output).
-  Instead, we implement the equivalent logic directly on the edit list,
-  which is simpler and guaranteed correct. The effect is the same:
-  shift each edit's boundaries to the latest possible position where
-  the adjacent lines are equal on both sides.
-}
-
-{ Try to shift a single edit forward (toward end of file).
-  Returns True if the edit was shifted by one position.
-  The shift is valid when:
-  - There's room to shift (EndA < MaxA and EndB < MaxB)
-  - The first changed line on each side equals the first unchanged line
-    after the run on the SAME side (intra-file comparison, matching
-    analyze.c's equivs[start] == equivs[i])
-  - For REPLACE: both sides must satisfy the condition simultaneously
-  - For INSERT (lenA=0): only side B needs to match
-  - For DELETE (lenB=0): only side A needs to match }
-function TryShiftEditForward(
-  var AEdit: TDiffEdit;
-  const ASeqA, ASeqB: TLineSequence;
-  MaxA, MaxB: Integer): Boolean;
-var
-  CanShiftA, CanShiftB: Boolean;
-begin
-  Result := False;
-  // Need room to shift: at least one unchanged line after the edit on
-  // the side(s) being shifted.
-  if (AEdit.EndA >= MaxA) and (AEdit.EndB >= MaxB) then
-    Exit;
-
-  // Can shift side A forward if: edit has A lines (EndA > BeginA),
-  // room exists (EndA < MaxA), and A[BeginA] == A[EndA]
-  // (first changed equals first unchanged after run).
-  CanShiftA := (AEdit.BeginA < AEdit.EndA) and (AEdit.EndA < MaxA) and
-               ASeqA.EqualsAt(AEdit.BeginA, ASeqA, AEdit.EndA);
-
-  // Can shift side B forward if: edit has B lines (EndB > BeginB),
-  // room exists (EndB < MaxB), and B[BeginB] == B[EndB].
-  CanShiftB := (AEdit.BeginB < AEdit.EndB) and (AEdit.EndB < MaxB) and
-               ASeqB.EqualsAt(AEdit.BeginB, ASeqB, AEdit.EndB);
-
-  // For REPLACE (both sides non-empty): both must match.
-  // For INSERT (A empty): only B needs to match.
-  // For DELETE (B empty): only A needs to match.
-  if (AEdit.BeginA < AEdit.EndA) and (AEdit.BeginB < AEdit.EndB) then
-  begin
-    // REPLACE: both sides must match
-    if not (CanShiftA and CanShiftB) then
-      Exit;
-  end
-  else if (AEdit.BeginA < AEdit.EndA) then
-  begin
-    // DELETE: only A needs to match
-    if not CanShiftA then
-      Exit;
-  end
-  else
-  begin
-    // INSERT: only B needs to match
-    if not CanShiftB then
-      Exit;
-  end;
-
-  // Perform the shift.
-  AEdit.Shift(1);
-  Result := True;
-end;
-
-{ Try to shift a single edit backward (toward beginning of file).
-  Returns True if the edit was shifted by one position.
-  The shift is valid when:
-  - There's room to shift (BeginA > PrevEndA and BeginB > PrevEndB)
-  - The last changed line on each side equals the line before the run
-    on the SAME side (matching analyze.c's equivs[start-1] == equivs[i-1])
-  - For REPLACE: both sides must satisfy the condition simultaneously
-  - For INSERT (lenA=0): only side B needs to match
-  - For DELETE (lenB=0): only side A needs to match }
-function TryShiftEditBackward(
-  var AEdit: TDiffEdit;
-  const ASeqA, ASeqB: TLineSequence;
-  PrevEndA, PrevEndB: Integer): Boolean;
-var
-  CanShiftA, CanShiftB: Boolean;
-begin
-  Result := False;
-  // Need room to shift: at least one unchanged line before the edit.
-  if (AEdit.BeginA <= PrevEndA) and (AEdit.BeginB <= PrevEndB) then
-    Exit;
-
-  // Can shift side A backward if: edit has A lines, room exists
-  // (BeginA > PrevEndA), and A[BeginA-1] == A[EndA-1]
-  // (line before run equals last changed line).
-  CanShiftA := (AEdit.BeginA < AEdit.EndA) and (AEdit.BeginA > PrevEndA) and
-               ASeqA.EqualsAt(AEdit.BeginA - 1, ASeqA, AEdit.EndA - 1);
-
-  // Can shift side B backward if: edit has B lines, room exists
-  // (BeginB > PrevEndB), and B[BeginB-1] == B[EndB-1].
-  CanShiftB := (AEdit.BeginB < AEdit.EndB) and (AEdit.BeginB > PrevEndB) and
-               ASeqB.EqualsAt(AEdit.BeginB - 1, ASeqB, AEdit.EndB - 1);
-
-  // For REPLACE: both sides must match.
-  // For DELETE: only A needs to match.
-  // For INSERT: only B needs to match.
-  if (AEdit.BeginA < AEdit.EndA) and (AEdit.BeginB < AEdit.EndB) then
-  begin
-    if not (CanShiftA and CanShiftB) then
-      Exit;
-  end
-  else if (AEdit.BeginA < AEdit.EndA) then
-  begin
-    if not CanShiftA then
-      Exit;
-  end
-  else
-  begin
-    if not CanShiftB then
-      Exit;
-  end;
-
-  // Perform the shift backward.
-  AEdit.Shift(-1);
-  Result := True;
-end;
-
-{ Apply shift_boundaries to an edit list. For each edit, tries to shift
-  it forward as far as possible (matching analyze.c's forward shift
-  which is preferred), then backward. Repeats until no more shifts are
-  possible. This replaces the old NormalizeEdits (which only did
-  forward shifts for pure INSERT/DELETE). }
-procedure ShiftBoundariesOnEdits(
-  var AEdits: TDiffEditList;
+{ JGit's normalize pass: shift pure INSERT/DELETE edits to their latest
+  possible position. Produces consistent diff output regardless of
+  which path the algorithm took through ties. }
+procedure NormalizeEdits(var AEdits: TDiffEditList;
   const ASeqA, ASeqB: TLineSequence);
 var
-  I, MaxA, MaxB, PrevEndA, PrevEndB: Integer;
-  Cur: TDiffEdit;
-  Shifted: Boolean;
+  I: Integer;
+  Cur, Prev: TDiffEdit;
+  MaxA, MaxB: Integer;
+  T: TDiffEditType;
 begin
-  if AEdits.Count = 0 then
-    Exit;
-
-  MaxA := ASeqA.Size;
-  MaxB := ASeqB.Size;
-
-  // Forward pass (right to left, matching JGit's NormalizeEdits order):
-  // each edit shifts forward as far as possible, constrained by the
-  // next edit's BeginA/BeginB.
-  PrevEndA := MaxA;
-  PrevEndB := MaxB;
+  if AEdits.Count = 0 then Exit;
+  Prev := TDiffEdit.Create(0, 0, 0, 0);
   for I := AEdits.Count - 1 downto 0 do
   begin
     Cur := AEdits.Items[I];
-    // Try to shift forward repeatedly.
-    repeat
-      Shifted := TryShiftEditForward(Cur, ASeqA, ASeqB, PrevEndA, PrevEndB);
-    until not Shifted;
-    AEdits.Items[I] := Cur;
-    PrevEndA := Cur.BeginA;
-    PrevEndB := Cur.BeginB;
-  end;
+    T := Cur.GetType;
+    if I = AEdits.Count - 1 then
+    begin
+      MaxA := ASeqA.Size;
+      MaxB := ASeqB.Size;
+    end
+    else
+    begin
+      MaxA := Prev.BeginA;
+      MaxB := Prev.BeginB;
+    end;
 
-  // Backward pass (left to right): each edit shifts backward as far as
-  // possible, constrained by the previous edit's EndA/EndB.
-  PrevEndA := 0;
-  PrevEndB := 0;
-  for I := 0 to AEdits.Count - 1 do
-  begin
-    Cur := AEdits.Items[I];
-    repeat
-      Shifted := TryShiftEditBackward(Cur, ASeqA, ASeqB, PrevEndA, PrevEndB);
-    until not Shifted;
+    if T = detInsert then
+    begin
+      while (Cur.EndA < MaxA) and (Cur.EndB < MaxB) and
+            ASeqB.EqualsAt(Cur.BeginB, ASeqB, Cur.EndB) do
+        Cur.Shift(1);
+    end
+    else if T = detDelete then
+    begin
+      while (Cur.EndA < MaxA) and (Cur.EndB < MaxB) and
+            ASeqA.EqualsAt(Cur.BeginA, ASeqA, Cur.EndA) do
+        Cur.Shift(1);
+    end;
     AEdits.Items[I] := Cur;
-    PrevEndA := Cur.EndA;
-    PrevEndB := Cur.EndB;
-  end;
-
-  // Second forward pass: backward shifts may have opened up new
-  // forward shift opportunities. Run forward again to prefer the
-  // forward position (matching analyze.c which does forward second).
-  PrevEndA := MaxA;
-  PrevEndB := MaxB;
-  for I := AEdits.Count - 1 downto 0 do
-  begin
-    Cur := AEdits.Items[I];
-    repeat
-      Shifted := TryShiftEditForward(Cur, ASeqA, ASeqB, PrevEndA, PrevEndB);
-    until not Shifted;
-    AEdits.Items[I] := Cur;
-    PrevEndA := Cur.BeginA;
-    PrevEndB := Cur.BeginB;
+    Prev := Cur;
   end;
 end;
 
@@ -2861,7 +2681,7 @@ begin
     end;
   end;
 
-  ShiftBoundariesOnEdits(Edits, SeqA, SeqB);
+  NormalizeEdits(Edits, SeqA, SeqB);
   Result := EditsToOpcodes(Edits, SeqA.Size, SeqB.Size);
 end;
 
