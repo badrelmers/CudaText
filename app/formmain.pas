@@ -737,6 +737,7 @@ type
     FLastFocusedFrame: TComponent;
     FLastTooltipLine: integer;
     FLastAppActivate: QWord;
+    FLastWindowStateChange: QWord;
     FLastSaveSessionTick: QWord;
     FLastPyMenuFilter: UnicodeString;
     FLastPyMenuHashOfLines: integer;
@@ -1478,6 +1479,55 @@ begin
        begin
          AppWindowsSettingChanged:= true;
          //MsgLogConsole('WM_SETTINGCHANGE');
+       end;
+
+     // Fix for https://github.com/Alexey-T/CudaText/issues/6418
+     // On Windows, the LCL Application.OnActivate event only fires on
+     // WM_ACTIVATEAPP, which is NOT sent by Windows when the app is restored
+     // from the taskbar via clicking the taskbar icon. WM_ACTIVATE is sent
+     // reliably in that case (with WA_CLICKACTIVE), so we hook it here and
+     // call AppPropsActivate/AppPropsDeactivate manually. The existing 500ms
+     // debounce in DoPyEvent_AppActivate prevents double-firing when LCL
+     // also fires the same event.
+     WM_ACTIVATE:
+       begin
+         if Assigned(PrevWndProc) then
+           Result := CallWindowProc(PrevWndProc, AHWnd, uMsg, WParam, LParam)
+         else
+           Result := Windows.DefWindowProc(AHWnd, uMsg, WParam, LParam);
+
+         if Assigned(fmMain) then
+           case LoWord(wParam) of
+             WA_ACTIVE, WA_CLICKACTIVE:
+               fmMain.AppPropsActivate(nil);
+             WA_INACTIVE:
+               fmMain.AppPropsDeactivate(nil);
+           end;
+         exit;
+       end;
+
+     // Fix for https://github.com/Alexey-T/CudaText/issues/6417
+     // On Windows, the LCL OnWindowStateChange event is NOT reliably fired
+     // when the app is minimized or restored (especially from the taskbar
+     // icon click). WM_SIZE is sent reliably in all those cases, so we hook
+     // it here and call FormWindowStateChange manually. The 500ms debounce
+     // in DoPyEvent_AppState (for APPSTATE_WINDOW) prevents double-firing
+     // when LCL also fires the same event (e.g. on maximize).
+     WM_SIZE:
+       begin
+         if Assigned(PrevWndProc) then
+           Result := CallWindowProc(PrevWndProc, AHWnd, uMsg, WParam, LParam)
+         else
+           Result := Windows.DefWindowProc(AHWnd, uMsg, WParam, LParam);
+
+         if Assigned(fmMain) then
+           case wParam of
+             SIZE_MINIMIZED,
+             SIZE_RESTORED,
+             SIZE_MAXIMIZED:
+               fmMain.FormWindowStateChange(nil);
+           end;
+         exit;
        end;
 
      {
@@ -3343,7 +3393,22 @@ begin
 end;
 
 procedure TfmMain.DoPyEvent_AppState(AState: integer);
+var
+  Tick: QWord;
 begin
+  // Debounce APPSTATE_WINDOW events (500ms) to prevent double-firing
+  // when both the LCL OnWindowStateChange event and the Win32 WndCallback
+  // WM_SIZE handler fire for the same window-state change.
+  // Without this, on Windows the on_state event would fire twice on
+  // maximize and once on minimize/restore (where LCL doesn't fire).
+  // See: https://github.com/Alexey-T/CudaText/issues/6417
+  if AState = APPSTATE_WINDOW then
+  begin
+    Tick:= GetTickCount64;
+    if (Tick - FLastWindowStateChange) <= 500 then
+      Exit;
+    FLastWindowStateChange:= Tick;
+  end;
   DoPyEvent(nil, TAppPyEvent.OnState, [AppVariant(AState)]);
 end;
 
