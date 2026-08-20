@@ -2323,7 +2323,7 @@ Possible values of "id_action":
 
 ===diff_proc===
 
- diff_proc(id, param1, param2, algo=0, flags=0, cancel=None)
+ diff_proc(id, param1, param2, algo=0, flags=0)
 
 Compares two texts using the built-in native diff engine (Free Pascal port of JGit's MyersDiff and HistogramDiff). Returns difflib-compatible opcodes — the same format as Python's <code>difflib.SequenceMatcher.get_opcodes()</code>.
 
@@ -2349,16 +2349,12 @@ Param "flags" is a bitmask of ignore options (combine with <code>|</code>):
 * DIFF_IGN_EOL (64): CR/LF vs LF treated equal.
 * DIFF_IGN_NUMBERS (128): Digit runs treated as equal (useful for comparing logs with timestamps).
 
-Param "cancel" is optional Python callable (no arguments). If provided, it is called periodically during the diff; if it returns a truthy value, the diff is aborted and the function returns None.
-
 Returns: list of 5-tuples <code>(tag, i1, i2, j1, j2)</code> where:
 
 * <code>tag</code> is a lowercase string: <code>'equal'</code>, <code>'delete'</code>, <code>'insert'</code>, or <code>'replace'</code>.
 * <code>i1, i2</code> is a half-open range into the first text (param1).
 * <code>j1, j2</code> is a half-open range into the second text (param2).
 * Adjacent tuples share boundaries; the first starts at <code>(0, 0)</code>; the last ends at <code>(len(param1), len(param2))</code>.
-
-Returns None if the diff was cancelled.
 
 For DIF_TEXTS, offsets are line indices. For DIF_CHARS, offsets are character indices.
 
@@ -2369,35 +2365,7 @@ Opcode semantics:
 * <code>'insert'</code>: <code>i1 == i2</code>, <code>j1 < j2</code>, lines/chars added in B.
 * <code>'replace'</code>: <code>i1 < i2</code>, <code>j1 < j2</code>, A[i1:i2] replaced by B[j1:j2].
 
-Example — line-level diff:
 
-<syntaxhighlight lang="Python">
-import cudatext
-
-text_a = "a\nb\nc\n"
-text_b = "a\nX\nc\n"
-
-opcodes = cudatext.diff_proc(
-    cudatext.DIF_TEXTS,
-    text_a,
-    text_b,
-    cudatext.DIFF_ALGO_HISTOGRAM
-)
-# Result: [('equal', 0, 1, 0, 1), ('replace', 1, 2, 1, 2), ('equal', 2, 3, 2, 3)]
-</syntaxhighlight>
-
-Example — char-level diff:
-
-<syntaxhighlight lang="Python">
-import cudatext
-
-opcodes = cudatext.diff_proc(
-    cudatext.DIF_CHARS,
-    "def hello():",
-    "def goodbye():"
-)
-# Result: [('equal', 0, 4, 0, 4), ('replace', 4, 9, 4, 11), ('equal', 9, 12, 11, 14)]
-</syntaxhighlight>
 
 ===more===
 

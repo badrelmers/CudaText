@@ -11102,53 +11102,25 @@ begin
 end;
 
 
-//Top-level callback for diff_proc cancellation. Must NOT be a nested
-//function because CudaDiff.DoDiffLines expects a plain procedural
-//function pointer (TDiffCancelFunc), and FPC's objfpc mode does not
-//allow assigning nested functions to non-nested function types.
-//The Python callable object is passed through AData as a PPyObject.
-function api_diff_proc_CancelCallback(AData: Pointer): Boolean;
-var
-  P: PPyObject;
-  Res: PPyObject;
-begin
-  Result := False;
-  P := PPyObject(AData);
-  if P = nil then Exit;
-  with AppPython.Engine do
-  begin
-    if PyCallable_Check(P) = 0 then Exit;
-    Res := PyObject_CallObject(P, nil);
-    if Res <> nil then
-    begin
-      Result := PyObject_IsTrue(Res) <> 0;
-      Py_DECREF(Res);
-    end;
-  end;
-end;
 
-//diff_proc(id, param1, param2, algo=0, flags=0, cancel=None)
+//diff_proc(id, param1, param2, algo=0, flags=0)
 //Compares two texts and returns difflib-compatible opcodes.
 //  id: DIF_TEXTS (1) -- param1, param2 are LF-separated strings.
 //      DIF_CHARS (2) -- param1, param2 are two strings compared at char level.
 //  algo: DIFF_ALGO_MYERS (0) or DIFF_ALGO_HISTOGRAM (1).
 //        Ignored for DIF_CHARS (char diff always uses word-Myers + byte-trim).
 //  flags: bitmask of DIFF_IGN_* values (case/whitespace/numbers/etc).
-//  cancel: optional Python callable; called periodically, return True to abort.
 //Returns: list of (tag, i1, i2, j1, j2) tuples where tag is a lowercase
 //  string 'equal'/'delete'/'insert'/'replace'. Format matches
 //  difflib.SequenceMatcher.get_opcodes() exactly.
-//Returns None if the diff was cancelled.
 function api_diff_proc(Self, Args: PPyObject): PPyObject; cdecl;
 var
   IdAction: Integer;
   Ptr1, Ptr2: PChar;
   Str1, Str2: string;
   NAlgo, NFlags: Integer;
-  CancelObj: PPyObject;
   LinesA, LinesB: TStringArray;
   Opcodes: TDiffOpcodeArray;
-  Cancelled: Boolean;
   I: Integer;
   TagStr: string;
   TagPtr: PChar;
@@ -11183,7 +11155,6 @@ var
   end;
 
 begin
-  CancelObj := nil;
   NAlgo := DIFF_ALGO_MYERS;
   NFlags := 0;
 
@@ -11191,8 +11162,8 @@ begin
   begin
     Result := ReturnNone;
 
-    if not Bool(PyArg_ParseTuple(Args, 'iss|iiO:diff_proc',
-      @IdAction, @Ptr1, @Ptr2, @NAlgo, @NFlags, @CancelObj)) then
+    if not Bool(PyArg_ParseTuple(Args, 'iss|ii:diff_proc',
+      @IdAction, @Ptr1, @Ptr2, @NAlgo, @NFlags)) then
       Exit;
 
     Str1 := string(Ptr1);
@@ -11208,24 +11179,14 @@ begin
           begin
             LinesA := CudaDiff.SplitLinesKeepEnds(Str1);
             LinesB := CudaDiff.SplitLinesKeepEnds(Str2);
-            Opcodes := CudaDiff.DoDiffLines(LinesA, LinesB, NAlgo, NFlags,
-              @api_diff_proc_CancelCallback, CancelObj, Cancelled);
-
-            if Cancelled then
-              Exit(ReturnNone);
-
+            Opcodes := CudaDiff.DoDiffLines(LinesA, LinesB, NAlgo, NFlags);
             BuildOpcodeList(Opcodes);
           end;
         DIF_CHARS:
         begin
           // Char-level diff. NAlgo is ignored — char diff always uses
-          // word-Histogram + byte-trim internally.
-          Opcodes := CudaDiff.DoDiffChars(Str1, Str2, NFlags,
-            @api_diff_proc_CancelCallback, CancelObj, Cancelled);
-
-          if Cancelled then
-            Exit(ReturnNone);
-
+          // word-Myers + byte-trim internally.
+          Opcodes := CudaDiff.DoDiffChars(Str1, Str2, NFlags);
           BuildOpcodeList(Opcodes);
         end;
       else

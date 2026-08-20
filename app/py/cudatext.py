@@ -1410,8 +1410,9 @@ def dlg_proc(id_dialog, id_action, prop='', index=-1, index2=-1, name=''):
 def finder_proc(id_finder, id_action, value="", setcaret=True):
     return ct.finder_proc(id_finder, id_action, to_str(value), setcaret)
 
-def diff_proc(id, param1, param2, algo=0, flags=0, cancel=None):
-    return ct.diff_proc(id, param1, param2, algo, flags, cancel)
+def diff_proc(id, param1, param2, algo=0, flags=0):
+    return ct.diff_proc(id, param1, param2, algo, flags)
+
 
 def esc_z(s):
     # temp solution for null chars, later replace it to full solution with app patch
