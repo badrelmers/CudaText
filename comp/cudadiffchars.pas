@@ -9,19 +9,13 @@ Implements the character-level diff backend for CudaText: a port of
 WinMerge's stringdiffs.cpp.
 
 Algorithm: tokenize both strings into "words" (identifiers, whitespace,
-individual punctuation), run word-level Myers O(ND) diff, then refine
-each non-equal word region to exact byte boundaries with prefix/suffix
-trimming. This is the same approach WinMerge uses.
+individual punctuation), run word-level Myers diff (copied from the
+line diff unit, including big_snake and TOO_EXPENSIVE heuristics),
+then refine each non-equal word region to exact byte boundaries with
+prefix/suffix trimming.
 
-This unit is FULLY STANDALONE — it does NOT depend on CudaDiff (the
-line diff unit) or any other CudaText diff code. It has its own copy of:
-  - Constants (DIFF_ALGO_xxx, DIFF_IGN_xxx, DIFF_TAG_xxx)
-  - Types (TDiffOpcode, TStringArray)
-  - Utility functions (MaxI, MinI, IsWhitespaceByte, HashLine)
-  - Word-level Myers O(ND) diff (self-contained, no heuristics)
-
-This intentional duplication allows the char diff to evolve and compile
-independently from the line diff.
+This unit is FULLY STANDALONE. The Myers implementation is a direct
+copy of the one in cudadiff.pas, with types renamed to avoid collisions.
 
 Public entry point:
   - DoDiffChars: compares two strings at character granularity, returns
@@ -76,7 +70,7 @@ type
   Myers diff, then refine each non-equal word region to exact byte
   boundaries with prefix/suffix trimming.
 
-  AFlags supports the same DIFF_IGN_* options as line diff. }
+  AFlags supports the same DIFF_IGN_xxx options as line diff. }
 function DoDiffChars(
   const ATextA, ATextB: string;
   AFlags: Integer
@@ -87,7 +81,7 @@ implementation
 uses
   SysUtils;
 
-{ ---------- Utility functions (self-contained, no CudaDiff dependency) ---------- }
+{ ---------- Utility functions ---------- }
 
 function MaxI(A, B: Integer): Integer; inline;
 begin
@@ -101,136 +95,8 @@ end;
 
 function IsWhitespaceByte(C: AnsiChar): Boolean; inline;
 begin
-  Result := (C = ' ') or (C = #9) or (C = #10) or (C = #13) or
-            (C = #11) or (C = #12);
+  Result := (C = ' ') or (C = #9) or (C = #10) or (C = #13);
 end;
-
-{ ---------- djb2 hash (for word comparison) ---------- }
-
-const
-  DJB2_SEED = 5381;
-
-{$PUSH}
-{$RANGECHECKS OFF}  { Cardinal wraparound on the djb2 accumulator. }
-function HashLine(const ALine: string): Integer;
-var
-  S: AnsiString;
-  I, Len: Integer;
-  H: Cardinal;
-begin
-  S := AnsiString(ALine);
-  Len := Length(S);
-  H := DJB2_SEED;
-  for I := 1 to Len do
-    H := ((H shl 5) + H) + Ord(S[I]);
-  Result := Integer(H);
-end;
-{$POP}
-
-{ ---------- Word sequence (hashed, for fast comparison) ---------- }
-
-type
-  PWordSequence = ^TWordSequence;
-  TWordSequence = record
-    FLines: TStringArray;
-    FHashes: array of Integer;
-    procedure Init(const ALines: array of string);
-    function EqualsAt(AIdxThis: Integer; const AOther: TWordSequence; AIdxOther: Integer): Boolean;
-    function HashAt(AIdx: Integer): Integer;
-    function Size: Integer;
-  end;
-
-procedure TWordSequence.Init(const ALines: array of string);
-var
-  I, N: Integer;
-begin
-  N := Length(ALines);
-  SetLength(FLines, N);
-  SetLength(FHashes, N);
-  for I := 0 to N - 1 do
-  begin
-    FLines[I] := ALines[I];
-    FHashes[I] := HashLine(ALines[I]);
-  end;
-end;
-
-function TWordSequence.EqualsAt(AIdxThis: Integer;
-  const AOther: TWordSequence; AIdxOther: Integer): Boolean;
-begin
-  if FHashes[AIdxThis] <> AOther.FHashes[AIdxOther] then
-    Exit(False);
-  Result := FLines[AIdxThis] = AOther.FLines[AIdxOther];
-end;
-
-function TWordSequence.HashAt(AIdx: Integer): Integer;
-begin
-  Result := FHashes[AIdx];
-end;
-
-function TWordSequence.Size: Integer;
-begin
-  Result := Length(FLines);
-end;
-
-{ ---------- Edit region (for word-level diff) ---------- }
-
-type
-  TCharEdit = record
-    BeginA, EndA, BeginB, EndB: Integer;
-    function IsEmpty: Boolean;
-    function LengthA: Integer;
-    function LengthB: Integer;
-  end;
-
-  TCharEditList = record
-    FItems: array of TCharEdit;
-    FCount: Integer;
-    procedure Init;
-    procedure Add(const AEdit: TCharEdit);
-    function GetItem(AIndex: Integer): TCharEdit;
-    function Count: Integer;
-  end;
-
-function TCharEdit.IsEmpty: Boolean;
-begin
-  Result := (BeginA = EndA) and (BeginB = EndB);
-end;
-
-function TCharEdit.LengthA: Integer;
-begin
-  Result := EndA - BeginA;
-end;
-
-function TCharEdit.LengthB: Integer;
-begin
-  Result := EndB - BeginB;
-end;
-
-procedure TCharEditList.Init;
-begin
-  FCount := 0;
-  SetLength(FItems, 0);
-end;
-
-procedure TCharEditList.Add(const AEdit: TCharEdit);
-begin
-  if FCount >= Length(FItems) then
-    SetLength(FItems, MaxI(Length(FItems) * 2, FCount + 16));
-  FItems[FCount] := AEdit;
-  Inc(FCount);
-end;
-
-function TCharEditList.GetItem(AIndex: Integer): TCharEdit;
-begin
-  Result := FItems[AIndex];
-end;
-
-function TCharEditList.Count: Integer;
-begin
-  Result := FCount;
-end;
-
-{ ---------- Snake packing (for Myers middle-snake) ---------- }
 
 {$PUSH}
 {$RANGECHECKS OFF}  { Cardinal(AY) cast can be out of Integer range;
@@ -251,97 +117,410 @@ begin
 end;
 {$POP}
 
-{ ---------- Myers O(ND) scratch state ---------- }
-
 type
+  TCharEditType = (cetInsert, cetDelete, cetReplace, cetEmpty);
+
+  { A modified region between two sequences. Mirrors JGit's Edit class.
+    All indices are 0-based, half-open [begin, end). Mutable by design
+    (the algorithms adjust begin/end in place during prefix/suffix trim
+    and edit normalization). }
+  TCharEdit = record
+    BeginA, EndA, BeginB, EndB: Integer;
+    function GetType: TCharEditType;
+    function IsEmpty: Boolean;
+    function LengthA: Integer;
+    function LengthB: Integer;
+    procedure Shift(AAmount: Integer);
+    class function Create(AAs, AAe, ABs, ABe: Integer): TCharEdit; static;
+    function Before(const ACut: TCharEdit): TCharEdit;
+    function After(const ACut: TCharEdit): TCharEdit;
+  end;
+
+  { Growable dynamic array of TCharEdit. Append is amortized O(1). }
+  TCharEditList = record
+    FItems: array of TCharEdit;
+    FCount: Integer;
+    procedure Init;
+    procedure Add(const AEdit: TCharEdit);
+    function GetItem(AIndex: Integer): TCharEdit;
+    procedure SetItem(AIndex: Integer; const AEdit: TCharEdit);
+    function Count: Integer;
+    property Items[AIndex: Integer]: TCharEdit read GetItem write SetItem;
+  end;
+
+  PWordSequence = ^TWordSequence;
+
+  { Wraps an array of lines together with their pre-computed hashes and
+    (optionally) normalized copies used for ignore-flag matching.
+    When AFlags = 0, FNormalized is empty and hashing/equality use the
+    original lines directly (saves memory in the common case). }
+  TWordSequence = record
+    FLines: TStringArray;
+    FNormalized: TStringArray;  // empty if no ignore flags
+    FHashes: array of Integer;
+    FHasNormalization: Boolean;
+    procedure Init(const ALines: array of string; AFlags: Integer);
+    function EqualsAt(AIdxThis: Integer; const AOther: TWordSequence; AIdxOther: Integer): Boolean;
+    function HashAt(AIdx: Integer): Integer;
+    function Size: Integer;
+  end;
+
+  { Scratch state for MyersDiff, reused across recursion levels to
+    avoid repeated heap allocation. Uses raw pointers (PInteger / PInt64)
+    for the V arrays instead of dynamic arrays — raw pointer indexing
+    is never range-checked, which eliminates per-access bounds-check
+    overhead (26.6s on the 3MB HTML test with checked arrays). The
+    pointer is adjusted by OffsetK so that negative k indices work
+    without bounds checks, exactly like LGenerics' LcsMyersImpl does
+    with PSizeInt. }
   TCharMyersState = record
     SeqA, SeqB: PWordSequence;
-    FwdXBuf: array of Integer;
+
+    // V arrays — allocated once at top level, accessed via pointers.
+    FwdXBuf: array of Integer;   // raw storage
     BwdXBuf: array of Integer;
     FwdSnakeBuf: array of Int64;
     BwdSnakeBuf: array of Int64;
-    FwdX: PInteger;
-    BwdX: PInteger;
-    FwdSnake: PInt64;
-    BwdSnake: PInt64;
+    FwdX: PInteger;    // pointer into FwdXBuf, adjusted by OffsetK
+    BwdX: PInteger;    // pointer into BwdXBuf, adjusted by OffsetK
+    FwdSnake: PInt64;  // pointer into FwdSnakeBuf, adjusted by OffsetK
+    BwdSnake: PInt64;  // pointer into BwdSnakeBuf, adjusted by OffsetK
     OffsetK: Integer;
+
     BeginA, EndA, BeginB, EndB: Integer;
+    MinK, MaxK: Integer;
+    FwdMiddleK, BwdMiddleK: Integer;
+    FwdBeginK, FwdEndK: Integer;
+    BwdBeginK, BwdEndK: Integer;
+
+    MiddleEdit: TCharEdit;
+    BigSnake: Boolean;  { Set when a snake > SNAKE_LIMIT is found }
   end;
 
-{ ---------- Forward/Backward snake ---------- }
+{ ---------- TCharEdit ---------- }
+
+function TCharEdit.GetType: TCharEditType;
+begin
+  if BeginA < EndA then
+  begin
+    if BeginB < EndB then
+      Exit(cetReplace);
+    Exit(cetDelete);
+  end;
+  if BeginB < EndB then
+    Exit(cetInsert);
+  Result := cetEmpty;
+end;
+
+function TCharEdit.IsEmpty: Boolean;
+begin
+  Result := (BeginA = EndA) and (BeginB = EndB);
+end;
+
+function TCharEdit.LengthA: Integer;
+begin
+  Result := EndA - BeginA;
+end;
+
+function TCharEdit.LengthB: Integer;
+begin
+  Result := EndB - BeginB;
+end;
+
+procedure TCharEdit.Shift(AAmount: Integer);
+begin
+  Inc(BeginA, AAmount);
+  Inc(EndA, AAmount);
+  Inc(BeginB, AAmount);
+  Inc(EndB, AAmount);
+end;
+
+class function TCharEdit.Create(AAs, AAe, ABs, ABe: Integer): TCharEdit;
+begin
+  Result.BeginA := AAs;
+  Result.EndA := AAe;
+  Result.BeginB := ABs;
+  Result.EndB := ABe;
+end;
+
+function TCharEdit.Before(const ACut: TCharEdit): TCharEdit;
+begin
+  Result := TCharEdit.Create(BeginA, ACut.BeginA, BeginB, ACut.BeginB);
+end;
+
+function TCharEdit.After(const ACut: TCharEdit): TCharEdit;
+begin
+  Result := TCharEdit.Create(ACut.EndA, EndA, ACut.EndB, EndB);
+end;
+
+
+{ ---------- TCharEditList ---------- }
+
+procedure TCharEditList.Init;
+begin
+  FItems := nil;
+  FCount := 0;
+end;
+
+procedure TCharEditList.Add(const AEdit: TCharEdit);
+var
+  NewCap, I: Integer;
+  NewItems: array of TCharEdit;
+begin
+  if FCount = Length(FItems) then
+  begin
+    if Length(FItems) = 0 then
+      NewCap := 16
+    else
+      NewCap := Length(FItems) * 2;
+    SetLength(NewItems, NewCap);
+    for I := 0 to FCount - 1 do
+      NewItems[I] := FItems[I];
+    FItems := NewItems;
+  end;
+  FItems[FCount] := AEdit;
+  Inc(FCount);
+end;
+
+function TCharEditList.GetItem(AIndex: Integer): TCharEdit;
+begin
+  Result := FItems[AIndex];
+end;
+
+procedure TCharEditList.SetItem(AIndex: Integer; const AEdit: TCharEdit);
+begin
+  FItems[AIndex] := AEdit;
+end;
+
+function TCharEditList.Count: Integer;
+begin
+  Result := FCount;
+end;
+
+
+{ djb2 hash of a line's bytes. Matches JGit's RawTextComparator.hashRegion.
+  Uses Cardinal (unsigned 32-bit) for the accumulator because the hash
+  is designed to wrap around. }
+const
+  { Initial djb2 hash seed. Same as JGit's RawTextComparator. }
+  DJB2_SEED = 5381;
+
+{$PUSH}
+{$RANGECHECKS OFF}  { Cardinal wraparound on the djb2 accumulator: the
+                       64-bit intermediate range-checks against
+                       Cardinal's range on assignment back to H. }
+function HashLine(const ALine: string): Integer;
+var
+  S: AnsiString;
+  I, Len: Integer;
+  H: Cardinal;
+begin
+  S := AnsiString(ALine);
+  Len := Length(S);
+  H := DJB2_SEED;
+  for I := 1 to Len do
+    H := ((H shl 5) + H) + Ord(S[I]);
+  Result := Integer(H);
+end;
+{$POP}
+
+
+{ ---------- TWordSequence ---------- }
+
+procedure TWordSequence.Init(const ALines: array of string; AFlags: Integer);
+var
+  I, N: Integer;
+begin
+  N := Length(ALines);
+  SetLength(FLines, N);
+  FHasNormalization := False;
+  FNormalized := nil;
+  SetLength(FHashes, N);
+  for I := 0 to N - 1 do
+  begin
+    FLines[I] := ALines[I];
+    FHashes[I] := HashLine(ALines[I]);
+  end;
+end;
+
+function TWordSequence.EqualsAt(AIdxThis: Integer;
+  const AOther: TWordSequence; AIdxOther: Integer): Boolean;
+var
+  PA, PB: PAnsiChar;
+  Len, I: Integer;
+begin
+  // CRITICAL: hash check FIRST (fast integer compare), then string equality
+  // to verify the match. A hash collision without this check produces a
+  // silently wrong diff which is nearly impossible to debug later.
+  if FHashes[AIdxThis] <> AOther.FHashes[AIdxOther] then
+    Exit(False);
+  // Fast pointer-based string comparison instead of Pascal's AnsiString
+  // comparison. Pascal's string = operator does a call to fpc_AnsStr_Compare
+  // which has overhead. Pointer comparison with MoveCompare is faster
+  // for the hot path (called billions of times in the Myers snake loops).
+  PA := Pointer(FLines[AIdxThis]);
+  PB := Pointer(AOther.FLines[AIdxOther]);
+  if PA = PB then
+    Exit(True);  // same pointer (e.g. comparing a sequence with itself)
+  Len := Length(FLines[AIdxThis]);
+  if Len <> Length(AOther.FLines[AIdxOther]) then
+    Exit(False);
+  if Len = 0 then
+    Exit(True);
+  // Compare 4 bytes at a time using PInteger
+  I := 0;
+  while I + 4 <= Len do
+  begin
+    if PInteger(PA + I)^ <> PInteger(PB + I)^ then
+      Exit(False);
+    Inc(I, 4);
+  end;
+  // Compare remaining bytes
+  while I < Len do
+  begin
+    if PA[I] <> PB[I] then
+      Exit(False);
+    Inc(I);
+  end;
+  Result := True;
+end;
+
+function TWordSequence.HashAt(AIdx: Integer): Integer;
+begin
+  Result := FHashes[AIdx];
+end;
+
+function TWordSequence.Size: Integer;
+begin
+  Result := Length(FLines);
+end;
+
+
+const
+  { GNU diffutils constants (analyze.c):
+    SNAKE_LIMIT: Snakes bigger than this are considered "big" and
+      trigger the big_snake early-termination heuristic.
+    TOO_EXPENSIVE_FLOOR: Minimum value for the too_expensive threshold. }
+  SNAKE_LIMIT = 20;
+  TOO_EXPENSIVE_FLOOR = 4096;
+
+{ Create a middle edit from forward and backward snake endpoints.
+  When the forward path meets the backward path on a diagonal, the
+  condition is NewX >= BwdX[K] (or LeftEnd >= BwdX[K-1] etc.). The
+  >= means forward X may strictly exceed backward X — in that case
+  the edit would be (BeginA=X1, EndA=X2) with X1 > X2, which is
+  invalid (negative-length range). EditsToOpcodes then walks the
+  edit list expecting BeginA <= EndA, and an inverted edit produces
+  wrong opcodes that visibly drift in side-by-side rendering.
+
+  JGit handles this in EditPaths.makeEdit() by clamping:
+    if x1 > x2: x1 = x2
+    if y1 > y2: y1 = y2
+  which collapses the overshoot to a zero-length edit on that axis.
+  This is the same clamp, ported faithfully. }
+function MakeMiddleEdit(AFwdSnake, ABwdSnake: Int64): TCharEdit; inline;
+var
+  X1, X2, Y1, Y2: Integer;
+begin
+  X1 := SnakeX(AFwdSnake);
+  X2 := SnakeX(ABwdSnake);
+  Y1 := SnakeY(AFwdSnake);
+  Y2 := SnakeY(ABwdSnake);
+  if X1 > X2 then X1 := X2;
+  if Y1 > Y2 then Y1 := Y2;
+  Result := TCharEdit.Create(X1, X2, Y1, Y2);
+end;
 
 function ForwardSnake(var AState: TCharMyersState; AK, AX: Integer): Integer; inline;
 var
-  X, Y: Integer;
+  X, Y, SnakeLen: Integer;
   SeqA, SeqB: PWordSequence;
 begin
   SeqA := AState.SeqA;
   SeqB := AState.SeqB;
   X := AX;
   Y := AK + X;
+  SnakeLen := 0;
   while (X < AState.EndA) and (Y < AState.EndB) and
         SeqA^.EqualsAt(X, SeqB^, Y) do
   begin
     Inc(X);
     Inc(Y);
+    Inc(SnakeLen);
   end;
+  if SnakeLen > SNAKE_LIMIT then
+    AState.BigSnake := True;
   Result := X;
 end;
 
 function BackwardSnake(var AState: TCharMyersState; AK, AX: Integer): Integer; inline;
 var
-  X, Y: Integer;
+  X, Y, SnakeLen: Integer;
   SeqA, SeqB: PWordSequence;
 begin
   SeqA := AState.SeqA;
   SeqB := AState.SeqB;
   X := AX;
   Y := AK + X;
+  SnakeLen := 0;
   while (X > AState.BeginA) and (Y > AState.BeginB) and
         SeqA^.EqualsAt(X - 1, SeqB^, Y - 1) do
   begin
     Dec(X);
     Dec(Y);
+    Inc(SnakeLen);
   end;
+  if SnakeLen > SNAKE_LIMIT then
+    AState.BigSnake := True;
   Result := X;
 end;
 
-{ ---------- Forward/Backward edit path calculation ---------- }
+function ForceKIntoRange(AK, AMinK, AMaxK: Integer): Integer; inline;
+begin
+  if AK < AMinK then
+    Exit(AMinK + ((AK xor AMinK) and 1))
+  else if AK > AMaxK then
+    Exit(AMaxK - ((AK xor AMaxK) and 1));
+  Result := AK;
+end;
 
+{ Forward EditPaths: extend forward D-paths by one step.
+  Returns True if the forward and backward fronts meet (middle snake found).
+  Uses pointer arithmetic (PInteger/PInt64) for V array access — no bounds
+  checking needed because the arrays are sized (2*MaxSize+1) at the top
+  level, which is always sufficient for any sub-region's k range. }
 function ForwardCalculate(var AState: TCharMyersState; AD: Integer): Boolean;
 var
-  K, Left, Right, NewX: Integer;
+  K, I, Left, Right, NewX: Integer;
   LeftEnd, RightEnd: Integer;
   LeftSnake, RightSnake, NewSnake: Int64;
+  PrevBeginK, PrevEndK: Integer;
   FwdX: PInteger;
   FwdSnake: PInt64;
   BwdX: PInteger;
   BwdSnake: PInt64;
-  FwdBeginK, FwdEndK, FwdMiddleK: Integer;
-  BwdBeginK, BwdEndK, BwdMiddleK: Integer;
 begin
   Result := False;
-  FwdMiddleK := AState.BeginB - AState.BeginA;
-  FwdBeginK := FwdMiddleK - AD;
-  FwdEndK := FwdMiddleK + AD;
-  BwdMiddleK := AState.EndB - AState.EndA;
-  BwdBeginK := BwdMiddleK - AD;
-  BwdEndK := BwdMiddleK + AD;
+  PrevBeginK := AState.FwdBeginK;
+  PrevEndK := AState.FwdEndK;
+  AState.FwdBeginK := ForceKIntoRange(AState.FwdMiddleK - AD, AState.MinK, AState.MaxK);
+  AState.FwdEndK := ForceKIntoRange(AState.FwdMiddleK + AD, AState.MinK, AState.MaxK);
 
+  // Cache pointers in locals for faster access in the loop.
   FwdX := AState.FwdX;
   FwdSnake := AState.FwdSnake;
   BwdX := AState.BwdX;
   BwdSnake := AState.BwdSnake;
 
-  K := FwdEndK;
-  while K >= FwdBeginK do
+  K := AState.FwdEndK;
+  while K >= AState.FwdBeginK do
   begin
     Left := -1;
     Right := -1;
     LeftSnake := -1;
     RightSnake := -1;
 
-    if K > FwdBeginK then
+    if K > PrevBeginK then
     begin
       Left := FwdX[K - 1];
       LeftEnd := ForwardSnake(AState, K - 1, Left);
@@ -349,17 +528,17 @@ begin
         LeftSnake := PackSnake(LeftEnd, (K - 1) + LeftEnd)
       else
         LeftSnake := FwdSnake[K - 1];
-      if (K - 1 >= BwdBeginK) and (K - 1 <= BwdEndK) and
-         (((AD - 1 + (K - 1) - BwdMiddleK) mod 2) = 0) and
+      if (K - 1 >= AState.BwdBeginK) and (K - 1 <= AState.BwdEndK) and
+         (((AD - 1 + (K - 1) - AState.BwdMiddleK) mod 2) = 0) and
          (LeftEnd >= BwdX[K - 1]) then
       begin
-        Result := True;
-        Exit;
+        AState.MiddleEdit := MakeMiddleEdit(LeftSnake, BwdSnake[K - 1]);
+        Exit(True);
       end;
       Left := LeftEnd;
     end;
 
-    if K < FwdEndK then
+    if K < PrevEndK then
     begin
       Right := FwdX[K + 1];
       RightEnd := ForwardSnake(AState, K + 1, Right);
@@ -367,17 +546,17 @@ begin
         RightSnake := PackSnake(RightEnd, (K + 1) + RightEnd)
       else
         RightSnake := FwdSnake[K + 1];
-      if (K + 1 >= BwdBeginK) and (K + 1 <= BwdEndK) and
-         (((AD - 1 + (K + 1) - BwdMiddleK) mod 2) = 0) and
+      if (K + 1 >= AState.BwdBeginK) and (K + 1 <= AState.BwdEndK) and
+         (((AD - 1 + (K + 1) - AState.BwdMiddleK) mod 2) = 0) and
          (RightEnd >= BwdX[K + 1]) then
       begin
-        Result := True;
-        Exit;
+        AState.MiddleEdit := MakeMiddleEdit(RightSnake, BwdSnake[K + 1]);
+        Exit(True);
       end;
       Right := RightEnd + 1;
     end;
 
-    if (K >= FwdEndK) or ((K > FwdBeginK) and (Left > Right)) then
+    if (K >= PrevEndK) or ((K > PrevBeginK) and (Left > Right)) then
     begin
       NewX := Left;
       NewSnake := LeftSnake;
@@ -388,46 +567,63 @@ begin
       NewSnake := RightSnake;
     end;
 
+    if (K >= AState.BwdBeginK) and (K <= AState.BwdEndK) and
+       (((AD - 1 + K - AState.BwdMiddleK) mod 2) = 0) and
+       (NewX >= BwdX[K]) then
+    begin
+      AState.MiddleEdit := MakeMiddleEdit(NewSnake, BwdSnake[K]);
+      Exit(True);
+    end;
+
+    if (NewX >= AState.EndA) or ((K + NewX) >= AState.EndB) then
+    begin
+      if K > AState.BwdMiddleK then
+        AState.MaxK := K
+      else
+        AState.MinK := K;
+    end;
+
     FwdX[K] := NewX;
     FwdSnake[K] := NewSnake;
+
     Dec(K, 2);
   end;
 end;
 
+{ Backward EditPaths: extend backward D-paths by one step.
+  Returns True if the forward and backward fronts meet (middle snake found). }
 function BackwardCalculate(var AState: TCharMyersState; AD: Integer): Boolean;
 var
-  K, Left, Right, NewX: Integer;
+  K, I, Left, Right, NewX: Integer;
   LeftEnd, RightEnd: Integer;
   LeftSnake, RightSnake, NewSnake: Int64;
+  PrevBeginK, PrevEndK: Integer;
   FwdX: PInteger;
   FwdSnake: PInt64;
   BwdX: PInteger;
   BwdSnake: PInt64;
-  FwdBeginK, FwdEndK, FwdMiddleK: Integer;
-  BwdBeginK, BwdEndK, BwdMiddleK: Integer;
 begin
   Result := False;
-  FwdMiddleK := AState.BeginB - AState.BeginA;
-  FwdBeginK := FwdMiddleK - AD;
-  FwdEndK := FwdMiddleK + AD;
-  BwdMiddleK := AState.EndB - AState.EndA;
-  BwdBeginK := BwdMiddleK - AD;
-  BwdEndK := BwdMiddleK + AD;
+  PrevBeginK := AState.BwdBeginK;
+  PrevEndK := AState.BwdEndK;
+  AState.BwdBeginK := ForceKIntoRange(AState.BwdMiddleK - AD, AState.MinK, AState.MaxK);
+  AState.BwdEndK := ForceKIntoRange(AState.BwdMiddleK + AD, AState.MinK, AState.MaxK);
 
+  // Cache pointers in locals for faster access in the loop.
   FwdX := AState.FwdX;
   FwdSnake := AState.FwdSnake;
   BwdX := AState.BwdX;
   BwdSnake := AState.BwdSnake;
 
-  K := BwdEndK;
-  while K >= BwdBeginK do
+  K := AState.BwdEndK;
+  while K >= AState.BwdBeginK do
   begin
     Left := -1;
     Right := -1;
     LeftSnake := -1;
     RightSnake := -1;
 
-    if K > BwdBeginK then
+    if K > PrevBeginK then
     begin
       Left := BwdX[K - 1];
       LeftEnd := BackwardSnake(AState, K - 1, Left);
@@ -435,17 +631,17 @@ begin
         LeftSnake := PackSnake(LeftEnd, (K - 1) + LeftEnd)
       else
         LeftSnake := BwdSnake[K - 1];
-      if (K - 1 >= FwdBeginK) and (K - 1 <= FwdEndK) and
-         (((AD + (K - 1) - FwdMiddleK) mod 2) = 0) and
+      if (K - 1 >= AState.FwdBeginK) and (K - 1 <= AState.FwdEndK) and
+         (((AD + (K - 1) - AState.FwdMiddleK) mod 2) = 0) and
          (LeftEnd <= FwdX[K - 1]) then
       begin
-        Result := True;
-        Exit;
+        AState.MiddleEdit := MakeMiddleEdit(FwdSnake[K - 1], LeftSnake);
+        Exit(True);
       end;
       Left := LeftEnd - 1;
     end;
 
-    if K < BwdEndK then
+    if K < PrevEndK then
     begin
       Right := BwdX[K + 1];
       RightEnd := BackwardSnake(AState, K + 1, Right);
@@ -453,17 +649,17 @@ begin
         RightSnake := PackSnake(RightEnd, (K + 1) + RightEnd)
       else
         RightSnake := BwdSnake[K + 1];
-      if (K + 1 >= FwdBeginK) and (K + 1 <= FwdEndK) and
-         (((AD + (K + 1) - FwdMiddleK) mod 2) = 0) and
+      if (K + 1 >= AState.FwdBeginK) and (K + 1 <= AState.FwdEndK) and
+         (((AD + (K + 1) - AState.FwdMiddleK) mod 2) = 0) and
          (RightEnd <= FwdX[K + 1]) then
       begin
-        Result := True;
-        Exit;
+        AState.MiddleEdit := MakeMiddleEdit(FwdSnake[K + 1], RightSnake);
+        Exit(True);
       end;
       Right := RightEnd;
     end;
 
-    if (K >= BwdEndK) or ((K > BwdBeginK) and (Left < Right)) then
+    if (K >= PrevEndK) or ((K > PrevBeginK) and (Left < Right)) then
     begin
       NewX := Left;
       NewSnake := LeftSnake;
@@ -474,31 +670,56 @@ begin
       NewSnake := RightSnake;
     end;
 
+    if (K >= AState.FwdBeginK) and (K <= AState.FwdEndK) and
+       (((AD + K - AState.FwdMiddleK) mod 2) = 0) and
+       (NewX <= FwdX[K]) then
+    begin
+      AState.MiddleEdit := MakeMiddleEdit(FwdSnake[K], NewSnake);
+      Exit(True);
+    end;
+
+    if (NewX <= AState.BeginA) or ((K + NewX) <= AState.BeginB) then
+    begin
+      if K > AState.FwdMiddleK then
+        AState.MaxK := K
+      else
+        AState.MinK := K;
+    end;
+
     BwdX[K] := NewX;
     BwdSnake[K] := NewSnake;
+
     Dec(K, 2);
   end;
 end;
 
-{ ---------- Self-contained Myers O(ND) for word-level diff ----------
-  This is a minimal middle-snake Myers diff. It does NOT include the
-  big_snake / TOO_EXPENSIVE / discard_confusing_lines heuristics —
-  those are line-diff optimizations not needed at the word level (word
-  counts are small, typically 10-2000 words per line).
-  In step 2, this will be replaced with a proper WinMerge O(NP) port. }
+type
+  TCharWorkItem = record
+    BeginA, EndA, BeginB, EndB: Integer;
+  end;
+  TCharWorkStack = array of TCharWorkItem;
 
-procedure WordMyersDiff(out AEdits: TCharEditList;
+
+function MyersDiffCore(
+  out AEdits: TCharEditList;
   const ASeqA, ASeqB: TWordSequence;
-  ARegion: TCharEdit);
+  ARegion: TCharEdit
+): Boolean;
 var
   State: TCharMyersState;
   MaxSize: Integer;
-  WorkStack: array of TCharEdit;
+  WorkStack: TCharWorkStack;
   WorkCount: Integer;
-  Item, Edit: TCharEdit;
+  Item: TCharWorkItem;
+  Edit: TCharEdit;
   K, X, D: Integer;
   Found: Boolean;
-  FwdMiddleK, BwdMiddleK: Integer;
+  TooExpensive: Integer;
+  BigSnake: Boolean;
+  FwdX, BwdX: PInteger;
+  FwdSnake, BwdSnake: PInt64;
+  BestVal, BestX, TmpX, TmpY, TmpD: Integer;
+  FxyBest, FxBest, BxyBest, BxBest: Integer;
 
   procedure PushWork(ABeginA, AEndA, ABeginB, AEndB: Integer);
   begin
@@ -512,6 +733,7 @@ var
   end;
 
 begin
+  Result := True;
   AEdits.Init;
 
   State.SeqA := @ASeqA;
@@ -521,30 +743,57 @@ begin
   if MaxSize = 0 then
     Exit;
 
+  { Compute TOO_EXPENSIVE threshold (GNU diffutils analyze.c line 958):
+    approximate square root of input size, bounded below by 4096.
+    This caps the D-loop to prevent O(N*D) blowup on files with
+    large edit distance. }
+  TooExpensive := 1;
+  TmpX := MaxSize;
+  while TmpX > 0 do
+  begin
+    TooExpensive := TooExpensive shl 1;
+    TmpX := TmpX shr 2;
+  end;
+  if TooExpensive < TOO_EXPENSIVE_FLOOR then
+    TooExpensive := TOO_EXPENSIVE_FLOOR;
   State.OffsetK := MaxSize;
+  // Allocate V arrays once at top level. Size is 2*MaxSize+1, which is
+  // always sufficient for any sub-region's k range (k is in [-MaxSize, +MaxSize]).
+  // Using pointer arithmetic (adjusted by OffsetK) eliminates bounds-checking
+  // overhead — direct memory access like LGenerics' LcsMyersImpl.
   SetLength(State.FwdXBuf, 2 * MaxSize + 1);
   SetLength(State.BwdXBuf, 2 * MaxSize + 1);
   SetLength(State.FwdSnakeBuf, 2 * MaxSize + 1);
   SetLength(State.BwdSnakeBuf, 2 * MaxSize + 1);
+  // Set pointers to the middle of each buffer, so Ptr[K] works for
+  // any K in [-MaxSize, +MaxSize] without bounds checking.
   State.FwdX := PInteger(@State.FwdXBuf[0]) + State.OffsetK;
   State.BwdX := PInteger(@State.BwdXBuf[0]) + State.OffsetK;
   State.FwdSnake := PInt64(@State.FwdSnakeBuf[0]) + State.OffsetK;
   State.BwdSnake := PInt64(@State.BwdSnakeBuf[0]) + State.OffsetK;
 
+  // Initialize the work stack with the top-level region.
   SetLength(WorkStack, 64);
   WorkCount := 0;
   PushWork(ARegion.BeginA, ARegion.EndA, ARegion.BeginB, ARegion.EndB);
 
-  while WorkCount > 0 do
+  // Process work items from the stack. This replaces the recursive
+  // CalculateEdits calls — the "stack" is now on the heap, so it can
+  // grow to any size without overflowing the call stack.
+  // Safety limit: the work stack can never have more items than the
+  // total number of lines (each item represents at least 1 line). If
+  // it exceeds that, something is wrong — bail out to prevent an
+  // infinite loop from hanging CudaText.
+  while (WorkCount > 0) and (WorkCount <= MaxSize + 1) do
   begin
     Dec(WorkCount);
     Item := WorkStack[WorkCount];
 
-    // Base case: one side empty
+    // Base case: one side empty → emit as a single edit.
     if (Item.BeginA >= Item.EndA) or (Item.BeginB >= Item.EndB) then
     begin
       if (Item.BeginA < Item.EndA) or (Item.BeginB < Item.EndB) then
-        AEdits.Add(Item);
+        AEdits.Add(TCharEdit.Create(Item.BeginA, Item.EndA, Item.BeginB, Item.EndB));
       Continue;
     end;
 
@@ -553,56 +802,251 @@ begin
     State.BeginB := Item.BeginB;
     State.EndB := Item.EndB;
 
-    // Strip common prefix
+    // Strip common prefix.
     K := Item.BeginB - Item.BeginA;
     X := ForwardSnake(State, K, Item.BeginA);
     State.BeginA := X;
     State.BeginB := K + X;
 
-    // Strip common suffix
+    // Strip common suffix.
     K := Item.EndB - Item.EndA;
     X := BackwardSnake(State, K, Item.EndA);
     State.EndA := X;
     State.EndB := K + X;
 
+    // After trimming, check if either side is empty. This is the same
+    // check TextDiff does (Diff_NP.pas line 365-380): if len1=0, emit
+    // as add; if len2=0, emit as delete. Without this check, the k range
+    // computation below produces invalid values (MinK > MaxK) which
+    // causes ForceKIntoRange to return garbage, leading to an infinite
+    // loop in the work stack.
     if (State.BeginA >= State.EndA) or (State.BeginB >= State.EndB) then
     begin
       if (State.BeginA < State.EndA) or (State.BeginB < State.EndB) then
-      begin
-        Edit.BeginA := State.BeginA;
-        Edit.EndA := State.EndA;
-        Edit.BeginB := State.BeginB;
-        Edit.EndB := State.EndB;
-        AEdits.Add(Edit);
-      end;
+        AEdits.Add(TCharEdit.Create(State.BeginA, State.EndA,
+          State.BeginB, State.EndB));
       Continue;
     end;
 
-    FwdMiddleK := State.BeginB - State.BeginA;
-    BwdMiddleK := State.EndB - State.EndA;
+    State.MinK := State.BeginB - State.EndA;
+    State.MaxK := State.EndB - State.BeginA;
+    State.FwdMiddleK := State.BeginB - State.BeginA;
+    State.BwdMiddleK := State.EndB - State.EndA;
+    State.FwdBeginK := State.FwdMiddleK;
+    State.FwdEndK := State.FwdMiddleK;
+    State.BwdBeginK := State.BwdMiddleK;
+    State.BwdEndK := State.BwdMiddleK;
 
-    State.FwdX[FwdMiddleK] := State.BeginA;
-    State.FwdSnake[FwdMiddleK] := PackSnake(State.BeginA, FwdMiddleK + State.BeginA);
-    State.BwdX[BwdMiddleK] := State.EndA;
-    State.BwdSnake[BwdMiddleK] := PackSnake(State.EndA, BwdMiddleK + State.EndA);
+    State.FwdX[State.FwdMiddleK] := State.BeginA;
+    State.FwdSnake[State.FwdMiddleK] :=
+      PackSnake(State.BeginA, State.FwdMiddleK + State.BeginA);
+    State.BwdX[State.BwdMiddleK] := State.EndA;
+    State.BwdSnake[State.BwdMiddleK] :=
+      PackSnake(State.EndA, State.BwdMiddleK + State.EndA);
 
-    Edit.BeginA := 0;
-    Edit.EndA := 0;
-    Edit.BeginB := 0;
-    Edit.EndB := 0;
+    // Find the middle snake with GNU diffutils heuristics.
+    Edit := TCharEdit.Create(0, 0, 0, 0);
     Found := False;
+    BigSnake := False;
     D := 1;
     while (D <= MaxSize) and not Found do
     begin
+      { Track big_snake: ForwardCalculate and BackwardCalculate
+        set BigSnake when a snake > SNAKE_LIMIT is found. We pass
+        it by reference via the State record. }
+      State.BigSnake := False;
+
       if ForwardCalculate(State, D) or BackwardCalculate(State, D) then
+      begin
+        Edit := State.MiddleEdit;
         Found := True;
-      Inc(D);
+      end
+      else
+      begin
+        if State.BigSnake then
+          BigSnake := True;
+
+        { GNU diffutils big_snake heuristic (analyze.c line 200):
+          When c > 200 and a big snake was found, check if any
+          diagonal has made progress >> cost. If so, return that
+          diagonal as the split point. This makes the algorithm
+          linear for files with constant small density of changes. }
+        if (D > 200) and BigSnake then
+        begin
+          { Check forward diagonals for best progress }
+          FwdX := State.FwdX;
+          FwdSnake := State.FwdSnake;
+          BestVal := 0;
+          BestX := 0;
+          K := State.FwdEndK;
+          while K >= State.FwdBeginK do
+          begin
+            TmpX := FwdX[K];
+            TmpY := TmpX - K;
+            TmpD := K - State.FwdMiddleK;
+            if TmpD < 0 then TmpD := -TmpD;
+            { v = (x - xoff) * 2 - dd = progress * 2 - diagonal_distance }
+            X := (TmpX - State.BeginA) * 2 - TmpD;
+            if (X > 12 * (D + TmpD)) and
+               (X > BestVal) and
+               (State.BeginA + SNAKE_LIMIT <= TmpX) and
+               (TmpX < State.EndA) and
+               (State.BeginB + SNAKE_LIMIT <= TmpY) and
+               (TmpY < State.EndB) then
+            begin
+              { Verify it ends with a significant snake }
+              TmpD := 0;
+              while (TmpD < SNAKE_LIMIT) and
+                    (TmpX - TmpD - 1 >= State.BeginA) and
+                    (TmpY - TmpD - 1 >= State.BeginB) and
+                    ASeqA.EqualsAt(TmpX - TmpD - 1, ASeqB, TmpY - TmpD - 1) do
+                Inc(TmpD);
+              if TmpD >= SNAKE_LIMIT then
+              begin
+                BestVal := X;
+                BestX := TmpX;
+              end;
+            end;
+            Dec(K, 2);
+          end;
+          if BestVal > 0 then
+          begin
+            Edit := TCharEdit.Create(BestX, BestX, BestX - (BestX - State.BeginA + State.BeginB), BestX - (BestX - State.BeginA + State.BeginB));
+            { Simplify: just use the point as a zero-length edit }
+            Edit.BeginA := BestX;
+            Edit.EndA := BestX;
+            Edit.BeginB := BestX - (State.FwdMiddleK);
+            Edit.EndB := Edit.BeginB;
+            Found := True;
+            Break;
+          end;
+
+          { Check backward diagonals for best progress }
+          BwdX := State.BwdX;
+          BwdSnake := State.BwdSnake;
+          BestVal := 0;
+          BestX := 0;
+          K := State.BwdEndK;
+          while K >= State.BwdBeginK do
+          begin
+            TmpX := BwdX[K];
+            TmpY := TmpX - K;
+            TmpD := K - State.BwdMiddleK;
+            if TmpD < 0 then TmpD := -TmpD;
+            { v = (xlim - x) * 2 + dd }
+            X := (State.EndA - TmpX) * 2 + TmpD;
+            if (X > 12 * (D + TmpD)) and
+               (X > BestVal) and
+               (State.BeginA < TmpX) and
+               (TmpX <= State.EndA - SNAKE_LIMIT) and
+               (State.BeginB < TmpY) and
+               (TmpY <= State.EndB - SNAKE_LIMIT) then
+            begin
+              TmpD := 0;
+              while (TmpD < SNAKE_LIMIT - 1) and
+                    (TmpX + TmpD < State.EndA) and
+                    (TmpY + TmpD < State.EndB) and
+                    ASeqA.EqualsAt(TmpX + TmpD, ASeqB, TmpY + TmpD) do
+                Inc(TmpD);
+              if TmpD >= SNAKE_LIMIT - 1 then
+              begin
+                BestVal := X;
+                BestX := TmpX;
+              end;
+            end;
+            Dec(K, 2);
+          end;
+          if BestVal > 0 then
+          begin
+            Edit.BeginA := BestX;
+            Edit.EndA := BestX;
+            Edit.BeginB := BestX - (State.BwdMiddleK);
+            Edit.EndB := Edit.BeginB;
+            Found := True;
+            Break;
+          end;
+        end;
+
+        { GNU diffutils TOO_EXPENSIVE heuristic (analyze.c line 277):
+          When cost exceeds the threshold, give up on finding the
+          optimal split and pick the best forward/backward diagonal
+          found so far. This produces a suboptimal but good enough
+          result, preventing O(N*D) blowup. }
+        if D >= TooExpensive then
+        begin
+          { Find forward diagonal that maximizes X + Y }
+          FwdX := State.FwdX;
+          FxyBest := -1;
+          FxBest := 0;
+          K := State.FwdEndK;
+          while K >= State.FwdBeginK do
+          begin
+            TmpX := FwdX[K];
+            if TmpX > State.EndA then TmpX := State.EndA;
+            TmpY := TmpX - K;
+            if TmpY > State.EndB then
+            begin
+              TmpX := State.EndB + K;
+              TmpY := State.EndB;
+            end;
+            if TmpX + TmpY > FxyBest then
+            begin
+              FxyBest := TmpX + TmpY;
+              FxBest := TmpX;
+            end;
+            Dec(K, 2);
+          end;
+
+          { Find backward diagonal that minimizes X + Y }
+          BwdX := State.BwdX;
+          BxyBest := MaxInt;
+          BxBest := 0;
+          K := State.BwdEndK;
+          while K >= State.BwdBeginK do
+          begin
+            TmpX := BwdX[K];
+            if TmpX < State.BeginA then TmpX := State.BeginA;
+            TmpY := TmpX - K;
+            if TmpY < State.BeginB then
+            begin
+              TmpX := State.BeginB + K;
+              TmpY := State.BeginB;
+            end;
+            if TmpX + TmpY < BxyBest then
+            begin
+              BxyBest := TmpX + TmpY;
+              BxBest := TmpX;
+            end;
+            Dec(K, 2);
+          end;
+
+          { Use the better of the two diagonals (GNU diffutils line 315) }
+          if (State.EndA + State.EndB) - BxyBest < FxyBest - (State.BeginA + State.BeginB) then
+          begin
+            Edit.BeginA := BxBest;
+            Edit.EndA := BxBest;
+            Edit.BeginB := BxyBest - BxBest;
+            Edit.EndB := Edit.BeginB;
+          end
+          else
+          begin
+            Edit.BeginA := FxBest;
+            Edit.EndA := FxBest;
+            Edit.BeginB := FxyBest - FxBest;
+            Edit.EndB := Edit.BeginB;
+          end;
+          Found := True;
+          Break;
+        end;
+
+        Inc(D);
+      end;
     end;
 
     if not Found then
       Continue;
 
-    // Push after half
+    // Push the "after" half onto the stack (processed later — LIFO).
     if (Item.EndA > Edit.EndA) or (Item.EndB > Edit.EndB) then
     begin
       K := Edit.EndB - Edit.EndA;
@@ -610,10 +1054,11 @@ begin
       PushWork(X, Item.EndA, K + X, Item.EndB);
     end;
 
+    // Emit the middle edit itself.
     if not Edit.IsEmpty then
       AEdits.Add(Edit);
 
-    // Push before half
+    // Push the "before" half onto the stack (processed next — LIFO).
     if (Item.BeginA < Edit.BeginA) or (Item.BeginB < Edit.BeginB) then
     begin
       K := Edit.BeginB - Edit.BeginA;
@@ -621,11 +1066,104 @@ begin
       PushWork(Item.BeginA, X, Item.BeginB, K + X);
     end;
   end;
+
+  // The explicit-stack (LIFO) processing emits edits out of positional
+  // order. Sort by BeginA (then BeginB) so EditsToOpcodes can walk them
+  // in order. This is the same approach TextDiff uses — its PushDiff/
+  // PopDiff loop also produces out-of-order edits that are sorted by
+  // position at the end.
+  if AEdits.Count > 1 then
+  begin
+    // Simple insertion sort — edit count is typically small (O(D) where
+    // D is the edit distance, not O(N)). For very large edit counts,
+    // could switch to quicksort, but insertion sort is cache-friendly
+    // and fast for small arrays.
+    for K := 1 to AEdits.Count - 1 do
+    begin
+      Edit := AEdits.Items[K];
+      D := K - 1;
+      while (D >= 0) and
+            ((AEdits.Items[D].BeginA > Edit.BeginA) or
+             ((AEdits.Items[D].BeginA = Edit.BeginA) and
+              (AEdits.Items[D].BeginB > Edit.BeginB))) do
+      begin
+        AEdits.Items[D + 1] := AEdits.Items[D];
+        Dec(D);
+      end;
+      AEdits.Items[D + 1] := Edit;
+    end;
+  end;
 end;
 
-{ ---------- Convert word edits to opcodes ---------- }
+function ReduceCommonStartEnd(
+  const ASeqA, ASeqB: TWordSequence;
+  AEdit: TCharEdit
+): TCharEdit;
+begin
+  Result := AEdit;
+  while (Result.BeginA < Result.EndA) and (Result.BeginB < Result.EndB) and
+        ASeqA.EqualsAt(Result.BeginA, ASeqB, Result.BeginB) do
+  begin
+    Inc(Result.BeginA);
+    Inc(Result.BeginB);
+  end;
+  while (Result.BeginA < Result.EndA) and (Result.BeginB < Result.EndB) and
+        ASeqA.EqualsAt(Result.EndA - 1, ASeqB, Result.EndB - 1) do
+  begin
+    Dec(Result.EndA);
+    Dec(Result.EndB);
+  end;
+end;
 
-function WordEditsToOpcodes(const AEdits: TCharEditList;
+{ JGit's normalize pass: shift pure INSERT/DELETE edits to their latest
+  possible position. Produces consistent diff output regardless of
+  which path the algorithm took through ties. }
+procedure NormalizeEdits(var AEdits: TCharEditList;
+  const ASeqA, ASeqB: TWordSequence);
+var
+  I: Integer;
+  Cur, Prev: TCharEdit;
+  MaxA, MaxB: Integer;
+  T: TCharEditType;
+begin
+  if AEdits.Count = 0 then Exit;
+  Prev := TCharEdit.Create(0, 0, 0, 0);
+  for I := AEdits.Count - 1 downto 0 do
+  begin
+    Cur := AEdits.Items[I];
+    T := Cur.GetType;
+    if I = AEdits.Count - 1 then
+    begin
+      MaxA := ASeqA.Size;
+      MaxB := ASeqB.Size;
+    end
+    else
+    begin
+      MaxA := Prev.BeginA;
+      MaxB := Prev.BeginB;
+    end;
+
+    if T = cetInsert then
+    begin
+      while (Cur.EndA < MaxA) and (Cur.EndB < MaxB) and
+            ASeqB.EqualsAt(Cur.BeginB, ASeqB, Cur.EndB) do
+        Cur.Shift(1);
+    end
+    else if T = cetDelete then
+    begin
+      while (Cur.EndA < MaxA) and (Cur.EndB < MaxB) and
+            ASeqA.EqualsAt(Cur.BeginA, ASeqA, Cur.EndA) do
+        Cur.Shift(1);
+    end;
+    AEdits.Items[I] := Cur;
+    Prev := Cur;
+  end;
+end;
+
+{ Convert an edit list to difflib-compatible opcodes.
+  Walks the edit list in order, emitting 'equal' opcodes for the
+  common regions between edits and the appropriate tag for each edit. }
+function EditsToOpcodes(const AEdits: TCharEditList;
   ALenA, ALenB: Integer): TDiffOpcodeArray;
 var
   Result_: TDiffOpcodeArray;
@@ -633,6 +1171,7 @@ var
   PrevEndA, PrevEndB: Integer;
   I: Integer;
   E: TCharEdit;
+  T: TCharEditType;
 
   procedure Emit(ATag: Integer; AI1, AI2, AJ1, AJ2: Integer);
   begin
@@ -654,19 +1193,17 @@ begin
 
   for I := 0 to AEdits.Count - 1 do
   begin
-    E := AEdits.GetItem(I);
+    E := AEdits.Items[I];
     if (E.BeginA > PrevEndA) or (E.BeginB > PrevEndB) then
       Emit(DIFF_TAG_EQUAL, PrevEndA, E.BeginA, PrevEndB, E.BeginB);
 
-    if E.LengthA > 0 then
-    begin
-      if E.LengthB > 0 then
-        Emit(DIFF_TAG_REPLACE, E.BeginA, E.EndA, E.BeginB, E.EndB)
-      else
-        Emit(DIFF_TAG_DELETE, E.BeginA, E.EndA, E.BeginB, E.EndB);
-    end
-    else if E.LengthB > 0 then
-      Emit(DIFF_TAG_INSERT, E.BeginA, E.EndA, E.BeginB, E.EndB);
+    T := E.GetType;
+    case T of
+      cetInsert:  Emit(DIFF_TAG_INSERT,  E.BeginA, E.EndA, E.BeginB, E.EndB);
+      cetDelete:  Emit(DIFF_TAG_DELETE,  E.BeginA, E.EndA, E.BeginB, E.EndB);
+      cetReplace: Emit(DIFF_TAG_REPLACE, E.BeginA, E.EndA, E.BeginB, E.EndB);
+      cetEmpty:   ;
+    end;
 
     PrevEndA := E.EndA;
     PrevEndB := E.EndB;
@@ -678,11 +1215,6 @@ begin
   SetLength(Result_, ResultCount);
   Result := Result_;
 end;
-
-{ ---------- Word tokenizer ----------
-  Tokenize a string into words, whitespace runs, and individual
-  punctuation characters. Port of WinMerge's BuildWordsArray
-  (which uses ICU break iterators — close enough for diff purposes). }
 
 type
   { Token from the word tokenizer. Stores the token text (for hashing
@@ -938,14 +1470,16 @@ begin
   // but the size limit above caps the worst case.
   WordsA := TokensToStrings(TokensA);
   WordsB := TokensToStrings(TokensB);
-  SeqA.Init(WordsA);
-  SeqB.Init(WordsB);
+  SeqA.Init(WordsA, 0);
+  SeqB.Init(WordsB, 0);
   Edit.BeginA := 0;
   Edit.EndA := SeqA.Size;
   Edit.BeginB := 0;
   Edit.EndB := SeqB.Size;
-  WordMyersDiff(Edits, SeqA, SeqB, Edit);
-  WordOpcodes := WordEditsToOpcodes(Edits, SeqA.Size, SeqB.Size);
+  Edit := ReduceCommonStartEnd(SeqA, SeqB, Edit);
+  MyersDiffCore(Edits, SeqA, SeqB, Edit);
+  NormalizeEdits(Edits, SeqA, SeqB);
+  WordOpcodes := EditsToOpcodes(Edits, SeqA.Size, SeqB.Size);
 
   StrA := AnsiString(ATextA);
   StrB := AnsiString(ATextB);
@@ -1088,6 +1622,7 @@ begin
   SetLength(Result_, ResultCount);
   Result := Result_;
 end;
+
 
 
 end.
