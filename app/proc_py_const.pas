@@ -933,8 +933,7 @@ const
   DIFF_IGN_EOL                  = 64;     // CR/LF vs LF treated equal
   DIFF_IGN_NUMBERS              = 128;    // digit runs treated as equal (for logs)
 
-  { diff_proc: opcode tag values (internal; wrapper converts to lowercase
-    strings 'equal'/'delete'/'insert'/'replace' before returning to Python). }
+  // diff_proc: opcode tag values
   DIFF_TAG_EQUAL   = 0;
   DIFF_TAG_DELETE  = 1;
   DIFF_TAG_INSERT  = 2;
