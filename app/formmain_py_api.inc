@@ -11119,13 +11119,43 @@ var
   Ptr1, Ptr2: PChar;
   Str1, Str2: string;
   NAlgo, NFlags: Integer;
-  LinesA, LinesB: TStringArray;
-  Opcodes: TDiffOpcodeArray;
+  LinesA, LinesB: CudaDiff.TStringArray;
+  Opcodes: CudaDiff.TDiffOpcodeArray;
+  OpcodesChars: CudaDiffChars.TDiffOpcodeArray;
   I: Integer;
   TagStr: string;
   TagPtr: PChar;
 
-  procedure BuildOpcodeList(const AOpcodes: TDiffOpcodeArray);
+  procedure BuildOpcodeList(const AOpcodes: CudaDiff.TDiffOpcodeArray);
+  var
+    J: Integer;
+    LTagStr: string;
+    LTagPtr: PChar;
+  begin
+    with AppPython.Engine do
+    begin
+      Result := PyList_New(Length(AOpcodes));
+      if not Assigned(Result) then
+        raise EPythonError.Create(msgPythonListError);
+      for J := 0 to High(AOpcodes) do
+      begin
+        case AOpcodes[J].Tag of
+          DIFF_TAG_EQUAL:   LTagStr := 'equal';
+          DIFF_TAG_DELETE:  LTagStr := 'delete';
+          DIFF_TAG_INSERT:  LTagStr := 'insert';
+          DIFF_TAG_REPLACE: LTagStr := 'replace';
+          else              LTagStr := 'equal';
+        end;
+        LTagPtr := PChar(LTagStr);
+        PyList_SetItem(Result, J,
+          Py_BuildValue('(siiii)', LTagPtr,
+            AOpcodes[J].I1, AOpcodes[J].I2,
+            AOpcodes[J].J1, AOpcodes[J].J2));
+      end;
+    end;
+  end;
+
+  procedure BuildOpcodeListChars(const AOpcodes: CudaDiffChars.TDiffOpcodeArray);
   var
     J: Integer;
     LTagStr: string;
@@ -11186,8 +11216,8 @@ begin
         begin
           // Char-level diff. NAlgo is ignored — char diff always uses
           // word-Myers + byte-trim internally.
-          Opcodes := CudaDiffChars.DoDiffChars(Str1, Str2, NFlags);
-          BuildOpcodeList(Opcodes);
+          OpcodesChars := CudaDiffChars.DoDiffChars(Str1, Str2, NFlags);
+          BuildOpcodeListChars(OpcodesChars);
         end;
       else
         begin
