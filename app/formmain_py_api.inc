@@ -11186,7 +11186,7 @@ begin
         begin
           // Char-level diff. NAlgo is ignored — char diff always uses
           // word-Myers + byte-trim internally.
-          Opcodes := CudaDiff.DoDiffChars(Str1, Str2, NFlags);
+          Opcodes := CudaDiffChars.DoDiffChars(Str1, Str2, NFlags);
           BuildOpcodeList(Opcodes);
         end;
       else
