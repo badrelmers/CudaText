@@ -2796,7 +2796,7 @@ procedure Tokenize(const AText: string; out ATokens: TTokenArray);
 var
   S: AnsiString;
   N, I, TokenStart, TokenLen: Integer;
-  Count: Integer;
+  Count, Cap: Integer;
   C: AnsiChar;
 begin
   SetLength(ATokens, 0);
@@ -2805,9 +2805,15 @@ begin
   if N = 0 then
     Exit;
 
-  // Pre-count tokens to size the array in one allocation.
-  // Worst case: every char is its own token (all punctuation).
-  SetLength(ATokens, N);
+  // Start with a small capacity and grow as needed (doubling).
+  // Avoids pre-allocating N TToken records (where N = byte length),
+  // which for very long lines (e.g. 80KB) would allocate 80K+ records
+  // (1.2MB+) and zero-fill them, even though the actual token count
+  // is typically 5-10x smaller (words are multi-char). The growable
+  // approach allocates only what's needed.
+  Cap := 256;
+  if Cap > N then Cap := N;
+  SetLength(ATokens, Cap);
   Count := 0;
 
   I := 1;
@@ -2833,6 +2839,14 @@ begin
       Inc(I);
     end;
     TokenLen := I - TokenStart;
+
+    // Grow the array if needed (amortized O(1) append).
+    if Count >= Cap then
+    begin
+      Cap := Cap * 2;
+      SetLength(ATokens, Cap);
+    end;
+
     ATokens[Count].Text := string(Copy(S, TokenStart, TokenLen));
     // StartOffset is 0-based into the original string; S is 1-based.
     ATokens[Count].StartOffset := TokenStart - 1;
@@ -2940,6 +2954,32 @@ begin
     Result[0].I2 := Length(ATextA);
     Result[0].J1 := 0;
     Result[0].J2 := 0;
+    Exit;
+  end;
+
+  // Step 0: Early byte-length bail-out BEFORE tokenizing.
+  // Tokenize() pre-allocates N TToken records (where N = byte length
+  // of the string). For very long lines (e.g. 100KB+ minified JS),
+  // this would allocate 100K+ records (1.6MB+) and create 100K+
+  // string copies via Copy(), only to immediately bail out at the
+  // 20480-word check below. The repeated allocate→fill→free cycle
+  // across many line pairs causes heap fragmentation and eventually
+  // EAccessViolation. Checking byte length first avoids the massive
+  // allocation entirely.
+  //
+  // Threshold: 100KB. Average token length is 3-5 bytes (words are
+  // 3-10 chars, punctuation is 1 char), so 100KB ≈ 20K-33K tokens,
+  // which is right around the 20480-word limit. Lines longer than
+  // this almost never benefit from word-level char-diff (the diff
+  // is too complex to be visually useful).
+  if (Length(ATextA) > 100000) or (Length(ATextB) > 100000) then
+  begin
+    SetLength(Result, 1);
+    Result[0].Tag := DIFF_TAG_REPLACE;
+    Result[0].I1 := 0;
+    Result[0].I2 := Length(ATextA);
+    Result[0].J1 := 0;
+    Result[0].J2 := Length(ATextB);
     Exit;
   end;
 
