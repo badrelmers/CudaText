@@ -71,21 +71,11 @@ type
   end;
   TDiffOpcodeArray = array of TDiffOpcode;
 
-  { Cancellation callback. Return True to abort the diff.
-    UserData is passed through unchanged from the caller. }
-  TDiffCancelFunc = function(AUserData: Pointer): Boolean;
-
-{ Compare two line arrays and return difflib-compatible opcodes.
-  If ACancelled is True on return, the result is empty and meaningless.
-  ACancelFunc is invoked periodically (every ~4K inner-loop iterations
-  and at every recursion level) to keep the UI responsive on huge files. }
+{ Compare two line arrays and return difflib-compatible opcodes. }
 function DoDiffLines(
   const ALinesA, ALinesB: array of string;
   AAlgo: Integer;
-  AFlags: Integer;
-  ACancelFunc: TDiffCancelFunc;
-  ACancelData: Pointer;
-  out ACancelled: Boolean
+  AFlags: Integer
 ): TDiffOpcodeArray;
 
 { Compare two LF-separated text blocks. Splits each text on #10 and
@@ -95,10 +85,7 @@ function DoDiffLines(
 function DoDiffText(
   const ATextA, ATextB: string;
   AAlgo: Integer;
-  AFlags: Integer;
-  ACancelFunc: TDiffCancelFunc;
-  ACancelData: Pointer;
-  out ACancelled: Boolean
+  AFlags: Integer
 ): TDiffOpcodeArray;
 
 { Compare two strings at character granularity. Returns char-level
@@ -117,10 +104,7 @@ function DoDiffText(
   byte-trim. AFlags supports the same DIFF_IGN_* options as line diff. }
 function DoDiffChars(
   const ATextA, ATextB: string;
-  AFlags: Integer;
-  ACancelFunc: TDiffCancelFunc;
-  ACancelData: Pointer;
-  out ACancelled: Boolean
+  AFlags: Integer
 ): TDiffOpcodeArray;
 
 { Split a string on #10 keeping the terminator attached. Useful for
@@ -312,14 +296,6 @@ end;
 function IsWhitespaceByte(C: AnsiChar): Boolean; inline;
 begin
   Result := (C = ' ') or (C = #9) or (C = #10) or (C = #13);
-end;
-
-function IsCancelled(ACancelFunc: TDiffCancelFunc; ACancelData: Pointer): Boolean; inline;
-begin
-  if Assigned(ACancelFunc) then
-    Result := ACancelFunc(ACancelData)
-  else
-    Result := False;
 end;
 
 {$PUSH}
@@ -675,28 +651,19 @@ end;
 function MyersDiffCore(
   out AEdits: TDiffEditList;
   const ASeqA, ASeqB: TLineSequence;
-  ARegion: TDiffEdit;
-  ACancelFunc: TDiffCancelFunc;
-  ACancelData: Pointer;
-  var ACancelled: Boolean
+  ARegion: TDiffEdit
 ): Boolean; forward;
 
 function MyersDiffNonCommon(
   out AEdits: TDiffEditList;
   const ASeqA, ASeqB: TLineSequence;
-  ARegion: TDiffEdit;
-  ACancelFunc: TDiffCancelFunc;
-  ACancelData: Pointer;
-  var ACancelled: Boolean
+  ARegion: TDiffEdit
 ): Boolean; forward;
 
 function HistogramDiffNonCommon(
   out AEdits: TDiffEditList;
   const ASeqA, ASeqB: TLineSequence;
-  ARegion: TDiffEdit;
-  ACancelFunc: TDiffCancelFunc;
-  ACancelData: Pointer;
-  var ACancelled: Boolean
+  ARegion: TDiffEdit
 ): Boolean; forward;
 
 function ReduceCommonStartEnd(
@@ -1319,7 +1286,7 @@ begin
         begin
           Inc(Consec);
           if Minimum = Consec then
-            // Back up to start of subrun, to cancel it all.
+            // Back up to start of subrun, to revert it all.
             J := J - Consec
           else if Minimum < Consec then
             ADiscards[I + J] := 0;
@@ -1549,10 +1516,7 @@ end;
 function MyersDiffCore(
   out AEdits: TDiffEditList;
   const ASeqA, ASeqB: TLineSequence;
-  ARegion: TDiffEdit;
-  ACancelFunc: TDiffCancelFunc;
-  ACancelData: Pointer;
-  var ACancelled: Boolean
+  ARegion: TDiffEdit
 ): Boolean;
 var
   State: TMyersState;
@@ -1583,7 +1547,6 @@ var
 
 begin
   Result := True;
-  ACancelled := False;
   AEdits.Init;
 
   State.SeqA := @ASeqA;
@@ -1638,14 +1601,6 @@ begin
   begin
     Dec(WorkCount);
     Item := WorkStack[WorkCount];
-
-    if ACancelled then Exit;
-    if (WorkCount and $FF) = 0 then
-      if IsCancelled(ACancelFunc, ACancelData) then
-      begin
-        ACancelled := True;
-        Exit;
-      end;
 
     // Base case: one side empty → emit as a single edit.
     if (Item.BeginA >= Item.EndA) or (Item.BeginB >= Item.EndB) then
@@ -1709,13 +1664,6 @@ begin
     D := 1;
     while (D <= MaxSize) and not Found do
     begin
-      if (D and $3FF) = 0 then
-        if IsCancelled(ACancelFunc, ACancelData) then
-        begin
-          ACancelled := True;
-          Exit;
-        end;
-
       { Track big_snake: ForwardCalculate and BackwardCalculate
         set BigSnake when a snake > SNAKE_LIMIT is found. We pass
         it by reference via the State record. }
@@ -1981,10 +1929,7 @@ end;
 function MyersDiffNonCommon(
   out AEdits: TDiffEditList;
   const ASeqA, ASeqB: TLineSequence;
-  ARegion: TDiffEdit;
-  ACancelFunc: TDiffCancelFunc;
-  ACancelData: Pointer;
-  var ACancelled: Boolean
+  ARegion: TDiffEdit
 ): Boolean;
 const
   { Below this threshold, skip discard preprocessing — Myers is fast
@@ -2004,7 +1949,6 @@ var
   RealBegin, RealEnd: Integer;
 begin
   Result := True;
-  ACancelled := False;
   AEdits.Init;
   LenA := ARegion.LengthA;
   LenB := ARegion.LengthB;
@@ -2016,8 +1960,7 @@ begin
   if not UseDiscard then
   begin
     // Small input — run Myers directly on the original sequences.
-    Exit(MyersDiffCore(AEdits, ASeqA, ASeqB, ARegion,
-      ACancelFunc, ACancelData, ACancelled));
+    Exit(MyersDiffCore(AEdits, ASeqA, ASeqB, ARegion));
   end;
 
   // Run discard_confusing_lines on both sides.
@@ -2027,8 +1970,7 @@ begin
   if (DiscardA.FKeptCount = ARegion.LengthA) and
      (DiscardB.FKeptCount = ARegion.LengthB) then
   begin
-    Exit(MyersDiffCore(AEdits, ASeqA, ASeqB, ARegion,
-      ACancelFunc, ACancelData, ACancelled));
+    Exit(MyersDiffCore(AEdits, ASeqA, ASeqB, ARegion));
   end;
 
   // Build virtual sequences containing only kept lines.
@@ -2050,22 +1992,17 @@ begin
     // lines as DELETE. But wait, the kept B lines might still match
     // discarded A lines (rare but possible). For correctness, fall
     // back to core on the original sequences.
-    Exit(MyersDiffCore(AEdits, ASeqA, ASeqB, ARegion,
-      ACancelFunc, ACancelData, ACancelled));
+    Exit(MyersDiffCore(AEdits, ASeqA, ASeqB, ARegion));
   end;
   if VirtSeqB.Size = 0 then
   begin
-    Exit(MyersDiffCore(AEdits, ASeqA, ASeqB, ARegion,
-      ACancelFunc, ACancelData, ACancelled));
+    Exit(MyersDiffCore(AEdits, ASeqA, ASeqB, ARegion));
   end;
 
   // Run Myers on the virtual sequences.
   VirtRegion := TDiffEdit.Create(0, VirtSeqA.Size, 0, VirtSeqB.Size);
   VirtEdits.Init;
-  MyersDiffCore(VirtEdits, VirtSeqA, VirtSeqB, VirtRegion,
-    ACancelFunc, ACancelData, ACancelled);
-  if ACancelled then
-    Exit;
+  MyersDiffCore(VirtEdits, VirtSeqA, VirtSeqB, VirtRegion);
 
   // Translate virtual edits back to real line indices using the
   // build_script approach from GNU diffutils (analyze.c line 793).
@@ -2421,10 +2358,7 @@ end;
 function HistogramDiffNonCommon(
   out AEdits: TDiffEditList;
   const ASeqA, ASeqB: TLineSequence;
-  ARegion: TDiffEdit;
-  ACancelFunc: TDiffCancelFunc;
-  ACancelData: Pointer;
-  var ACancelled: Boolean
+  ARegion: TDiffEdit
 ): Boolean;
 var
   Queue: TDiffEditList;
@@ -2434,20 +2368,13 @@ var
     Index: THistogramIndex;
     Lcs: TDiffEdit;
   begin
-    if ACancelled then Exit;
-    if IsCancelled(ACancelFunc, ACancelData) then
-    begin
-      ACancelled := True;
-      Exit;
-    end;
     Index.Init(HISTOGRAM_MAX_CHAIN_LENGTH, @ASeqA, @ASeqB, ARegion);
     Lcs := Index.FindLongestCommonSequence;
 
     if Index.FFallback then
     begin
       // Fallback to Myers on this region.
-      MyersDiffNonCommon(AEdits, ASeqA, ASeqB, ARegion,
-        ACancelFunc, ACancelData, ACancelled);
+      MyersDiffNonCommon(AEdits, ASeqA, ASeqB, ARegion);
     end
     else if Lcs.IsEmpty then
     begin
@@ -2486,12 +2413,11 @@ var
   E: TDiffEdit;
 begin
   Result := True;
-  ACancelled := False;
   AEdits.Init;
   Queue.Init;
 
   DiffReplace(ARegion);
-  while (Queue.Count > 0) and not ACancelled do
+  while Queue.Count > 0 do
   begin
     E := Queue.FItems[Queue.FCount - 1];
     Dec(Queue.FCount);
@@ -2627,10 +2553,7 @@ end;
 function DoDiffLines(
   const ALinesA, ALinesB: array of string;
   AAlgo: Integer;
-  AFlags: Integer;
-  ACancelFunc: TDiffCancelFunc;
-  ACancelData: Pointer;
-  out ACancelled: Boolean
+  AFlags: Integer
 ): TDiffOpcodeArray;
 var
   SeqA, SeqB: TLineSequence;
@@ -2638,7 +2561,6 @@ var
   Edits: TDiffEditList;
   RegionType: TDiffEditType;
 begin
-  ACancelled := False;
   SetLength(Result, 0);
 
   SeqA.Init(ALinesA, AFlags);
@@ -2667,16 +2589,12 @@ begin
       begin
         case AAlgo of
           DIFF_ALGO_MYERS:
-            MyersDiffNonCommon(Edits, SeqA, SeqB, Reduced,
-              ACancelFunc, ACancelData, ACancelled);
+            MyersDiffNonCommon(Edits, SeqA, SeqB, Reduced);
           DIFF_ALGO_HISTOGRAM:
-            HistogramDiffNonCommon(Edits, SeqA, SeqB, Reduced,
-              ACancelFunc, ACancelData, ACancelled);
+            HistogramDiffNonCommon(Edits, SeqA, SeqB, Reduced);
           else
             raise EArgumentException.Create('Unknown diff algorithm');
         end;
-        if ACancelled then
-          Exit;
       end;
     end;
   end;
@@ -2727,18 +2645,14 @@ end;
 function DoDiffText(
   const ATextA, ATextB: string;
   AAlgo: Integer;
-  AFlags: Integer;
-  ACancelFunc: TDiffCancelFunc;
-  ACancelData: Pointer;
-  out ACancelled: Boolean
+  AFlags: Integer
 ): TDiffOpcodeArray;
 var
   LinesA, LinesB: TStringArray;
 begin
   LinesA := SplitLinesKeepEnds(ATextA);
   LinesB := SplitLinesKeepEnds(ATextB);
-  Result := DoDiffLines(LinesA, LinesB, AAlgo, AFlags,
-    ACancelFunc, ACancelData, ACancelled);
+  Result := DoDiffLines(LinesA, LinesB, AAlgo, AFlags);
 end;
 
 { ---------- Character-level diff (DIF_CHARS) ---------- }
@@ -2869,10 +2783,7 @@ end;
 
 function DoDiffChars(
   const ATextA, ATextB: string;
-  AFlags: Integer;
-  ACancelFunc: TDiffCancelFunc;
-  ACancelData: Pointer;
-  out ACancelled: Boolean
+  AFlags: Integer
 ): TDiffOpcodeArray;
 var
   TokensA, TokensB: TTokenArray;
@@ -2917,7 +2828,6 @@ var
   end;
 
 begin
-  ACancelled := False;
   SetLength(Result, 0);
 
   // Fast path: identical strings produce a single 'equal' opcode.
@@ -2988,10 +2898,17 @@ begin
   Tokenize(ATextB, TokensB);
 
   // Step 2: WinMerge's size limit (stringdiffs.cpp line 398).
-  // If either word array exceeds 20480 words, skip word-level diff
-  // and mark the entire line as one diff span. This prevents
+  // If either word array exceeds the token limit, skip word-level
+  // diff and mark the entire line as one diff span. This prevents
   // pathological slowdowns on extremely long lines (e.g. minified JS).
+  // WinMerge uses 20480 on 64-bit and 2048 on 32-bit (the O(NP)
+  // algorithm allocates int[M+N+3] arrays — on 32-bit, 2048 keeps
+  // the address space safe). We match that per-platform threshold.
+  {$IFDEF CPU64}
   if (Length(TokensA) > 20480) or (Length(TokensB) > 20480) then
+  {$ELSE}
+  if (Length(TokensA) > 2048) or (Length(TokensB) > 2048) then
+  {$ENDIF}
   begin
     SetLength(Result, 1);
     Result[0].Tag := DIFF_TAG_REPLACE;
@@ -3009,10 +2926,7 @@ begin
   // but the size limit above caps the worst case.
   WordsA := TokensToStrings(TokensA);
   WordsB := TokensToStrings(TokensB);
-  WordOpcodes := DoDiffLines(WordsA, WordsB, DIFF_ALGO_MYERS, AFlags,
-    ACancelFunc, ACancelData, ACancelled);
-  if ACancelled then
-    Exit;
+  WordOpcodes := DoDiffLines(WordsA, WordsB, DIFF_ALGO_MYERS, AFlags);
 
   StrA := AnsiString(ATextA);
   StrB := AnsiString(ATextB);
