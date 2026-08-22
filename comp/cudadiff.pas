@@ -1497,7 +1497,17 @@ begin
         else
         begin
           { Cancel any subrun of MINIMUM or more provisionals within the
-            larger run (analyze.c:530-590) }
+            larger run (analyze.c:544-553). NOTE: the C code does NOT reset
+            consec after `j -= consec` — keeping consec at MINIMUM is what
+            makes the next iteration zero out the discards entry (consec
+            becomes MINIMUM+1 > MINIMUM, hitting the `minimum < consec`
+            branch). Resetting consec here (an earlier bug in this port)
+            caused an infinite loop: back up, reset, hit minimum, back up,
+            reset, ... forever. }
+
+          { MINIMUM is approximate square root of LENGTH/4 (analyze.c:532-542).
+            A subrun of two or more provisionals can stand when LENGTH is at
+            least 16. A subrun of 4 or more can stand when LENGTH >= 64. }
           Minimum := 1;
           Tem := Cardinal(Length_) div 4;
           while True do
@@ -1519,9 +1529,11 @@ begin
               Inc(Consec);
               if Minimum = Consec then
               begin
-                { Back up to start of subrun, to cancel it all }
+                { Back up to start of subrun, to cancel it all.
+                  Do NOT reset Consec here — the C source leaves it at
+                  Minimum so the next iteration makes it Minimum+1 > Minimum,
+                  zeroing out the discards entry. }
                 Dec(J, Consec);
-                Consec := 0;
               end
               else if Minimum < Consec then
                 Discarded[F * Ctx.Files[0].BufferedLines + I + J] := 0;
