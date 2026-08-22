@@ -1,32 +1,112 @@
 (*
-This Source Code Form is subject to the terms of the Mozilla Public
-License, v. 2.0. If a copy of the MPL was not distributed with this
-file, You can obtain one at https://mozilla.org/MPL/2.0/.
+  CudaDiff — Free Pascal port of JGit's line-diff engine.
 
-Copyright (c) 2026 CudaText project contributors
+  Ported from:
+    https://github.com/eclipse-jgit/jgit/tree/v7.7.1.202607240634-r/org.eclipse.jgit/src/org/eclipse/jgit/diff
 
-Implements the line-level diff backend for CudaText: a native Free Pascal
-port of Eclipse JGit's MyersDiff (linear-space, middle-snake) and
-HistogramDiff (with max_chain_length=64 and Myers fallback).
+  Pinned tag: v7.7.1.202607240634-r
+  Commit URL pattern:
+    https://raw.githubusercontent.com/eclipse-jgit/jgit/v7.7.1.202607240634-r/org.eclipse.jgit/src/org/eclipse/jgit/diff/<File>.java
 
-The algorithms are ports of the public JGit code
-(https://github.com/eclipse-jgit/jgit, BSD-3-Clause / EDL-1.0),
-re-implemented in Object Pascal. The behavior is intended to match
-`git diff --myers` and `git diff --histogram` for typical inputs.
+  License: BSD-3-Clause (Eclipse Distribution License v1.0) — same as JGit.
 
-Public entry points:
-  - DoDiffLines: compares two arrays of strings, returns difflib-style
-    opcodes (5-tuples: tag, i1, i2, j1, j2) where tag is an integer
-    enum that the caller can map to 'equal'/'delete'/'insert'/'replace'.
-  - DoDiffText: same but accepts two LF-separated strings; splits them
-    into lines internally.
+  ----------------------------------------------------------------
+  What this unit provides
+  ----------------------------------------------------------------
+  Public types/functions consumed by formmain_py_api.inc:
 
-Character-level diff (DIF_CHARS) is in a separate unit: CudaDiffChars.
+    type
+      TDiffOpcode = record
+        Tag: Integer;   // 0=equal, 1=delete, 2=insert, 3=replace
+                         // (matches DIFF_TAG_* in proc_py_const.pas —
+                         //  those constants are NOT redefined here, see G13)
+        I1, I2, J1, J2: Integer;
+      end;
+      TDiffOpcodeArray = array of TDiffOpcode;
 
-The opcode format matches Python's difflib.SequenceMatcher.get_opcodes()
-exactly so the result can be returned to Python plugins with no
-adaptation layer.
+    function DoDiffTexts(const ATextA, ATextB: string;
+                        AAlgo: Integer;
+                        AFlags: Integer): TDiffOpcodeArray;
+
+  ----------------------------------------------------------------
+  Source files ported
+  ----------------------------------------------------------------
+    JGit file                                | Pascal counterpart
+    -----------------------------------------|---------------------------
+    diff/Sequence.java                       | TSequence
+    diff/SequenceComparator.java             | TSequenceComparator
+    diff/SequenceComparator.reduceCommonStartEnd | TSequenceComparator.ReduceCommonStartEnd
+    diff/RawText.java                        | TRawText
+    diff/RawTextComparator.java              | TRawTextComparator + subclasses
+    diff/Edit.java                           | TEdit + TEditType
+    diff/EditList.java                       | TEditList
+    diff/HashedSequence.java                 | THashedSequence
+    diff/HashedSequenceComparator.java       | THashedSequenceComparator
+    diff/HashedSequencePair.java             | THashedSequencePair
+    diff/Subsequence.java                    | TSubsequence
+    diff/SubsequenceComparator.java           | TSubsequenceComparator
+    diff/DiffAlgorithm.java                  | TDiffAlgorithm (+ DiffAlgorithm.normalize)
+    diff/LowLevelDiffAlgorithm.java          | TLowLevelDiffAlgorithm
+    diff/MyersDiff.java                      | TMyersDiff + TMyersMiddleEdit + TMyersEditPaths
+    diff/HistogramDiff.java                  | THistogramDiff + THistogramDiffState
+    diff/HistogramDiffIndex.java             | THistogramDiffIndex
+    util/IntList.java                         | TIntList
+    util/LongList.java                        | TLongList
+    util/RawCharUtil.java                     | (inlined as class methods of THashUtil)
+    util/RawParseUtils.java (lineMap, nextLF)| TRawText.LineMap (with documented divergence)
+
+  ----------------------------------------------------------------
+  Documented divergences from JGit
+  ----------------------------------------------------------------
+  1. Line splitting (G8): JGit's RawParseUtils.lineMap() splits on \n only.
+     Pascal's TRawText.Create splits on \r\n (treated as one boundary),
+     \r (lone CR), and \n (lone LF) — matching CudaText's split_lines_safe()
+     convention. See TRawText.Create for details.
+
+  2. DIFF_IGN_CASE (G5): JGit has no case-insensitive comparator. We implement
+     ASCII-only tolower per byte (matching WinMerge's io.c:348 behavior, NOT
+     Unicode case folding). See TRawTextComparator*Equals methods.
+
+  3. DIFF_IGN_NUMBERS (G6): JGit has no equivalent. We skip digit bytes
+     entirely when hashing/comparing (matching WinMerge's io.c:307,334,345,356,
+     382,393 behavior — `continue` on isdigit(c)).
+
+  4. DIFF_IGN_EOL (G9): JGit has no equivalent. We trim trailing \r\n / \n / \r
+     from the line before hashing/comparing.
+
+  5. DIFF_IGN_BLANK_LINES (G7): Implemented as a post-diff hunk-suppression
+     pass over the EditList, matching GNU `diff -B` semantics (NOT a
+     comparator tweak). See SuppressBlankLineHunks.
+
+  6. Structural divergence (G31): JGit's RawTextComparator exposes WS_IGNORE_*
+     as mutually-exclusive singletons (DEFAULT, WS_IGNORE_ALL, WS_IGNORE_LEADING,
+     WS_IGNORE_TRAILING, WS_IGNORE_CHANGE). We keep these as separate Pascal
+     subclasses (TRawTextComparatorDefault, TRawTextComparatorWSIgnoreAll,
+     TRawTextComparatorWSIgnoreLeading, TRawTextComparatorWSIgnoreTrailing,
+     TRawTextComparatorWSIgnoreChange) — same class names, same logic, byte-for-byte
+     identical hash values. CASE/NUMBERS/EOL flags are layered on top via
+     helper functions (XformByte, IsSkippedByte, TrimTrailingEOL) called inline
+     in each subclass's Equals/HashRegion. JGit has no precedent for this
+     layering — it's documented as a divergence but produces the same result
+     a Java-side ad-hoc comparator would produce.
+
+  7. Compiler mode (G10, G12): CudaText is compiled with -Cr -Co (range +
+     overflow checks). DJB2 and Knuth multiplicative hash intentionally wrap
+     on overflow, so we wrap the affected code in $PUSH/$R-/$Q-...$POP.
+
+  8. JGit's RawTextComparator.reduceCommonStartEnd has a likely typo:
+     `int bPtr = a.lines.get(e.beginB + 1)` — reads from `a.lines` instead
+     of `b.lines`. We port it correctly (use b.lines for bPtr). This only
+     matters when a and b have different line layouts, which is rare but
+     possible; the bug is harmless in 99% of real-world cases because
+     aPtr/bPtr happen to coincide when sequences are similar.
+
+  9. Pascal strings under objfpc mode with $H+ are AnsiString (UTF-8 bytes
+     by CudaText convention). This matches JGit's byte[] semantics 1:1.
+     We use RawByteString for content storage and access bytes via PByte —
+     no UnicodeString/WideString/UnicodeLowerCase anywhere in this unit.
 *)
+
 unit CudaDiff;
 
 {$mode objfpc}{$H+}
@@ -34,2608 +114,3485 @@ unit CudaDiff;
 
 interface
 
+uses
+  Classes, SysUtils;
+
+{ The DIFF_IGN_* / DIFF_ALGO_* / DIFF_TAG_* constants are defined in
+  proc_py_const.pas. We do NOT redefine them here (G13). formmain_py_api.inc
+  pulls them in via its own uses clause. Inside this unit we use the integer
+  literals directly, with private aliases below for readability. }
+
 const
-  { Algorithm selectors for DoDiffLines / DoDiffText. }
-  DIFF_ALGO_MYERS     = 0;
-  DIFF_ALGO_HISTOGRAM = 1;
+  { Algorithm selectors — must match proc_py_const.pas DIFF_ALGO_* }
+  cAlgoMyers     = 0;
+  cAlgoHistogram = 1;
 
-  { Bitmask flags for DoDiffLines / DoDiffText. Combine with 'or'. }
-  DIFF_IGN_NONE                 = 0;
-  DIFF_IGN_CASE                 = 1;      // case-insensitive
-  DIFF_IGN_WHITESPACE           = 2;      // all whitespace ignored
-  DIFF_IGN_WHITESPACE_CHANGE    = 4;      // runs equal, presence matters
-  DIFF_IGN_WHITESPACE_EOL       = 8;      // trailing whitespace
-  DIFF_IGN_WHITESPACE_BEGINNING = 16;     // leading whitespace
-  DIFF_IGN_BLANK_LINES          = 32;     // blank lines ignored for matching
-  DIFF_IGN_EOL                  = 64;     // CR/LF vs LF treated equal
-  DIFF_IGN_NUMBERS              = 128;    // digit runs treated as equal
+  { Ignore flags — must match proc_py_const.pas DIFF_IGN_* }
+  cIgnCase                 = 1;      // DIFF_IGN_CASE
+  cIgnWhitespace           = 2;      // DIFF_IGN_WHITESPACE
+  cIgnWhitespaceChange     = 4;      // DIFF_IGN_WHITESPACE_CHANGE
+  cIgnWhitespaceEOL        = 8;      // DIFF_IGN_WHITESPACE_EOL
+  cIgnWhitespaceBeginning  = 16;     // DIFF_IGN_WHITESPACE_BEGINNING
+  cIgnBlankLines           = 32;     // DIFF_IGN_BLANK_LINES
+  cIgnEOL                  = 64;     // DIFF_IGN_EOL
+  cIgnNumbers              = 128;    // DIFF_IGN_NUMBERS
 
-  { Opcode tag values returned in TDiffOpcode.Tag.
-    These are integers internally; the Python wrapper converts them
-    to the lowercase strings 'equal'/'delete'/'insert'/'replace'
-    expected by difflib.SequenceMatcher.get_opcodes(). }
-  DIFF_TAG_EQUAL   = 0;
-  DIFF_TAG_DELETE  = 1;
-  DIFF_TAG_INSERT  = 2;
-  DIFF_TAG_REPLACE = 3;
+  { Opcode tag values — must match proc_py_const.pas DIFF_TAG_* }
+  cTagEqual   = 0;
+  cTagDelete  = 1;
+  cTagInsert  = 2;
+  cTagReplace = 3;
 
 type
-  TStringArray = array of string;
-
-  { A single difflib-compatible opcode.
-    Tag is one of DIFF_TAG_*; (I1, I2) is a half-open range into the
-    first sequence and (J1, J2) into the second. Adjacent opcodes
-    share boundaries; the first starts at (0, 0); the last ends at
-    (Len(A), Len(B)). }
+  { Public opcode type. Same layout as CudaDiffChars.TDiffOpcode but a
+    SEPARATE Pascal type (G14) — the two units must not alias. }
   TDiffOpcode = record
-    Tag: Integer;
+    Tag: Integer;   // 0=equal, 1=delete, 2=insert, 3=replace
     I1, I2, J1, J2: Integer;
   end;
   TDiffOpcodeArray = array of TDiffOpcode;
 
-{ Compare two line arrays and return difflib-compatible opcodes. }
-function DoDiffLines(
-  const ALinesA, ALinesB: array of string;
-  AAlgo: Integer;
-  AFlags: Integer
-): TDiffOpcodeArray;
+  { Forward declarations }
+  TSequence = class;
+  TSequenceComparator = class;
+  TRawText = class;
+  TRawTextComparator = class;
+  THashedSequence = class;
+  THashedSequenceComparator = class;
+  TSubsequence = class;
+  TSubsequenceComparator = class;
 
-{ Compare two LF-separated text blocks. Splits each text on #10 and
-  keeps the line terminators attached (matches difflib keepends=True
-  behavior). The last line keeps its terminator if present; if absent,
-  it's still emitted as a separate line. }
-function DoDiffText(
-  const ATextA, ATextB: string;
-  AAlgo: Integer;
-  AFlags: Integer
-): TDiffOpcodeArray;
+  { ----------------------------------------------------------------
+    TEdit — ported from diff/Edit.java (lines 32-262)
+    ----------------------------------------------------------------
+    A modified region between two versions of roughly the same content.
 
-{ Split a string on #10 keeping the terminator attached. Useful for
-  callers who want to pre-split text once and reuse the line array
-  across multiple DoDiffLines calls. }
-function SplitLinesKeepEnds(const AText: string): TStringArray;
+    beginA < endA && beginB == endB  -> delete (B removed region from A)
+    beginA == endA && beginB < endB  -> insert (B inserted region at beginA)
+    beginA < endA && beginB < endB   -> replace (B replaced region in A)
+    beginA == endA && beginB == endB  -> empty (describes nothing)
+  }
+  TEditType = (etInsert, etDelete, etReplace, etEmpty);
+
+  TEdit = record
+    beginA, endA, beginB, endB: Integer;
+    function GetType: TEditType; inline;
+    function IsEmpty: Boolean; inline;
+    function GetLengthA: Integer; inline;
+    function GetLengthB: Integer; inline;
+    procedure Shift(amount: Integer); inline;
+    function Before(const cut: TEdit): TEdit; inline;
+    function After(const cut: TEdit): TEdit; inline;
+    procedure ExtendA; inline;
+    procedure ExtendB; inline;
+    procedure Swap; inline;
+  end;
+  TEditArray = array of TEdit;
+
+  { ----------------------------------------------------------------
+    TEditList — ported from diff/EditList.java (lines 18-56)
+    ----------------------------------------------------------------
+    Specialized list of TEdit records. We use a dynamic array of TEdit
+    (records, value-type) rather than Java's ArrayList<Edit> (references).
+    Edits are mutated via SetItem (write-back after copy). }
+  TEditList = class
+  private
+    FItems: TEditArray;
+    FCount: Integer;
+    procedure Grow;
+  public
+    constructor Create(capacity: Integer = 16);
+    function Size: Integer; inline;
+    function Get(i: Integer): TEdit; inline;
+    procedure SetItem(i: Integer; const e: TEdit); inline;
+    procedure Add(const e: TEdit);
+    procedure AddAt(index: Integer; const e: TEdit);
+    procedure AddAll(other: TEditList);
+    { Remove and return the last element. Matches Java's
+      `queue.remove(queue.size() - 1)`. Raises if empty. }
+    function RemoveLast: TEdit;
+    class function Singleton(const e: TEdit): TEditList; static;
+    property Items[i: Integer]: TEdit read Get write SetItem; default;
+  end;
+
+  { ----------------------------------------------------------------
+    TIntList — ported from util/IntList.java (lines 17-219)
+    ----------------------------------------------------------------
+    A more efficient List<Integer> using a primitive integer array.
+    We omit the sort() method (unused by diff code). }
+  TIntList = class
+  private
+    FEntries: array of Integer;
+    FCount: Integer;
+    procedure Grow;
+  public
+    constructor Create(capacity: Integer = 10);
+    function Size: Integer; inline;
+    function Get(i: Integer): Integer; inline;
+    procedure Clear;
+    procedure Add(n: Integer);
+    procedure SetItem(index: Integer; n: Integer);
+    procedure FillTo(toIndex: Integer; val: Integer);
+  end;
+
+  { ----------------------------------------------------------------
+    TLongList — ported from util/LongList.java (lines 19-155)
+    ----------------------------------------------------------------
+    A more efficient List<Long> using a primitive long array. }
+  TLongList = class
+  private
+    FEntries: array of Int64;
+    FCount: Integer;
+    procedure Grow;
+  public
+    constructor Create(capacity: Integer = 10);
+    function Size: Integer; inline;
+    function Get(i: Integer): Int64; inline;
+    procedure Clear;
+    procedure Add(n: Int64);
+    procedure SetItem(index: Integer; n: Int64);
+    procedure FillTo(toIndex: Integer; val: Int64);
+  end;
+
+  { ----------------------------------------------------------------
+    TSequence — ported from diff/Sequence.java (lines 29-37)
+    ---------------------------------------------------------------- }
+  TSequence = class
+    function Size: Integer; virtual; abstract;
+  end;
+
+  { ----------------------------------------------------------------
+    TSequenceComparator — ported from diff/SequenceComparator.java
+    ----------------------------------------------------------------
+    Equivalence function for a TSequence compared by difference algorithm.
+    Indexes within a sequence are zero-based. }
+  TSequenceComparator = class
+    function Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean; reintroduce; virtual; abstract;
+    function Hash(seq: TSequence; ptr: Integer): Integer; virtual; abstract;
+    function ReduceCommonStartEnd(a: TSequence; b: TSequence; var e: TEdit): TEdit; virtual;
+  end;
+
+  { ----------------------------------------------------------------
+    TRawText — ported from diff/RawText.java (lines 41-590)
+    ----------------------------------------------------------------
+    A Sequence supporting UNIX-formatted text in byte[] format. Elements are
+    lines of the file, delimited by line terminators.
+
+    DIVERGENCE (G8): JGit's RawText uses RawParseUtils.lineMap() which
+    splits on \n only. We split on \r\n (single boundary), \r, and \n —
+    matching CudaText's split_lines_safe() convention. For files with
+    \r\n or \n endings (99% of real-world files), line content is identical
+    to JGit's split. Only files with lone \r endings (old Mac style, rare)
+    produce different line counts. }
+  TRawText = class(TSequence)
+  private
+    FContent: RawByteString;
+    FLines: TIntList;
+    FContentPtr: PByte;  // cached pointer to FContent[0] for fast byte access
+    procedure UpdateContentPtr;
+  public
+    { Constructs a RawText from a UTF-8 byte buffer (Pascal string under
+      objfpc mode with $H+). Matches JGit's RawText(byte[]) constructor. }
+    constructor Create(const input: RawByteString);
+    destructor Destroy; override;
+
+    function Size: Integer; override;
+    { Start byte offset of line i (0-based). Matches JGit's getStart(i) —
+      uses lines[i+1] internally because lines[0] is a MIN_VALUE sentinel. }
+    function GetStart(i: Integer): Integer; inline;
+    { End byte offset of line i (0-based). Matches JGit's getEnd(i) —
+      uses lines[i+2] internally. }
+    function GetEnd(i: Integer): Integer; inline;
+
+    property Content: RawByteString read FContent;
+    property ContentPtr: PByte read FContentPtr;
+    property Lines: TIntList read FLines;
+  end;
+
+  { ----------------------------------------------------------------
+    TRawTextComparator — ported from diff/RawTextComparator.java
+    ----------------------------------------------------------------
+    Equivalence function for TRawText.
+
+    Subclasses (one per JGit singleton):
+      TRawTextComparatorDefault        -> RawTextComparator.DEFAULT
+      TRawTextComparatorWSIgnoreAll    -> RawTextComparator.WS_IGNORE_ALL
+      TRawTextComparatorWSIgnoreLeading -> RawTextComparator.WS_IGNORE_LEADING
+      TRawTextComparatorWSIgnoreTrailing -> RawTextComparator.WS_IGNORE_TRAILING
+      TRawTextComparatorWSIgnoreChange  -> RawTextComparator.WS_IGNORE_CHANGE
+
+    Each subclass overrides Equals + HashRegion. The Hash() and
+    ReduceCommonStartEnd() implementations live here (shared across subclasses).
+
+    FFlags holds the non-WS ignore flags (CASE, NUMBERS, EOL) — these
+    are applied uniformly across all WS modes via helper functions
+    XformByte / IsSkippedByte / TrimTrailingEOL. }
+  TRawTextComparator = class(TSequenceComparator)
+  private
+    FFlags: Integer;  // CASE | NUMBERS | EOL (WS flags handled by subclass)
+  protected
+    { JGit's RawTextComparator.hashCode — uses RawTextComparator.hashRegion.
+      Implemented per-subclass. }
+    function HashRegion(raw: PByte; ptr, end_: Integer): Integer; virtual; abstract;
+  public
+    constructor Create(AFlags: Integer = 0);
+
+    { Ported from RawTextComparator.hash() (lines 223-228).
+      begin = lines[lno+1], end = lines[lno+2]. }
+    function Hash(seq: TSequence; ptr: Integer): Integer; override;
+
+    { Ported from RawTextComparator.reduceCommonStartEnd() (lines 231-282).
+      Fast byte-level prefix/suffix trim, then super.reduceCommonStartEnd
+      for the remaining line-level trim. }
+    function ReduceCommonStartEnd(a: TSequence; b: TSequence; var e: TEdit): TEdit; override;
+
+    property Flags: Integer read FFlags;
+  end;
+
+  { DEFAULT: no special treatment — strict byte equality.
+    Ported from RawTextComparator.DEFAULT (lines 25-53). }
+  TRawTextComparatorDefault = class(TRawTextComparator)
+  public
+    function Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean; override;
+    function HashRegion(raw: PByte; ptr, end_: Integer): Integer; override;
+  end;
+
+  { WS_IGNORE_ALL: ignores all whitespace.
+    Ported from RawTextComparator.WS_IGNORE_ALL (lines 56-104). }
+  TRawTextComparatorWSIgnoreAll = class(TRawTextComparator)
+  public
+    function Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean; override;
+    function HashRegion(raw: PByte; ptr, end_: Integer): Integer; override;
+  end;
+
+  { WS_IGNORE_LEADING: ignore leading whitespace.
+    Ported from RawTextComparator.WS_IGNORE_LEADING (lines 109-141). }
+  TRawTextComparatorWSIgnoreLeading = class(TRawTextComparator)
+  public
+    function Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean; override;
+    function HashRegion(raw: PByte; ptr, end_: Integer): Integer; override;
+  end;
+
+  { WS_IGNORE_TRAILING: ignore trailing whitespace.
+    Ported from RawTextComparator.WS_IGNORE_TRAILING (lines 144-176). }
+  TRawTextComparatorWSIgnoreTrailing = class(TRawTextComparator)
+  public
+    function Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean; override;
+    function HashRegion(raw: PByte; ptr, end_: Integer): Integer; override;
+  end;
+
+  { WS_IGNORE_CHANGE: ignore whitespace occurring between non-whitespace chars.
+    Ported from RawTextComparator.WS_IGNORE_CHANGE (lines 179-221). }
+  TRawTextComparatorWSIgnoreChange = class(TRawTextComparator)
+  public
+    function Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean; override;
+    function HashRegion(raw: PByte; ptr, end_: Integer): Integer; override;
+  end;
+
+  { ----------------------------------------------------------------
+    THashedSequence — ported from diff/HashedSequence.java
+    ----------------------------------------------------------------
+    Wraps a TSequence to assign hash codes to elements. Acts as a proxy
+    for the real sequence, caching element hash codes. }
+  THashedSequence = class(TSequence)
+  private
+    FBase: TSequence;
+    FHashes: array of Integer;
+    function GetHash(i: Integer): Integer; inline;
+  public
+    constructor Create(base: TSequence; hashes: array of Integer);
+    function Size: Integer; override;
+    property Base: TSequence read FBase;
+    property Hashes[i: Integer]: Integer read GetHash;
+  end;
+
+  { ----------------------------------------------------------------
+    THashedSequenceComparator — ported from HashedSequenceComparator.java
+    ----------------------------------------------------------------
+    Wrap another comparator for use with THashedSequence. Evaluates the
+    cached hash code before testing the underlying comparator's equality. }
+  THashedSequenceComparator = class(TSequenceComparator)
+  private
+    FCmp: TSequenceComparator;
+  public
+    constructor Create(cmp: TSequenceComparator);
+    function Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean; override;
+    function Hash(seq: TSequence; ptr: Integer): Integer; override;
+    function ReduceCommonStartEnd(a: TSequence; b: TSequence; var e: TEdit): TEdit; override;
+    property Cmp: TSequenceComparator read FCmp;
+  end;
+
+  { ----------------------------------------------------------------
+    THashedSequencePair — ported from HashedSequencePair.java
+    ----------------------------------------------------------------
+    Wraps two TSequence instances to cache their element hash codes. }
+  THashedSequencePair = class
+  private
+    FCmp: TSequenceComparator;
+    FBaseA: TSequence;
+    FBaseB: TSequence;
+    FCachedA: THashedSequence;
+    FCachedB: THashedSequence;
+    function Wrap(base: TSequence): THashedSequence;
+  public
+    constructor Create(cmp: TSequenceComparator; a, b: TSequence);
+    destructor Destroy; override;
+    function GetComparator: THashedSequenceComparator;
+    function GetA: THashedSequence;
+    function GetB: THashedSequence;
+  end;
+
+  { ----------------------------------------------------------------
+    TSubsequence — ported from diff/Subsequence.java
+    ----------------------------------------------------------------
+    Wraps a TSequence to have a narrower range of elements. Translates
+    element indexes on the fly by adding `begin` to them. }
+  TSubsequence = class(TSequence)
+  private
+    FBase: TSequence;
+    FBegin: Integer;
+    FSize: Integer;
+  public
+    constructor Create(base: TSequence; begn, end_: Integer);
+    function Size: Integer; override;
+    class function A(base: TSequence; const region: TEdit): TSubsequence; static;
+    class function B(base: TSequence; const region: TEdit): TSubsequence; static;
+    class procedure ToBaseEdit(var e: TEdit; sa, sb: TSubsequence); static;
+    class function ToBaseEditList(edits: TEditList; sa, sb: TSubsequence): TEditList; static;
+    property Base: TSequence read FBase;
+    property BeginOffset: Integer read FBegin;
+  end;
+
+  { ----------------------------------------------------------------
+    TSubsequenceComparator — ported from SubsequenceComparator.java
+    ---------------------------------------------------------------- }
+  TSubsequenceComparator = class(TSequenceComparator)
+  private
+    FCmp: TSequenceComparator;
+  public
+    constructor Create(cmp: TSequenceComparator);
+    function Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean; override;
+    function Hash(seq: TSequence; ptr: Integer): Integer; override;
+    function ReduceCommonStartEnd(a: TSequence; b: TSequence; var e: TEdit): TEdit; override;
+    property Cmp: TSequenceComparator read FCmp;
+  end;
+
+  { ----------------------------------------------------------------
+    TDiffAlgorithm — ported from diff/DiffAlgorithm.java
+    ---------------------------------------------------------------- }
+  TDiffAlgorithm = class
+  public
+    { Ported from DiffAlgorithm.diff() (lines 79-105).
+      Reduces common start/end, then dispatches by EditType. }
+    function Diff(cmp: TSequenceComparator; a, b: TSequence): TEditList;
+    { Subclass-specific implementation. JGit's diffNonCommon() is the
+      post-prefix/suffix-trim entry point. }
+    function DiffNonCommon(cmp: TSequenceComparator; a, b: TSequence): TEditList; virtual; abstract;
+    { Ported from DiffAlgorithm.normalize() (lines 186-210).
+      Shifts INSERT/DELETE edits to their latest possible position.
+      Called by Diff() after diffNonCommon returns. }
+    class function Normalize(cmp: TSequenceComparator; e: TEditList; a, b: TSequence): TEditList; static;
+  end;
+
+  { ----------------------------------------------------------------
+    TLowLevelDiffAlgorithm — ported from LowLevelDiffAlgorithm.java
+    ---------------------------------------------------------------- }
+  TLowLevelDiffAlgorithm = class(TDiffAlgorithm)
+  public
+    function DiffNonCommon(cmp: TSequenceComparator; a, b: TSequence): TEditList; override;
+    { Subclass-specific. Wraps sequences in HashedSequencePair first, then
+      calls the algorithm-specific method with a (0, a.size, 0, b.size) region. }
+    procedure DiffNonCommonLow(edits: TEditList;
+      cmp: THashedSequenceComparator;
+      a, b: THashedSequence;
+      const region: TEdit); virtual; abstract;
+  end;
+
+  { ----------------------------------------------------------------
+    TMyersDiff — ported from diff/MyersDiff.java
+    ----------------------------------------------------------------
+    O(ND) Myers diff with linear-space middle-snake optimization.
+
+    The basic idea: line numbers of text A as columns ("x"), lines of text B
+    as rows ("y"). Find shortest "edit path" from upper-left to lower-right
+    where you can go horizontally or vertically, but diagonal (x+1,y+1) only
+    if line x in A equals line y in B.
+
+    Optimization: generate D-paths simultaneously from both sides. When
+    the ends meet, we've found "the middle" of the path. From the end
+    points of that diagonal part, we generate the rest recursively.
+    This requires only linear space. }
+  TMyersDiff = class(TLowLevelDiffAlgorithm)
+  public
+    procedure DiffNonCommonLow(edits: TEditList;
+      cmp: THashedSequenceComparator;
+      a, b: THashedSequence;
+      const region: TEdit); override;
+  end;
+
+  { ----------------------------------------------------------------
+    THistogramDiff — ported from diff/HistogramDiff.java
+    ----------------------------------------------------------------
+    Extended Bram Cohen patience diff. Builds a histogram of occurrences
+    for each element of A. Scans B for matching elements with the lowest
+    occurrence count; splits region around that LCS, recurses. Falls back
+    to MyersDiff when maxChainLength (default 64) is exceeded. }
+  THistogramDiff = class(TLowLevelDiffAlgorithm)
+  private
+    FFallback: TDiffAlgorithm;
+    FMaxChainLength: Integer;
+  public
+    constructor Create;
+    procedure SetFallbackAlgorithm(alg: TDiffAlgorithm);
+    procedure SetMaxChainLength(maxLen: Integer);
+    procedure DiffNonCommonLow(edits: TEditList;
+      cmp: THashedSequenceComparator;
+      a, b: THashedSequence;
+      const region: TEdit); override;
+    property Fallback: TDiffAlgorithm read FFallback;
+    property MaxChainLength: Integer read FMaxChainLength;
+  end;
+
+{ ----------------------------------------------------------------
+  Public entry point — called by formmain_py_api.inc
+  ---------------------------------------------------------------- }
+function DoDiffTexts(const ATextA, ATextB: string;
+                     AAlgo: Integer;
+                     AFlags: Integer): TDiffOpcodeArray;
 
 implementation
 
-{ Free Pascal on 64-bit evaluates 32-bit arithmetic in 64-bit signed
-  and then range-checks the assignment back to the 32-bit variable.
-  This means Cardinal wraparound (djb2 in HashLine, Knuth mix in
-  HashSeq) trips ERangeError under RANGECHECKS ON — not EIntOverflow,
-  since the 64-bit intermediate never overflows. The Int64-to-Integer
-  narrowing in SnakeX/SnakeY/RecNext/RecPtr/RecCnt is also
-  range-checked. Those sites disable RANGECHECKS locally below via
-  PUSH/POP blocks. The Myers V arrays use raw PInteger/PInt64 offsets,
-  which are never range-checked, so they need no directive.
-  OVERFLOWCHECKS is left at the project default everywhere — nothing
-  in this unit needs it off. }
-
-uses
-  SysUtils;
-
+{ ------------------------------------------------------------------
+  HistogramDiffIndex constants — ported from diff/HistogramDiffIndex.java
+  (lines 28-38).
+  JGit declares these as `private static final int` inside the class.
+  Pascal's objfpc mode doesn't support `class const` in classes
+  (only in Delphi mode), so we declare them at unit scope instead.
+  The values are the same as JGit's and referenced directly by
+  THistogramDiffIndex methods below.
+  ------------------------------------------------------------------ }
 const
-  { Histogram chain-length cutoff. Matches JGit's default and Git's
-    xhistogram.c index->max_chain_length = 64. When a hash bucket in
-    sequence A exceeds this many distinct elements, the histogram
-    algorithm gives up on the region and falls back to Myers. }
-  HISTOGRAM_MAX_CHAIN_LENGTH = 64;
+  HDI_REC_NEXT_SHIFT = 28 + 8;       // 36
+  HDI_REC_PTR_SHIFT  = 8;
+  HDI_REC_PTR_MASK   = (1 shl 28) - 1;
+  HDI_REC_CNT_MASK   = (1 shl 8) - 1;
+  HDI_MAX_PTR        = HDI_REC_PTR_MASK;
+  HDI_MAX_CNT        = (1 shl 8) - 1;
 
-  { Bit-packing constants for histogram records (mirrors JGit's
-    HistogramDiffIndex.java). Fields are packed into an Int64:
-      bits 36..63 : index of next record in same hash chain (REC_NEXT)
-      bits  8..35 : first element index in A (REC_PTR, 28 bits)
-      bits  0..7  : occurrence count, capped at 255 (REC_CNT)
-    The 28-bit pointer limits sequences to 2^28 - 1 = 268,435,455
-    elements, same as JGit. }
-  REC_NEXT_SHIFT = 36;
-  REC_PTR_SHIFT  = 8;
-  REC_PTR_MASK   = (1 shl 28) - 1;
-  REC_CNT_MASK   = (1 shl 8) - 1;
-  MAX_PTR        = REC_PTR_MASK;
-  MAX_CNT        = (1 shl 8) - 1;
+{ ------------------------------------------------------------------
+  Helper functions — byte transforms for CASE/NUMBERS/EOL flags.
+  These are NOT part of JGit (which has no such flags) — documented
+  divergence from JGit, applied uniformly across all WS comparators.
+  ------------------------------------------------------------------ }
 
-  { Knuth's multiplicative hash constant, used to mix hash bits before
-    taking the table index (same value JGit uses: 0x9e370001).
-    Typed as Cardinal to ensure 32-bit unsigned multiplication. }
-  HASH_MIX_CONSTANT: Cardinal = $9e370001;
-
-  { Initial djb2 hash seed. Same as JGit's RawTextComparator. }
-  DJB2_SEED = 5381;
-
-type
-  TDiffEditType = (detInsert, detDelete, detReplace, detEmpty);
-
-  { A modified region between two sequences. Mirrors JGit's Edit class.
-    All indices are 0-based, half-open [begin, end). Mutable by design
-    (the algorithms adjust begin/end in place during prefix/suffix trim
-    and edit normalization). }
-  TDiffEdit = record
-    BeginA, EndA, BeginB, EndB: Integer;
-    function GetType: TDiffEditType;
-    function IsEmpty: Boolean;
-    function LengthA: Integer;
-    function LengthB: Integer;
-    procedure Shift(AAmount: Integer);
-    class function Create(AAs, AAe, ABs, ABe: Integer): TDiffEdit; static;
-    function Before(const ACut: TDiffEdit): TDiffEdit;
-    function After(const ACut: TDiffEdit): TDiffEdit;
-  end;
-
-  { Growable dynamic array of TDiffEdit. Append is amortized O(1). }
-  TDiffEditList = record
-    FItems: array of TDiffEdit;
-    FCount: Integer;
-    procedure Init;
-    procedure Add(const AEdit: TDiffEdit);
-    function GetItem(AIndex: Integer): TDiffEdit;
-    procedure SetItem(AIndex: Integer; const AEdit: TDiffEdit);
-    function Count: Integer;
-    property Items[AIndex: Integer]: TDiffEdit read GetItem write SetItem;
-  end;
-
-  PLineSequence = ^TLineSequence;
-
-  { Wraps an array of lines together with their pre-computed hashes and
-    (optionally) normalized copies used for ignore-flag matching.
-    When AFlags = 0, FNormalized is empty and hashing/equality use the
-    original lines directly (saves memory in the common case). }
-  TLineSequence = record
-    FLines: TStringArray;
-    FNormalized: TStringArray;  // empty if no ignore flags
-    FHashes: array of Integer;
-    FHasNormalization: Boolean;
-    procedure Init(const ALines: array of string; AFlags: Integer);
-    function EqualsAt(AIdxThis: Integer; const AOther: TLineSequence; AIdxOther: Integer): Boolean;
-    function HashAt(AIdx: Integer): Integer;
-    function Size: Integer;
-  end;
-
-  { Scratch state for MyersDiff, reused across recursion levels to
-    avoid repeated heap allocation. Uses raw pointers (PInteger / PInt64)
-    for the V arrays instead of dynamic arrays — raw pointer indexing
-    is never range-checked, which eliminates per-access bounds-check
-    overhead (26.6s on the 3MB HTML test with checked arrays). The
-    pointer is adjusted by OffsetK so that negative k indices work
-    without bounds checks, exactly like LGenerics' LcsMyersImpl does
-    with PSizeInt. }
-  TMyersState = record
-    SeqA, SeqB: PLineSequence;
-
-    // V arrays — allocated once at top level, accessed via pointers.
-    FwdXBuf: array of Integer;   // raw storage
-    BwdXBuf: array of Integer;
-    FwdSnakeBuf: array of Int64;
-    BwdSnakeBuf: array of Int64;
-    FwdX: PInteger;    // pointer into FwdXBuf, adjusted by OffsetK
-    BwdX: PInteger;    // pointer into BwdXBuf, adjusted by OffsetK
-    FwdSnake: PInt64;  // pointer into FwdSnakeBuf, adjusted by OffsetK
-    BwdSnake: PInt64;  // pointer into BwdSnakeBuf, adjusted by OffsetK
-    OffsetK: Integer;
-
-    BeginA, EndA, BeginB, EndB: Integer;
-    MinK, MaxK: Integer;
-    FwdMiddleK, BwdMiddleK: Integer;
-    FwdBeginK, FwdEndK: Integer;
-    BwdBeginK, BwdEndK: Integer;
-
-    MiddleEdit: TDiffEdit;
-    BigSnake: Boolean;  { Set when a snake > SNAKE_LIMIT is found }
-  end;
-
-  { Result of discard_confusing_lines preprocessing for one side.
-    FDiscarded[I] is True when line (ARegionBegin + I) was discarded
-    (matches nothing in the other file, or matches too many lines and
-    survived the provisional-cancel rules).
-    FKeptIdx[J] gives the offset (relative to ARegionBegin) of the J-th
-    kept line, for J in [0..FKeptCount-1]. Used to translate virtual
-    indices back to real ones after Myers runs on the kept subset. }
-  TDiscardMap = record
-    FDiscarded: array of Boolean;
-    FKeptIdx: array of Integer;
-    FKeptCount: Integer;
-    FRegionLen: Integer;
-  end;
-
-  { HistogramDiff per-region scratch. }
-  THistogramIndex = record
-    FMaxChainLength: Integer;
-    FSeqA, FSeqB: PLineSequence;
-    FRegion: TDiffEdit;
-    FTable: array of Integer;
-    FKeyShift: Integer;
-    FRecs: array of Int64;
-    FRecCnt: Integer;
-    FNext: array of Integer;
-    FRecIdx: array of Integer;
-    FPtrShift: Integer;
-    FLcs: TDiffEdit;
-    FCnt: Integer;
-    FHasCommon: Boolean;
-    FFallback: Boolean;        // True if scanA exceeded chain length or LCS search exhausted
-
-    procedure Init(AMaxChainLength: Integer; ASeqA, ASeqB: PLineSequence; ARegion: TDiffEdit);
-    function FindLongestCommonSequence: TDiffEdit;
-    function ScanA: Boolean;
-    function TryLongestCommonSequence(ABPtr: Integer): Integer;
-    function HashSeq(ASeq: PLineSequence; AIdx: Integer): Integer;
-    class function RecCreate(ANext, APtr, ACnt: Integer): Int64; static;
-    class function RecNext(ARec: Int64): Integer; static;
-    class function RecPtr(ARec: Int64): Integer; static;
-    class function RecCnt(ARec: Int64): Integer; static;
-    class function TableBits(ASz: Integer): Integer; static;
-  end;
-
-{ ---------- Utility functions ---------- }
-
-function MaxI(A, B: Integer): Integer; inline;
+{ Apply ASCII-only tolower to a byte when DIFF_IGN_CASE is set.
+  Matches WinMerge's io.c:348 behavior. Unicode case folding is NOT
+  performed because it can change byte length (e.g. İ -> i̇). }
+function XformByte(c: Byte; AFlags: Integer): Byte; inline;
 begin
-  if A > B then Result := A else Result := B;
+  if (AFlags and cIgnCase) <> 0 then
+    if (c >= $41) and (c <= $5A) then  // 'A'..'Z'
+      Exit(c or $20);
+  Result := c;
 end;
 
-function MinI(A, B: Integer): Integer; inline;
+{ Returns True if this byte should be skipped (under DIFF_IGN_NUMBERS).
+  Matches WinMerge's io.c:307,334,345,356,382,393 — `continue` past
+  every digit byte. Only ASCII [0-9] counts; non-ASCII digits do not. }
+function IsSkippedByte(c: Byte; AFlags: Integer): Boolean; inline;
 begin
-  if A < B then Result := A else Result := B;
+  if (AFlags and cIgnNumbers) <> 0 then
+    if (c >= $30) and (c <= $39) then  // '0'..'9'
+      Exit(True);
+  Result := False;
 end;
 
-function IsWhitespaceByte(C: AnsiChar): Boolean; inline;
+{ Returns True if c is one of the whitespace bytes JGit's RawCharUtil
+  recognizes: \r, \n, \t, space. Ported from RawCharUtil.isWhitespace()
+  (util/RawCharUtil.java:35-37). }
+function IsWhitespaceByte(c: Byte): Boolean; inline;
 begin
-  Result := (C = ' ') or (C = #9) or (C = #10) or (C = #13);
+  Result := (c = $0D) or (c = $0A) or (c = $09) or (c = $20);
 end;
 
-{$PUSH}
-{$RANGECHECKS OFF}  { Cardinal(AY) cast can be out of Integer range;
-                       Int64-to-Integer narrowing in SnakeX/SnakeY. }
-function PackSnake(AX, AY: Integer): Int64; inline;
+{ Trims trailing whitespace bytes from [ptr, end_).
+  Ported from RawCharUtil.trimTrailingWhitespace() (util/RawCharUtil.java:52-58).
+  Returns the new end position. }
+function TrimTrailingWhitespace(raw: PByte; start, end_: Integer): Integer; inline;
+var
+  p: Integer;
 begin
-  Result := (Int64(AX) shl 32) or Int64(Cardinal(AY));
+  p := end_ - 1;
+  while (start <= p) and IsWhitespaceByte(raw[p]) do
+    Dec(p);
+  Result := p + 1;
 end;
 
-function SnakeX(ASnake: Int64): Integer; inline;
+{ Trims leading whitespace bytes from [ptr, end_).
+  Ported from RawCharUtil.trimLeadingWhitespace() (util/RawCharUtil.java:73-78).
+  Returns the new start position. }
+function TrimLeadingWhitespace(raw: PByte; start, end_: Integer): Integer; inline;
 begin
-  Result := Int64(ASnake) shr 32;
+  while (start < end_) and IsWhitespaceByte(raw[start]) do
+    Inc(start);
+  Result := start;
 end;
 
-function SnakeY(ASnake: Int64): Integer; inline;
+{ Trims trailing EOL (\r\n, \n, \r) from [ptr, end_) when DIFF_IGN_EOL is set.
+  DIVERGENCE from JGit (G9) — JGit has no such comparator. }
+function TrimTrailingEOL(raw: PByte; ptr, end_: Integer; AFlags: Integer): Integer; inline;
 begin
-  Result := Integer(Cardinal(Int64(ASnake) and $FFFFFFFF));
+  if (AFlags and cIgnEOL) <> 0 then
+  begin
+    if end_ > ptr then
+    begin
+      if raw[end_ - 1] = $0A then  // \n
+      begin
+        Dec(end_);
+        if (end_ > ptr) and (raw[end_ - 1] = $0D) then  // \r before \n
+          Dec(end_);
+      end
+      else if raw[end_ - 1] = $0D then  // \r
+        Dec(end_);
+    end;
+  end;
+  Result := end_;
+end;
+
+{ ------------------------------------------------------------------
+  DJB2 hash helper — ported from RawTextComparator.DEFAULT.hashRegion
+  (diff/RawTextComparator.java:47-52).
+
+  DJB2: seed = 5381, multiplier = 33 (implemented as (hash << 5) + hash).
+  Per-byte: hash := ((hash shl 5) + hash) + (raw[ptr] and $FF).
+  Wraps on overflow intentionally — must use $PUSH/$R-/$Q- around it
+  to match JGit's behavior under -Cr -Co (G10, G12). }
+function Djb2Hash(raw: PByte; ptr, end_: Integer): Integer;
+{$PUSH}{$R-}{$Q-}
+var
+  h: Integer;
+begin
+  h := 5381;
+  while ptr < end_ do
+  begin
+    h := ((h shl 5) + h) + (raw[ptr] and $FF);
+    Inc(ptr);
+  end;
+  Result := h;
 end;
 {$POP}
 
-{ ---------- TDiffEdit ---------- }
-
-function TDiffEdit.GetType: TDiffEditType;
+{ DJB2 hash with CASE-fold transform applied per byte.
+  DIVERGENCE: WinMerge-style ASCII tolower on bytes (G5). }
+function Djb2HashCase(raw: PByte; ptr, end_: Integer; AFlags: Integer): Integer;
+{$PUSH}{$R-}{$Q-}
+var
+  h: Integer;
+  c: Byte;
 begin
-  if BeginA < EndA then
+  h := 5381;
+  while ptr < end_ do
   begin
-    if BeginB < EndB then
-      Exit(detReplace);
-    Exit(detDelete);
+    c := raw[ptr];
+    if (AFlags and cIgnNumbers) <> 0 then
+      if (c >= $30) and (c <= $39) then
+      begin
+        Inc(ptr);
+        Continue;
+      end;
+    h := ((h shl 5) + h) + (XformByte(c, AFlags) and $FF);
+    Inc(ptr);
   end;
-  if BeginB < EndB then
-    Exit(detInsert);
-  Result := detEmpty;
+  Result := h;
+end;
+{$POP}
+
+{ ------------------------------------------------------------------
+  TEdit methods
+  ------------------------------------------------------------------ }
+
+function TEdit.GetType: TEditType;
+begin
+  if beginA < endA then
+  begin
+    if beginB < endB then
+      Exit(etReplace);
+    Exit(etDelete);
+  end;
+  if beginB < endB then
+    Exit(etInsert);
+  Result := etEmpty;
 end;
 
-function TDiffEdit.IsEmpty: Boolean;
+function TEdit.IsEmpty: Boolean;
 begin
-  Result := (BeginA = EndA) and (BeginB = EndB);
+  Result := (beginA = endA) and (beginB = endB);
 end;
 
-function TDiffEdit.LengthA: Integer;
+function TEdit.GetLengthA: Integer;
 begin
-  Result := EndA - BeginA;
+  Result := endA - beginA;
 end;
 
-function TDiffEdit.LengthB: Integer;
+function TEdit.GetLengthB: Integer;
 begin
-  Result := EndB - BeginB;
+  Result := endB - beginB;
 end;
 
-procedure TDiffEdit.Shift(AAmount: Integer);
+procedure TEdit.Shift(amount: Integer);
 begin
-  Inc(BeginA, AAmount);
-  Inc(EndA, AAmount);
-  Inc(BeginB, AAmount);
-  Inc(EndB, AAmount);
+  Inc(beginA, amount);
+  Inc(endA, amount);
+  Inc(beginB, amount);
+  Inc(endB, amount);
 end;
 
-class function TDiffEdit.Create(AAs, AAe, ABs, ABe: Integer): TDiffEdit;
+function TEdit.Before(const cut: TEdit): TEdit;
 begin
-  Result.BeginA := AAs;
-  Result.EndA := AAe;
-  Result.BeginB := ABs;
-  Result.EndB := ABe;
+  Result.beginA := beginA;
+  Result.endA := cut.beginA;
+  Result.beginB := beginB;
+  Result.endB := cut.beginB;
 end;
 
-function TDiffEdit.Before(const ACut: TDiffEdit): TDiffEdit;
+function TEdit.After(const cut: TEdit): TEdit;
 begin
-  Result := TDiffEdit.Create(BeginA, ACut.BeginA, BeginB, ACut.BeginB);
+  Result.beginA := cut.endA;
+  Result.endA := endA;
+  Result.beginB := cut.endB;
+  Result.endB := endB;
 end;
 
-function TDiffEdit.After(const ACut: TDiffEdit): TDiffEdit;
+procedure TEdit.ExtendA;
 begin
-  Result := TDiffEdit.Create(ACut.EndA, EndA, ACut.EndB, EndB);
+  Inc(endA);
 end;
 
-{ ---------- TDiffEditList ---------- }
-
-procedure TDiffEditList.Init;
+procedure TEdit.ExtendB;
 begin
-  FItems := nil;
+  Inc(endB);
+end;
+
+procedure TEdit.Swap;
+var
+  sBegin, sEnd: Integer;
+begin
+  sBegin := beginA;
+  sEnd := endA;
+  beginA := beginB;
+  endA := endB;
+  beginB := sBegin;
+  endB := sEnd;
+end;
+
+{ ------------------------------------------------------------------
+  TEditList methods
+  ------------------------------------------------------------------ }
+
+constructor TEditList.Create(capacity: Integer);
+begin
+  inherited Create;
+  SetLength(FItems, capacity);
   FCount := 0;
 end;
 
-procedure TDiffEditList.Add(const AEdit: TDiffEdit);
+procedure TEditList.Grow;
 var
-  NewCap, I: Integer;
-  NewItems: array of TDiffEdit;
+  newCap: Integer;
 begin
-  if FCount = Length(FItems) then
-  begin
-    if Length(FItems) = 0 then
-      NewCap := 16
-    else
-      NewCap := Length(FItems) * 2;
-    SetLength(NewItems, NewCap);
-    for I := 0 to FCount - 1 do
-      NewItems[I] := FItems[I];
-    FItems := NewItems;
-  end;
-  FItems[FCount] := AEdit;
-  Inc(FCount);
+  if Length(FItems) = 0 then
+    newCap := 16
+  else
+    newCap := (Length(FItems) + 16) * 3 div 2;
+  SetLength(FItems, newCap);
 end;
 
-function TDiffEditList.GetItem(AIndex: Integer): TDiffEdit;
-begin
-  Result := FItems[AIndex];
-end;
-
-procedure TDiffEditList.SetItem(AIndex: Integer; const AEdit: TDiffEdit);
-begin
-  FItems[AIndex] := AEdit;
-end;
-
-function TDiffEditList.Count: Integer;
+function TEditList.Size: Integer;
 begin
   Result := FCount;
 end;
 
-{ ---------- Line normalization ---------- }
+function TEditList.Get(i: Integer): TEdit;
+begin
+  if (i < 0) or (i >= FCount) then
+    raise EArgumentOutOfRangeException.CreateFmt('TEditList.Get(%d) out of range [0, %d)', [i, FCount]);
+  Result := FItems[i];
+end;
 
-{ Apply ignore-flag normalization to a single line.
-  Returns the normalized form used for both hashing and equality.
-  If AFlags = 0, returns the original line unchanged (caller skips
-  normalization entirely in that case). }
-function NormalizeLine(const ALine: string; AFlags: Integer): string;
+procedure TEditList.SetItem(i: Integer; const e: TEdit);
+begin
+  if (i < 0) or (i >= FCount) then
+    raise EArgumentOutOfRangeException.CreateFmt('TEditList.SetItem(%d) out of range [0, %d)', [i, FCount]);
+  FItems[i] := e;
+end;
+
+procedure TEditList.Add(const e: TEdit);
+begin
+  if FCount = Length(FItems) then
+    Grow;
+  FItems[FCount] := e;
+  Inc(FCount);
+end;
+
+procedure TEditList.AddAt(index: Integer; const e: TEdit);
+begin
+  if (index < 0) or (index > FCount) then
+    raise EArgumentOutOfRangeException.CreateFmt('TEditList.AddAt(%d) out of range [0, %d]', [index, FCount]);
+  if FCount = Length(FItems) then
+    Grow;
+  if index < FCount then
+    Move(FItems[index], FItems[index + 1], (FCount - index) * SizeOf(TEdit));
+  FItems[index] := e;
+  Inc(FCount);
+end;
+
+procedure TEditList.AddAll(other: TEditList);
 var
-  InStr, OutStr: AnsiString;
-  I, Len: Integer;
-  C: AnsiChar;
-  LastWasWS, SawNonWS: Boolean;
+  i: Integer;
 begin
-  if AFlags = 0 then
-    Exit(ALine);
-
-  InStr := AnsiString(ALine);
-  Len := Length(InStr);
-
-  // DIFF_IGN_EOL: strip any combination of trailing CR/LF.
-  if (AFlags and DIFF_IGN_EOL) <> 0 then
-    while (Len > 0) and ((InStr[Len] = #10) or (InStr[Len] = #13)) do
-      Dec(Len);
-
-  // DIFF_IGN_WHITESPACE_EOL: strip trailing whitespace.
-  if (AFlags and DIFF_IGN_WHITESPACE_EOL) <> 0 then
-    while (Len > 0) and IsWhitespaceByte(InStr[Len]) do
-      Dec(Len);
-
-  // Start index for output scan (after optional leading-whitespace strip).
-  I := 1;
-  if (AFlags and DIFF_IGN_WHITESPACE_BEGINNING) <> 0 then
-    while (I <= Len) and IsWhitespaceByte(InStr[I]) do
-      Inc(I);
-
-  OutStr := '';
-  LastWasWS := False;
-  SawNonWS := False;
-
-  if (AFlags and DIFF_IGN_WHITESPACE) <> 0 then
-  begin
-    // Drop all whitespace entirely.
-    while I <= Len do
-    begin
-      C := InStr[I];
-      if not IsWhitespaceByte(C) then
-      begin
-        OutStr := OutStr + C;
-        SawNonWS := True;
-      end;
-      Inc(I);
-    end;
-  end
-  else if (AFlags and DIFF_IGN_WHITESPACE_CHANGE) <> 0 then
-  begin
-    // Collapse runs of whitespace to a single space.
-    while I <= Len do
-    begin
-      C := InStr[I];
-      if IsWhitespaceByte(C) then
-      begin
-        if not LastWasWS then
-        begin
-          OutStr := OutStr + ' ';
-          LastWasWS := True;
-        end;
-      end
-      else
-      begin
-        OutStr := OutStr + C;
-        LastWasWS := False;
-        SawNonWS := True;
-      end;
-      Inc(I);
-    end;
-    // Trim the trailing single space if added.
-    if (Length(OutStr) > 0) and (OutStr[Length(OutStr)] = ' ') then
-      SetLength(OutStr, Length(OutStr) - 1);
-  end
-  else
-  begin
-    // Copy remaining bytes verbatim.
-    while I <= Len do
-    begin
-      OutStr := OutStr + InStr[I];
-      Inc(I);
-    end;
-    SawNonWS := Length(OutStr) > 0;
-  end;
-
-  // DIFF_IGN_BLANK_LINES: blank lines normalize to empty string.
-  if (AFlags and DIFF_IGN_BLANK_LINES) <> 0 then
-    if not SawNonWS then
-      OutStr := '';
-
-  // DIFF_IGN_CASE: ASCII lowercase (sufficient for typical diff use).
-  if (AFlags and DIFF_IGN_CASE) <> 0 then
-    OutStr := AnsiLowerCase(OutStr);
-
-  // DIFF_IGN_NUMBERS: replace each digit run with a single '0' so
-  // "v1.2.3" matches "v1.2.4" but not "v1.20.3". Useful for logs
-  // with timestamps / counters that change between versions.
-  if (AFlags and DIFF_IGN_NUMBERS) <> 0 then
-  begin
-    InStr := OutStr;
-    OutStr := '';
-    I := 1;
-    Len := Length(InStr);
-    while I <= Len do
-    begin
-      if (InStr[I] >= '0') and (InStr[I] <= '9') then
-      begin
-        OutStr := OutStr + '0';
-        while (I <= Len) and (InStr[I] >= '0') and (InStr[I] <= '9') do
-          Inc(I);
-      end
-      else
-      begin
-        OutStr := OutStr + InStr[I];
-        Inc(I);
-      end;
-    end;
-  end;
-
-  Result := string(OutStr);
-end;
-
-{ djb2 hash of a line's bytes. Matches JGit's RawTextComparator.hashRegion.
-  Uses Cardinal (unsigned 32-bit) for the accumulator because the hash
-  is designed to wrap around. }
-{$PUSH}
-{$RANGECHECKS OFF}  { Cardinal wraparound on the djb2 accumulator: the
-                       64-bit intermediate range-checks against
-                       Cardinal's range on assignment back to H. }
-function HashLine(const ALine: string): Integer;
-var
-  S: AnsiString;
-  I, Len: Integer;
-  H: Cardinal;
-begin
-  S := AnsiString(ALine);
-  Len := Length(S);
-  H := DJB2_SEED;
-  for I := 1 to Len do
-    H := ((H shl 5) + H) + Ord(S[I]);
-  Result := Integer(H);
-end;
-{$POP}
-
-{ ---------- TLineSequence ---------- }
-
-procedure TLineSequence.Init(const ALines: array of string; AFlags: Integer);
-var
-  I, N: Integer;
-begin
-  N := Length(ALines);
-  SetLength(FLines, N);
-  FHasNormalization := (AFlags <> 0);
-  if FHasNormalization then
-    SetLength(FNormalized, N)
-  else
-    FNormalized := nil;
-  SetLength(FHashes, N);
-  for I := 0 to N - 1 do
-  begin
-    FLines[I] := ALines[I];
-    if FHasNormalization then
-    begin
-      FNormalized[I] := NormalizeLine(ALines[I], AFlags);
-      FHashes[I] := HashLine(FNormalized[I]);
-    end
-    else
-      FHashes[I] := HashLine(ALines[I]);
-  end;
-end;
-
-function TLineSequence.EqualsAt(AIdxThis: Integer;
-  const AOther: TLineSequence; AIdxOther: Integer): Boolean;
-var
-  PA, PB: PAnsiChar;
-  Len, I: Integer;
-begin
-  // CRITICAL: hash check FIRST (fast integer compare), then string equality
-  // to verify the match. A hash collision without this check produces a
-  // silently wrong diff which is nearly impossible to debug later.
-  if FHashes[AIdxThis] <> AOther.FHashes[AIdxOther] then
-    Exit(False);
-  if FHasNormalization then
-    Exit(FNormalized[AIdxThis] = AOther.FNormalized[AIdxOther]);
-  // Fast pointer-based string comparison instead of Pascal's AnsiString
-  // comparison. Pascal's string = operator does a call to fpc_AnsStr_Compare
-  // which has overhead. Pointer comparison with MoveCompare is faster
-  // for the hot path (called billions of times in the Myers snake loops).
-  PA := Pointer(FLines[AIdxThis]);
-  PB := Pointer(AOther.FLines[AIdxOther]);
-  if PA = PB then
-    Exit(True);  // same pointer (e.g. comparing a sequence with itself)
-  Len := Length(FLines[AIdxThis]);
-  if Len <> Length(AOther.FLines[AIdxOther]) then
-    Exit(False);
-  if Len = 0 then
-    Exit(True);
-  // Compare 4 bytes at a time using PInteger
-  I := 0;
-  while I + 4 <= Len do
-  begin
-    if PInteger(PA + I)^ <> PInteger(PB + I)^ then
-      Exit(False);
-    Inc(I, 4);
-  end;
-  // Compare remaining bytes
-  while I < Len do
-  begin
-    if PA[I] <> PB[I] then
-      Exit(False);
-    Inc(I);
-  end;
-  Result := True;
-end;
-
-function TLineSequence.HashAt(AIdx: Integer): Integer;
-begin
-  Result := FHashes[AIdx];
-end;
-
-function TLineSequence.Size: Integer;
-begin
-  Result := Length(FLines);
-end;
-
-{ ---------- Forward declarations for diff algorithms ---------- }
-
-function MyersDiffCore(
-  out AEdits: TDiffEditList;
-  const ASeqA, ASeqB: TLineSequence;
-  ARegion: TDiffEdit
-): Boolean; forward;
-
-function MyersDiffNonCommon(
-  out AEdits: TDiffEditList;
-  const ASeqA, ASeqB: TLineSequence;
-  ARegion: TDiffEdit
-): Boolean; forward;
-
-function HistogramDiffNonCommon(
-  out AEdits: TDiffEditList;
-  const ASeqA, ASeqB: TLineSequence;
-  ARegion: TDiffEdit
-): Boolean; forward;
-
-function ReduceCommonStartEnd(
-  const ASeqA, ASeqB: TLineSequence;
-  AEdit: TDiffEdit
-): TDiffEdit; forward;
-
-procedure NormalizeEdits(var AEdits: TDiffEditList;
-  const ASeqA, ASeqB: TLineSequence); forward;
-
-function EditsToOpcodes(const AEdits: TDiffEditList;
-  ALenA, ALenB: Integer): TDiffOpcodeArray; forward;
-
-{ ---------- MyersDiff (linear-space, middle snake) ---------- }
-{
-  Port of JGit's MyersDiff.java. The algorithm computes the shortest
-  edit script by simultaneously extending forward D-paths from the
-  top-left and backward D-paths from the bottom-right until the two
-  fronts meet on a middle snake. Recursion on the two halves gives
-  the full edit list with O(N) space (vs O(N*D) for naive Myers).
-}
-
-const
-  { GNU diffutils constants (analyze.c):
-    SNAKE_LIMIT: Snakes bigger than this are considered "big" and
-      trigger the big_snake early-termination heuristic.
-    TOO_EXPENSIVE_FLOOR: Minimum value for the too_expensive threshold. }
-  SNAKE_LIMIT = 20;
-  TOO_EXPENSIVE_FLOOR = 4096;
-
-{ Create a middle edit from forward and backward snake endpoints.
-  When the forward path meets the backward path on a diagonal, the
-  condition is NewX >= BwdX[K] (or LeftEnd >= BwdX[K-1] etc.). The
-  >= means forward X may strictly exceed backward X — in that case
-  the edit would be (BeginA=X1, EndA=X2) with X1 > X2, which is
-  invalid (negative-length range). EditsToOpcodes then walks the
-  edit list expecting BeginA <= EndA, and an inverted edit produces
-  wrong opcodes that visibly drift in side-by-side rendering.
-
-  JGit handles this in EditPaths.makeEdit() by clamping:
-    if x1 > x2: x1 = x2
-    if y1 > y2: y1 = y2
-  which collapses the overshoot to a zero-length edit on that axis.
-  This is the same clamp, ported faithfully. }
-function MakeMiddleEdit(AFwdSnake, ABwdSnake: Int64): TDiffEdit; inline;
-var
-  X1, X2, Y1, Y2: Integer;
-begin
-  X1 := SnakeX(AFwdSnake);
-  X2 := SnakeX(ABwdSnake);
-  Y1 := SnakeY(AFwdSnake);
-  Y2 := SnakeY(ABwdSnake);
-  if X1 > X2 then X1 := X2;
-  if Y1 > Y2 then Y1 := Y2;
-  Result := TDiffEdit.Create(X1, X2, Y1, Y2);
-end;
-
-function ForwardSnake(var AState: TMyersState; AK, AX: Integer): Integer; inline;
-var
-  X, Y, SnakeLen: Integer;
-  SeqA, SeqB: PLineSequence;
-begin
-  SeqA := AState.SeqA;
-  SeqB := AState.SeqB;
-  X := AX;
-  Y := AK + X;
-  SnakeLen := 0;
-  while (X < AState.EndA) and (Y < AState.EndB) and
-        SeqA^.EqualsAt(X, SeqB^, Y) do
-  begin
-    Inc(X);
-    Inc(Y);
-    Inc(SnakeLen);
-  end;
-  if SnakeLen > SNAKE_LIMIT then
-    AState.BigSnake := True;
-  Result := X;
-end;
-
-function BackwardSnake(var AState: TMyersState; AK, AX: Integer): Integer; inline;
-var
-  X, Y, SnakeLen: Integer;
-  SeqA, SeqB: PLineSequence;
-begin
-  SeqA := AState.SeqA;
-  SeqB := AState.SeqB;
-  X := AX;
-  Y := AK + X;
-  SnakeLen := 0;
-  while (X > AState.BeginA) and (Y > AState.BeginB) and
-        SeqA^.EqualsAt(X - 1, SeqB^, Y - 1) do
-  begin
-    Dec(X);
-    Dec(Y);
-    Inc(SnakeLen);
-  end;
-  if SnakeLen > SNAKE_LIMIT then
-    AState.BigSnake := True;
-  Result := X;
-end;
-
-function ForceKIntoRange(AK, AMinK, AMaxK: Integer): Integer; inline;
-begin
-  if AK < AMinK then
-    Exit(AMinK + ((AK xor AMinK) and 1))
-  else if AK > AMaxK then
-    Exit(AMaxK - ((AK xor AMaxK) and 1));
-  Result := AK;
-end;
-
-{ Forward EditPaths: extend forward D-paths by one step.
-  Returns True if the forward and backward fronts meet (middle snake found).
-  Uses pointer arithmetic (PInteger/PInt64) for V array access — no bounds
-  checking needed because the arrays are sized (2*MaxSize+1) at the top
-  level, which is always sufficient for any sub-region's k range. }
-function ForwardCalculate(var AState: TMyersState; AD: Integer): Boolean;
-var
-  K, I, Left, Right, NewX: Integer;
-  LeftEnd, RightEnd: Integer;
-  LeftSnake, RightSnake, NewSnake: Int64;
-  PrevBeginK, PrevEndK: Integer;
-  FwdX: PInteger;
-  FwdSnake: PInt64;
-  BwdX: PInteger;
-  BwdSnake: PInt64;
-begin
-  Result := False;
-  PrevBeginK := AState.FwdBeginK;
-  PrevEndK := AState.FwdEndK;
-  AState.FwdBeginK := ForceKIntoRange(AState.FwdMiddleK - AD, AState.MinK, AState.MaxK);
-  AState.FwdEndK := ForceKIntoRange(AState.FwdMiddleK + AD, AState.MinK, AState.MaxK);
-
-  // Cache pointers in locals for faster access in the loop.
-  FwdX := AState.FwdX;
-  FwdSnake := AState.FwdSnake;
-  BwdX := AState.BwdX;
-  BwdSnake := AState.BwdSnake;
-
-  K := AState.FwdEndK;
-  while K >= AState.FwdBeginK do
-  begin
-    Left := -1;
-    Right := -1;
-    LeftSnake := -1;
-    RightSnake := -1;
-
-    if K > PrevBeginK then
-    begin
-      Left := FwdX[K - 1];
-      LeftEnd := ForwardSnake(AState, K - 1, Left);
-      if Left <> LeftEnd then
-        LeftSnake := PackSnake(LeftEnd, (K - 1) + LeftEnd)
-      else
-        LeftSnake := FwdSnake[K - 1];
-      if (K - 1 >= AState.BwdBeginK) and (K - 1 <= AState.BwdEndK) and
-         (((AD - 1 + (K - 1) - AState.BwdMiddleK) mod 2) = 0) and
-         (LeftEnd >= BwdX[K - 1]) then
-      begin
-        AState.MiddleEdit := MakeMiddleEdit(LeftSnake, BwdSnake[K - 1]);
-        Exit(True);
-      end;
-      Left := LeftEnd;
-    end;
-
-    if K < PrevEndK then
-    begin
-      Right := FwdX[K + 1];
-      RightEnd := ForwardSnake(AState, K + 1, Right);
-      if Right <> RightEnd then
-        RightSnake := PackSnake(RightEnd, (K + 1) + RightEnd)
-      else
-        RightSnake := FwdSnake[K + 1];
-      if (K + 1 >= AState.BwdBeginK) and (K + 1 <= AState.BwdEndK) and
-         (((AD - 1 + (K + 1) - AState.BwdMiddleK) mod 2) = 0) and
-         (RightEnd >= BwdX[K + 1]) then
-      begin
-        AState.MiddleEdit := MakeMiddleEdit(RightSnake, BwdSnake[K + 1]);
-        Exit(True);
-      end;
-      Right := RightEnd + 1;
-    end;
-
-    if (K >= PrevEndK) or ((K > PrevBeginK) and (Left > Right)) then
-    begin
-      NewX := Left;
-      NewSnake := LeftSnake;
-    end
-    else
-    begin
-      NewX := Right;
-      NewSnake := RightSnake;
-    end;
-
-    if (K >= AState.BwdBeginK) and (K <= AState.BwdEndK) and
-       (((AD - 1 + K - AState.BwdMiddleK) mod 2) = 0) and
-       (NewX >= BwdX[K]) then
-    begin
-      AState.MiddleEdit := MakeMiddleEdit(NewSnake, BwdSnake[K]);
-      Exit(True);
-    end;
-
-    if (NewX >= AState.EndA) or ((K + NewX) >= AState.EndB) then
-    begin
-      if K > AState.BwdMiddleK then
-        AState.MaxK := K
-      else
-        AState.MinK := K;
-    end;
-
-    FwdX[K] := NewX;
-    FwdSnake[K] := NewSnake;
-
-    Dec(K, 2);
-  end;
-end;
-
-{ Backward EditPaths: extend backward D-paths by one step.
-  Returns True if the forward and backward fronts meet (middle snake found). }
-function BackwardCalculate(var AState: TMyersState; AD: Integer): Boolean;
-var
-  K, I, Left, Right, NewX: Integer;
-  LeftEnd, RightEnd: Integer;
-  LeftSnake, RightSnake, NewSnake: Int64;
-  PrevBeginK, PrevEndK: Integer;
-  FwdX: PInteger;
-  FwdSnake: PInt64;
-  BwdX: PInteger;
-  BwdSnake: PInt64;
-begin
-  Result := False;
-  PrevBeginK := AState.BwdBeginK;
-  PrevEndK := AState.BwdEndK;
-  AState.BwdBeginK := ForceKIntoRange(AState.BwdMiddleK - AD, AState.MinK, AState.MaxK);
-  AState.BwdEndK := ForceKIntoRange(AState.BwdMiddleK + AD, AState.MinK, AState.MaxK);
-
-  // Cache pointers in locals for faster access in the loop.
-  FwdX := AState.FwdX;
-  FwdSnake := AState.FwdSnake;
-  BwdX := AState.BwdX;
-  BwdSnake := AState.BwdSnake;
-
-  K := AState.BwdEndK;
-  while K >= AState.BwdBeginK do
-  begin
-    Left := -1;
-    Right := -1;
-    LeftSnake := -1;
-    RightSnake := -1;
-
-    if K > PrevBeginK then
-    begin
-      Left := BwdX[K - 1];
-      LeftEnd := BackwardSnake(AState, K - 1, Left);
-      if Left <> LeftEnd then
-        LeftSnake := PackSnake(LeftEnd, (K - 1) + LeftEnd)
-      else
-        LeftSnake := BwdSnake[K - 1];
-      if (K - 1 >= AState.FwdBeginK) and (K - 1 <= AState.FwdEndK) and
-         (((AD + (K - 1) - AState.FwdMiddleK) mod 2) = 0) and
-         (LeftEnd <= FwdX[K - 1]) then
-      begin
-        AState.MiddleEdit := MakeMiddleEdit(FwdSnake[K - 1], LeftSnake);
-        Exit(True);
-      end;
-      Left := LeftEnd - 1;
-    end;
-
-    if K < PrevEndK then
-    begin
-      Right := BwdX[K + 1];
-      RightEnd := BackwardSnake(AState, K + 1, Right);
-      if Right <> RightEnd then
-        RightSnake := PackSnake(RightEnd, (K + 1) + RightEnd)
-      else
-        RightSnake := BwdSnake[K + 1];
-      if (K + 1 >= AState.FwdBeginK) and (K + 1 <= AState.FwdEndK) and
-         (((AD + (K + 1) - AState.FwdMiddleK) mod 2) = 0) and
-         (RightEnd <= FwdX[K + 1]) then
-      begin
-        AState.MiddleEdit := MakeMiddleEdit(FwdSnake[K + 1], RightSnake);
-        Exit(True);
-      end;
-      Right := RightEnd;
-    end;
-
-    if (K >= PrevEndK) or ((K > PrevBeginK) and (Left < Right)) then
-    begin
-      NewX := Left;
-      NewSnake := LeftSnake;
-    end
-    else
-    begin
-      NewX := Right;
-      NewSnake := RightSnake;
-    end;
-
-    if (K >= AState.FwdBeginK) and (K <= AState.FwdEndK) and
-       (((AD + K - AState.FwdMiddleK) mod 2) = 0) and
-       (NewX <= FwdX[K]) then
-    begin
-      AState.MiddleEdit := MakeMiddleEdit(FwdSnake[K], NewSnake);
-      Exit(True);
-    end;
-
-    if (NewX <= AState.BeginA) or ((K + NewX) <= AState.BeginB) then
-    begin
-      if K > AState.FwdMiddleK then
-        AState.MaxK := K
-      else
-        AState.MinK := K;
-    end;
-
-    BwdX[K] := NewX;
-    BwdSnake[K] := NewSnake;
-
-    Dec(K, 2);
-  end;
-end;
-
-{ Myers O(ND) diff with linear-space middle-snake optimization.
-  Port of JGit's MyersDiff.java (Myers 1986 + Myers-Miller 1988
-  divide-and-conquer).
-
-  Additional optimizations ported from GNU diffutils (WinMerge's
-  default diff engine, analyze.c):
-  - TOO_EXPENSIVE heuristic: caps the D-loop at max(4096, sqrt(N)).
-    When exceeded, picks the best forward/backward diagonal found so
-    far as the split point, producing a suboptimal but good enough
-    result. Makes the algorithm O(N*sqrt(N)) instead of O(N*D) for
-    files with large edit distance.
-  - big_snake heuristic: when c > 200 and a snake > 20 lines was
-    found, checks if any diagonal has made progress >> cost. If so,
-    returns that diagonal as the split point. Makes the algorithm
-    O(N) for files with constant small density of changes.
-  - discard_confusing_lines (analyze.c lines 414-614): preprocesses
-    both sequences to remove lines that obviously don't match (nmatch
-    == 0) or that match too many lines (nmatch > sqrt(N)*5, marked
-    "provisionally discardable"). Myers then runs on the smaller
-    "undiscarded" subset, with discarded lines emitted as standalone
-    INSERT/DELETE edits. Provides huge speedups on files with many
-    unique lines (e.g. log files with timestamps) by avoiding the
-    O(N*D) trap entirely.
-
-  Not ported from GNU diffutils:
-  - shift_boundaries: adjusts boundaries for prettier output. The
-    Differ plugin does its own opcode realignment.
-
-  TextDiff's PushDiff/PopDiff pattern replaces recursion with an
-  explicit heap-allocated work stack to prevent stack overflow.
-  Pointer arithmetic (PInteger adjusted by OffsetK) eliminates
-  bounds-checking overhead. }
-type
-  TDiffWorkItem = record
-    BeginA, EndA, BeginB, EndB: Integer;
-  end;
-  TDiffWorkStack = array of TDiffWorkItem;
-
-{ ---------- discard_confusing_lines (port of analyze.c) ---------- }
-{
-  Direct port of WinMerge/GNU diffutils analyze.c:discard_confusing_lines
-  (lines 414-614). Builds equivalence classes for lines in both sequences
-  within the region, counts how many lines of each side fall into each
-  class, then marks lines as discardable when they match 0 lines on the
-  other side, or as "provisionally discardable" when they match too many
-  (nmatch > sqrt(N)*5).
-
-  The provisional-discard run rules (analyze.c lines 483-593) are ported
-  verbatim — they cancel provisional discards in subruns that don't meet
-  length/position thresholds, preventing the algorithm from discarding
-  useful context lines.
-
-  Output: ADiscardA / ADiscardB describe which lines were discarded and
-  provide the virtual->real index mapping for the kept lines.
-}
-
-type
-  { Hash map entry for equivalence class lookup. One per line in both
-    sequences within the region. Chains via Next for hash-bucket collision
-    resolution. }
-  TEquivEntry = record
-    Hash: Integer;
-    Side: Byte;        // 0 = A, 1 = B
-    LocalIdx: Integer; // offset within the side's region (0..Len-1)
-    EquivClass: Integer;
-    Next: Integer;     // index of next entry in same hash bucket, -1 if none
-  end;
-
-{ Compute log2(table size) for a power-of-2 table. Used to derive the
-  Knuth-mix shift count from the bucket count. }
-function EquivTableBits(ATableSize: Integer): Integer;
-var
-  B: Integer;
-begin
-  B := 0;
-  while (1 shl B) < ATableSize do
-    Inc(B);
-  Result := B;
-end;
-
-{ Build equivalence-class assignments for both sides of a region.
-  EquivsA[i] / EquivsB[i] get the class ID for the i-th line in each
-  side's region (i is a 0-based offset from ARegion.BeginA/BeginB).
-  Returns EquivMax = one more than the largest class ID used.
-
-  Lines that compare equal across sides get the same class ID; lines
-  with the same hash but different content get different class IDs
-  (verified via EqualsAt to avoid hash-collision false matches). }
-{$PUSH}
-{$RANGECHECKS OFF}  { Cardinal*Cardinal Knuth mix wraps on assignment. }
-procedure BuildEquivClasses(
-  const ASeqA, ASeqB: TLineSequence;
-  ARegion: TDiffEdit;
-  var AEquivsA: array of Integer;
-  var AEquivsB: array of Integer;
-  var AEquivMax: Integer);
-var
-  LenA, LenB, Total, I, J, Hash, Bucket, ClassId, TableSize, Mask, EntryIdx: Integer;
-  Entries: array of TEquivEntry;
-  Buckets: array of Integer;
-  TBits: Integer;
-  MatchFound: Boolean;
-begin
-  LenA := ARegion.LengthA;
-  LenB := ARegion.LengthB;
-  Total := LenA + LenB;
-  // Caller pre-allocates AEquivsA / AEquivsB to LenA / LenB.
-  if Total = 0 then
-  begin
-    AEquivMax := 1;
+  if other = nil then
     Exit;
-  end;
-
-  // Size the hash table to next power of 2 >= 2*Total (load factor ~0.5).
-  TableSize := 16;
-  while TableSize < Total * 2 do
-    TableSize := TableSize shl 1;
-  Mask := TableSize - 1;
-  TBits := EquivTableBits(TableSize);
-  SetLength(Buckets, TableSize);
-  for I := 0 to TableSize - 1 do
-    Buckets[I] := -1;
-
-  // Allocate one entry per line in both sequences.
-  SetLength(Entries, Total);
-  EntryIdx := 0;
-
-  // Fill entries for side A.
-  for I := 0 to LenA - 1 do
-  begin
-    Hash := ASeqA.HashAt(ARegion.BeginA + I);
-    Entries[EntryIdx].Hash := Hash;
-    Entries[EntryIdx].Side := 0;
-    Entries[EntryIdx].LocalIdx := I;
-    Entries[EntryIdx].EquivClass := -1;
-    Bucket := (Cardinal(Hash) * $9e370001) shr (32 - TBits);
-    Bucket := Bucket and Mask;
-    Entries[EntryIdx].Next := Buckets[Bucket];
-    Buckets[Bucket] := EntryIdx;
-    Inc(EntryIdx);
-  end;
-
-  // Fill entries for side B.
-  for I := 0 to LenB - 1 do
-  begin
-    Hash := ASeqB.HashAt(ARegion.BeginB + I);
-    Entries[EntryIdx].Hash := Hash;
-    Entries[EntryIdx].Side := 1;
-    Entries[EntryIdx].LocalIdx := I;
-    Entries[EntryIdx].EquivClass := -1;
-    Bucket := (Cardinal(Hash) * $9e370001) shr (32 - TBits);
-    Bucket := Bucket and Mask;
-    Entries[EntryIdx].Next := Buckets[Bucket];
-    Buckets[Bucket] := EntryIdx;
-    Inc(EntryIdx);
-  end;
-
-  // Walk all entries, assigning equivalence classes.
-  // Class 0 is reserved for "no match" (a line whose equivs[i] == 0 is
-  // always discarded because nmatch == 0 — see analyze.c line 473).
-  ClassId := 1;
-  for I := 0 to Total - 1 do
-  begin
-    if Entries[I].EquivClass <> -1 then
-      Continue;
-
-    // Start a new equivalence class.
-    Entries[I].EquivClass := ClassId;
-
-    // Walk the hash bucket chain to find same-hash entries and verify
-    // content equality. Same-hash different-content entries will fail
-    // the EqualsAt check and remain unassigned — they get their own
-    // class when their outer-loop iteration arrives.
-    Bucket := (Cardinal(Entries[I].Hash) * $9e370001) shr (32 - TBits);
-    Bucket := Bucket and Mask;
-    J := Buckets[Bucket];
-    while J <> -1 do
-    begin
-      if (J <> I) and (Entries[J].EquivClass = -1) and
-         (Entries[J].Hash = Entries[I].Hash) then
-      begin
-        // Verify content equality.
-        if (Entries[I].Side = 0) and (Entries[J].Side = 0) then
-          MatchFound := ASeqA.EqualsAt(
-            ARegion.BeginA + Entries[I].LocalIdx,
-            ASeqA, ARegion.BeginA + Entries[J].LocalIdx)
-        else if (Entries[I].Side = 1) and (Entries[J].Side = 1) then
-          MatchFound := ASeqB.EqualsAt(
-            ARegion.BeginB + Entries[I].LocalIdx,
-            ASeqB, ARegion.BeginB + Entries[J].LocalIdx)
-        else if Entries[I].Side = 0 then
-          // I in A, J in B
-          MatchFound := ASeqA.EqualsAt(
-            ARegion.BeginA + Entries[I].LocalIdx,
-            ASeqB, ARegion.BeginB + Entries[J].LocalIdx)
-        else
-          // I in B, J in A
-          MatchFound := ASeqA.EqualsAt(
-            ARegion.BeginA + Entries[J].LocalIdx,
-            ASeqB, ARegion.BeginB + Entries[I].LocalIdx);
-        if MatchFound then
-          Entries[J].EquivClass := ClassId;
-      end;
-      J := Entries[J].Next;
-    end;
-
-    Inc(ClassId);
-  end;
-
-  // Emit equivs arrays.
-  for I := 0 to Total - 1 do
-  begin
-    if Entries[I].Side = 0 then
-      AEquivsA[Entries[I].LocalIdx] := Entries[I].EquivClass
-    else
-      AEquivsB[Entries[I].LocalIdx] := Entries[I].EquivClass;
-  end;
-
-  AEquivMax := ClassId;
-end;
-{$POP}
-
-{ Apply the provisional-discard run rules (analyze.c lines 483-593).
-  Walks the discards[] array (0=keep, 1=discard, 2=provisional) and
-  cancels provisional discards that don't meet the run-length thresholds.
-  Mutates ADiscards in place. }
-procedure CancelProvisionalRuns(var ADiscards: array of Byte; AEnd: Integer);
-var
-  I, J, Length_, Provisional, Minimum, Tem, Consec: Integer;
-begin
-  I := 0;
-  while I < AEnd do
-  begin
-    // Standalone provisionals (not in a run with nonprovisionals) get cancelled.
-    if ADiscards[I] = 2 then
-    begin
-      ADiscards[I] := 0;
-      Inc(I);
-      Continue;
-    end;
-    if ADiscards[I] = 0 then
-    begin
-      Inc(I);
-      Continue;
-    end;
-
-    // Found a nonprovisional discard (value 1) at I.
-    // Find end of run; count provisionals.
-    J := I;
-    Provisional := 0;
-    while (J < AEnd) and (ADiscards[J] <> 0) do
-    begin
-      if ADiscards[J] = 2 then
-        Inc(Provisional);
-      Inc(J);
-    end;
-
-    // Cancel provisional discards at end of run.
-    while (J > I) and (ADiscards[J - 1] = 2) do
-    begin
-      Dec(J);
-      ADiscards[J] := 0;
-      Dec(Provisional);
-    end;
-
-    Length_ := J - I;
-
-    // If 1/4 of the run is provisional, cancel all provisionals in the run.
-    if Provisional * 4 > Length_ then
-    begin
-      while J > I do
-      begin
-        Dec(J);
-        if ADiscards[J] = 2 then
-          ADiscards[J] := 0;
-      end;
-    end
-    else
-    begin
-      // MINIMUM = approximate sqrt(Length/4) + 1.
-      // A subrun of two or more provisionals can stand when LENGTH >= 16.
-      // A subrun of 4 or more can stand when LENGTH >= 64.
-      Minimum := 1;
-      Tem := Length_ div 4;
-      while Tem > 0 do
-      begin
-        Tem := Tem shr 2;
-        if Tem > 0 then
-          Minimum := Minimum * 2;
-      end;
-      Inc(Minimum);
-
-      // Cancel any subrun of MINIMUM or more provisionals within the run.
-      Consec := 0;
-      J := 0;
-      while J < Length_ do
-      begin
-        if ADiscards[I + J] <> 2 then
-          Consec := 0
-        else
-        begin
-          Inc(Consec);
-          if Minimum = Consec then
-            // Back up to start of subrun, to revert it all.
-            J := J - Consec
-          else if Minimum < Consec then
-            ADiscards[I + J] := 0;
-        end;
-        Inc(J);
-      end;
-
-      // Scan from beginning of run: cancel provisionals until we find
-      // 3+ nonprovisionals in a row, or until the first nonprovisional
-      // at least 8 lines in. Until that point, cancel any provisionals.
-      Consec := 0;
-      for J := 0 to Length_ - 1 do
-      begin
-        if (J >= 8) and (ADiscards[I + J] = 1) then
-          Break;
-        if ADiscards[I + J] = 2 then
-        begin
-          Consec := 0;
-          ADiscards[I + J] := 0;
-        end
-        else if ADiscards[I + J] = 0 then
-          Consec := 0
-        else
-          Inc(Consec);
-        if Consec = 3 then
-          Break;
-      end;
-
-      // I advances to the last line of the run.
-      I := I + Length_ - 1;
-
-      // Same scan, from end backwards.
-      Consec := 0;
-      for J := 0 to Length_ - 1 do
-      begin
-        if (J >= 8) and (ADiscards[I - J] = 1) then
-          Break;
-        if ADiscards[I - J] = 2 then
-        begin
-          Consec := 0;
-          ADiscards[I - J] := 0;
-        end
-        else if ADiscards[I - J] = 0 then
-          Consec := 0
-        else
-          Inc(Consec);
-        if Consec = 3 then
-          Break;
-      end;
-    end;
-
-    Inc(I);
-  end;
+  for i := 0 to other.Size - 1 do
+    Add(other.Get(i));
 end;
 
-{ Port of analyze.c:discard_confusing_lines (lines 414-614).
-  Produces ADiscardA / ADiscardB describing which lines were discarded
-  and the virtual->real index mapping for kept lines. }
-procedure DiscardConfusingLines(
-  const ASeqA, ASeqB: TLineSequence;
-  ARegion: TDiffEdit;
-  out ADiscardA, ADiscardB: TDiscardMap);
-var
-  EquivsA, EquivsB: array of Integer;
-  EquivMax, I, J, LenA, LenB, Many, Tem: Integer;
-  EquivCountA, EquivCountB: array of Integer;
-  DiscardedA, DiscardedB: array of Byte;  // 0=keep, 1=discard, 2=provisional
+class function TEditList.Singleton(const e: TEdit): TEditList;
 begin
-  LenA := ARegion.LengthA;
-  LenB := ARegion.LengthB;
-  SetLength(ADiscardA.FDiscarded, LenA);
-  SetLength(ADiscardA.FKeptIdx, LenA);
-  ADiscardA.FKeptCount := 0;
-  ADiscardA.FRegionLen := LenA;
-  SetLength(ADiscardB.FDiscarded, LenB);
-  SetLength(ADiscardB.FKeptIdx, LenB);
-  ADiscardB.FKeptCount := 0;
-  ADiscardB.FRegionLen := LenB;
-
-  if (LenA = 0) or (LenB = 0) then
-  begin
-    // Nothing to discard when one side is empty — keep everything.
-    for I := 0 to LenA - 1 do
-    begin
-      ADiscardA.FDiscarded[I] := False;
-      ADiscardA.FKeptIdx[I] := I;
-    end;
-    ADiscardA.FKeptCount := LenA;
-    for I := 0 to LenB - 1 do
-    begin
-      ADiscardB.FDiscarded[I] := False;
-      ADiscardB.FKeptIdx[I] := I;
-    end;
-    ADiscardB.FKeptCount := LenB;
-    Exit;
-  end;
-
-  SetLength(EquivsA, LenA);
-  SetLength(EquivsB, LenB);
-  BuildEquivClasses(ASeqA, ASeqB, ARegion, EquivsA, EquivsB, EquivMax);
-
-  // equiv_count[F][I] = # lines in file F with equivalence class I.
-  SetLength(EquivCountA, EquivMax);
-  SetLength(EquivCountB, EquivMax);
-  for I := 0 to EquivMax - 1 do
-  begin
-    EquivCountA[I] := 0;
-    EquivCountB[I] := 0;
-  end;
-  for I := 0 to LenA - 1 do
-    Inc(EquivCountA[EquivsA[I]]);
-  for I := 0 to LenB - 1 do
-    Inc(EquivCountB[EquivsB[I]]);
-
-  SetLength(DiscardedA, LenA);
-  SetLength(DiscardedB, LenB);
-  for I := 0 to LenA - 1 do
-    DiscardedA[I] := 0;
-  for I := 0 to LenB - 1 do
-    DiscardedB[I] := 0;
-
-  // Mark discardable lines on side A. For each line in A, look at the
-  // count of matching lines in B (via the shared equiv class).
-  // MANY = 5 * approximate sqrt(LenA/64) — threshold for "too many matches".
-  Many := 5;
-  Tem := LenA div 64;
-  while Tem > 0 do
-  begin
-    Tem := Tem shr 2;
-    if Tem > 0 then
-      Many := Many * 2;
-  end;
-  for I := 0 to LenA - 1 do
-  begin
-    if EquivsA[I] = 0 then
-      Continue;
-    J := EquivCountB[EquivsA[I]];
-    if J = 0 then
-      DiscardedA[I] := 1
-    else if J > Many then
-      DiscardedA[I] := 2;
-  end;
-
-  // Side B.
-  Many := 5;
-  Tem := LenB div 64;
-  while Tem > 0 do
-  begin
-    Tem := Tem shr 2;
-    if Tem > 0 then
-      Many := Many * 2;
-  end;
-  for I := 0 to LenB - 1 do
-  begin
-    if EquivsB[I] = 0 then
-      Continue;
-    J := EquivCountA[EquivsB[I]];
-    if J = 0 then
-      DiscardedB[I] := 1
-    else if J > Many then
-      DiscardedB[I] := 2;
-  end;
-
-  // Apply provisional-cancel run rules.
-  CancelProvisionalRuns(DiscardedA, LenA);
-  CancelProvisionalRuns(DiscardedB, LenB);
-
-  // Actually discard: build kept-index arrays.
-  J := 0;
-  for I := 0 to LenA - 1 do
-  begin
-    if DiscardedA[I] = 0 then
-    begin
-      ADiscardA.FDiscarded[I] := False;
-      ADiscardA.FKeptIdx[J] := I;
-      Inc(J);
-    end
-    else
-      ADiscardA.FDiscarded[I] := True;
-  end;
-  ADiscardA.FKeptCount := J;
-
-  J := 0;
-  for I := 0 to LenB - 1 do
-  begin
-    if DiscardedB[I] = 0 then
-    begin
-      ADiscardB.FDiscarded[I] := False;
-      ADiscardB.FKeptIdx[J] := I;
-      Inc(J);
-    end
-    else
-      ADiscardB.FDiscarded[I] := True;
-  end;
-  ADiscardB.FKeptCount := J;
+  Result := TEditList.Create(1);
+  Result.Add(e);
 end;
 
-{ Build a virtual TLineSequence containing only the kept lines from
-  ASource[ABegin..ABegin+ADiscard.FRegionLen). Reuses hashes and
-  normalized copies from ASource so no rehashing is needed. }
-procedure BuildVirtualSequence(
-  const ASource: TLineSequence;
-  ABegin: Integer;
-  const ADiscard: TDiscardMap;
-  out AVirt: TLineSequence);
-var
-  I, RealIdx: Integer;
+function TEditList.RemoveLast: TEdit;
+{ Returns the last element and decrements FCount. The underlying array
+  is NOT shrunk (just like Java's ArrayList.remove, which only decrements
+  size). Subsequent Add() calls will reuse the slot. }
 begin
-  AVirt.FHasNormalization := ASource.FHasNormalization;
-  SetLength(AVirt.FLines, ADiscard.FKeptCount);
-  if AVirt.FHasNormalization then
-    SetLength(AVirt.FNormalized, ADiscard.FKeptCount)
+  if FCount = 0 then
+    raise EArgumentOutOfRangeException.Create('TEditList.RemoveLast: empty list');
+  Dec(FCount);
+  Result := FItems[FCount];
+end;
+
+{ ------------------------------------------------------------------
+  TIntList methods — ported from util/IntList.java
+  ------------------------------------------------------------------ }
+
+constructor TIntList.Create(capacity: Integer);
+begin
+  inherited Create;
+  SetLength(FEntries, capacity);
+  FCount := 0;
+end;
+
+procedure TIntList.Grow;
+var
+  newCap: Integer;
+begin
+  if Length(FEntries) = 0 then
+    newCap := 10
   else
-    AVirt.FNormalized := nil;
-  SetLength(AVirt.FHashes, ADiscard.FKeptCount);
-  for I := 0 to ADiscard.FKeptCount - 1 do
-  begin
-    RealIdx := ABegin + ADiscard.FKeptIdx[I];
-    AVirt.FLines[I] := ASource.FLines[RealIdx];
-    if AVirt.FHasNormalization then
-      AVirt.FNormalized[I] := ASource.FNormalized[RealIdx];
-    AVirt.FHashes[I] := ASource.FHashes[RealIdx];
-  end;
+    newCap := (Length(FEntries) + 16) * 3 div 2;
+  SetLength(FEntries, newCap);
 end;
 
-
-function MyersDiffCore(
-  out AEdits: TDiffEditList;
-  const ASeqA, ASeqB: TLineSequence;
-  ARegion: TDiffEdit
-): Boolean;
-var
-  State: TMyersState;
-  MaxSize: Integer;
-  WorkStack: TDiffWorkStack;
-  WorkCount: Integer;
-  Item: TDiffWorkItem;
-  Edit: TDiffEdit;
-  K, X, D: Integer;
-  Found: Boolean;
-  TooExpensive: Integer;
-  BigSnake: Boolean;
-  FwdX, BwdX: PInteger;
-  FwdSnake, BwdSnake: PInt64;
-  BestVal, BestX, TmpX, TmpY, TmpD: Integer;
-  FxyBest, FxBest, BxyBest, BxBest: Integer;
-
-  procedure PushWork(ABeginA, AEndA, ABeginB, AEndB: Integer);
-  begin
-    if WorkCount >= Length(WorkStack) then
-      SetLength(WorkStack, MaxI(Length(WorkStack) * 2, WorkCount + 64));
-    WorkStack[WorkCount].BeginA := ABeginA;
-    WorkStack[WorkCount].EndA := AEndA;
-    WorkStack[WorkCount].BeginB := ABeginB;
-    WorkStack[WorkCount].EndB := AEndB;
-    Inc(WorkCount);
-  end;
-
+function TIntList.Size: Integer;
 begin
-  Result := True;
-  AEdits.Init;
-
-  State.SeqA := @ASeqA;
-  State.SeqB := @ASeqB;
-
-  MaxSize := ARegion.LengthA + ARegion.LengthB;
-  if MaxSize = 0 then
-    Exit;
-
-  { Compute TOO_EXPENSIVE threshold (GNU diffutils analyze.c line 958):
-    approximate square root of input size, bounded below by 4096.
-    This caps the D-loop to prevent O(N*D) blowup on files with
-    large edit distance. }
-  TooExpensive := 1;
-  TmpX := MaxSize;
-  while TmpX > 0 do
-  begin
-    TooExpensive := TooExpensive shl 1;
-    TmpX := TmpX shr 2;
-  end;
-  if TooExpensive < TOO_EXPENSIVE_FLOOR then
-    TooExpensive := TOO_EXPENSIVE_FLOOR;
-  State.OffsetK := MaxSize;
-  // Allocate V arrays once at top level. Size is 2*MaxSize+1, which is
-  // always sufficient for any sub-region's k range (k is in [-MaxSize, +MaxSize]).
-  // Using pointer arithmetic (adjusted by OffsetK) eliminates bounds-checking
-  // overhead — direct memory access like LGenerics' LcsMyersImpl.
-  SetLength(State.FwdXBuf, 2 * MaxSize + 1);
-  SetLength(State.BwdXBuf, 2 * MaxSize + 1);
-  SetLength(State.FwdSnakeBuf, 2 * MaxSize + 1);
-  SetLength(State.BwdSnakeBuf, 2 * MaxSize + 1);
-  // Set pointers to the middle of each buffer, so Ptr[K] works for
-  // any K in [-MaxSize, +MaxSize] without bounds checking.
-  State.FwdX := PInteger(@State.FwdXBuf[0]) + State.OffsetK;
-  State.BwdX := PInteger(@State.BwdXBuf[0]) + State.OffsetK;
-  State.FwdSnake := PInt64(@State.FwdSnakeBuf[0]) + State.OffsetK;
-  State.BwdSnake := PInt64(@State.BwdSnakeBuf[0]) + State.OffsetK;
-
-  // Initialize the work stack with the top-level region.
-  SetLength(WorkStack, 64);
-  WorkCount := 0;
-  PushWork(ARegion.BeginA, ARegion.EndA, ARegion.BeginB, ARegion.EndB);
-
-  // Process work items from the stack. This replaces the recursive
-  // CalculateEdits calls — the "stack" is now on the heap, so it can
-  // grow to any size without overflowing the call stack.
-  // Safety limit: the work stack can never have more items than the
-  // total number of lines (each item represents at least 1 line). If
-  // it exceeds that, something is wrong — bail out to prevent an
-  // infinite loop from hanging CudaText.
-  while (WorkCount > 0) and (WorkCount <= MaxSize + 1) do
-  begin
-    Dec(WorkCount);
-    Item := WorkStack[WorkCount];
-
-    // Base case: one side empty → emit as a single edit.
-    if (Item.BeginA >= Item.EndA) or (Item.BeginB >= Item.EndB) then
-    begin
-      if (Item.BeginA < Item.EndA) or (Item.BeginB < Item.EndB) then
-        AEdits.Add(TDiffEdit.Create(Item.BeginA, Item.EndA, Item.BeginB, Item.EndB));
-      Continue;
-    end;
-
-    State.BeginA := Item.BeginA;
-    State.EndA := Item.EndA;
-    State.BeginB := Item.BeginB;
-    State.EndB := Item.EndB;
-
-    // Strip common prefix.
-    K := Item.BeginB - Item.BeginA;
-    X := ForwardSnake(State, K, Item.BeginA);
-    State.BeginA := X;
-    State.BeginB := K + X;
-
-    // Strip common suffix.
-    K := Item.EndB - Item.EndA;
-    X := BackwardSnake(State, K, Item.EndA);
-    State.EndA := X;
-    State.EndB := K + X;
-
-    // After trimming, check if either side is empty. This is the same
-    // check TextDiff does (Diff_NP.pas line 365-380): if len1=0, emit
-    // as add; if len2=0, emit as delete. Without this check, the k range
-    // computation below produces invalid values (MinK > MaxK) which
-    // causes ForceKIntoRange to return garbage, leading to an infinite
-    // loop in the work stack.
-    if (State.BeginA >= State.EndA) or (State.BeginB >= State.EndB) then
-    begin
-      if (State.BeginA < State.EndA) or (State.BeginB < State.EndB) then
-        AEdits.Add(TDiffEdit.Create(State.BeginA, State.EndA,
-          State.BeginB, State.EndB));
-      Continue;
-    end;
-
-    State.MinK := State.BeginB - State.EndA;
-    State.MaxK := State.EndB - State.BeginA;
-    State.FwdMiddleK := State.BeginB - State.BeginA;
-    State.BwdMiddleK := State.EndB - State.EndA;
-    State.FwdBeginK := State.FwdMiddleK;
-    State.FwdEndK := State.FwdMiddleK;
-    State.BwdBeginK := State.BwdMiddleK;
-    State.BwdEndK := State.BwdMiddleK;
-
-    State.FwdX[State.FwdMiddleK] := State.BeginA;
-    State.FwdSnake[State.FwdMiddleK] :=
-      PackSnake(State.BeginA, State.FwdMiddleK + State.BeginA);
-    State.BwdX[State.BwdMiddleK] := State.EndA;
-    State.BwdSnake[State.BwdMiddleK] :=
-      PackSnake(State.EndA, State.BwdMiddleK + State.EndA);
-
-    // Find the middle snake with GNU diffutils heuristics.
-    Edit := TDiffEdit.Create(0, 0, 0, 0);
-    Found := False;
-    BigSnake := False;
-    D := 1;
-    while (D <= MaxSize) and not Found do
-    begin
-      { Track big_snake: ForwardCalculate and BackwardCalculate
-        set BigSnake when a snake > SNAKE_LIMIT is found. We pass
-        it by reference via the State record. }
-      State.BigSnake := False;
-
-      if ForwardCalculate(State, D) or BackwardCalculate(State, D) then
-      begin
-        Edit := State.MiddleEdit;
-        Found := True;
-      end
-      else
-      begin
-        if State.BigSnake then
-          BigSnake := True;
-
-        { GNU diffutils big_snake heuristic (analyze.c line 200):
-          When c > 200 and a big snake was found, check if any
-          diagonal has made progress >> cost. If so, return that
-          diagonal as the split point. This makes the algorithm
-          linear for files with constant small density of changes. }
-        if (D > 200) and BigSnake then
-        begin
-          { Check forward diagonals for best progress }
-          FwdX := State.FwdX;
-          FwdSnake := State.FwdSnake;
-          BestVal := 0;
-          BestX := 0;
-          K := State.FwdEndK;
-          while K >= State.FwdBeginK do
-          begin
-            TmpX := FwdX[K];
-            TmpY := TmpX - K;
-            TmpD := K - State.FwdMiddleK;
-            if TmpD < 0 then TmpD := -TmpD;
-            { v = (x - xoff) * 2 - dd = progress * 2 - diagonal_distance }
-            X := (TmpX - State.BeginA) * 2 - TmpD;
-            if (X > 12 * (D + TmpD)) and
-               (X > BestVal) and
-               (State.BeginA + SNAKE_LIMIT <= TmpX) and
-               (TmpX < State.EndA) and
-               (State.BeginB + SNAKE_LIMIT <= TmpY) and
-               (TmpY < State.EndB) then
-            begin
-              { Verify it ends with a significant snake }
-              TmpD := 0;
-              while (TmpD < SNAKE_LIMIT) and
-                    (TmpX - TmpD - 1 >= State.BeginA) and
-                    (TmpY - TmpD - 1 >= State.BeginB) and
-                    ASeqA.EqualsAt(TmpX - TmpD - 1, ASeqB, TmpY - TmpD - 1) do
-                Inc(TmpD);
-              if TmpD >= SNAKE_LIMIT then
-              begin
-                BestVal := X;
-                BestX := TmpX;
-              end;
-            end;
-            Dec(K, 2);
-          end;
-          if BestVal > 0 then
-          begin
-            Edit := TDiffEdit.Create(BestX, BestX, BestX - (BestX - State.BeginA + State.BeginB), BestX - (BestX - State.BeginA + State.BeginB));
-            { Simplify: just use the point as a zero-length edit }
-            Edit.BeginA := BestX;
-            Edit.EndA := BestX;
-            Edit.BeginB := BestX - (State.FwdMiddleK);
-            Edit.EndB := Edit.BeginB;
-            Found := True;
-            Break;
-          end;
-
-          { Check backward diagonals for best progress }
-          BwdX := State.BwdX;
-          BwdSnake := State.BwdSnake;
-          BestVal := 0;
-          BestX := 0;
-          K := State.BwdEndK;
-          while K >= State.BwdBeginK do
-          begin
-            TmpX := BwdX[K];
-            TmpY := TmpX - K;
-            TmpD := K - State.BwdMiddleK;
-            if TmpD < 0 then TmpD := -TmpD;
-            { v = (xlim - x) * 2 + dd }
-            X := (State.EndA - TmpX) * 2 + TmpD;
-            if (X > 12 * (D + TmpD)) and
-               (X > BestVal) and
-               (State.BeginA < TmpX) and
-               (TmpX <= State.EndA - SNAKE_LIMIT) and
-               (State.BeginB < TmpY) and
-               (TmpY <= State.EndB - SNAKE_LIMIT) then
-            begin
-              TmpD := 0;
-              while (TmpD < SNAKE_LIMIT - 1) and
-                    (TmpX + TmpD < State.EndA) and
-                    (TmpY + TmpD < State.EndB) and
-                    ASeqA.EqualsAt(TmpX + TmpD, ASeqB, TmpY + TmpD) do
-                Inc(TmpD);
-              if TmpD >= SNAKE_LIMIT - 1 then
-              begin
-                BestVal := X;
-                BestX := TmpX;
-              end;
-            end;
-            Dec(K, 2);
-          end;
-          if BestVal > 0 then
-          begin
-            Edit.BeginA := BestX;
-            Edit.EndA := BestX;
-            Edit.BeginB := BestX - (State.BwdMiddleK);
-            Edit.EndB := Edit.BeginB;
-            Found := True;
-            Break;
-          end;
-        end;
-
-        { GNU diffutils TOO_EXPENSIVE heuristic (analyze.c line 277):
-          When cost exceeds the threshold, give up on finding the
-          optimal split and pick the best forward/backward diagonal
-          found so far. This produces a suboptimal but good enough
-          result, preventing O(N*D) blowup. }
-        if D >= TooExpensive then
-        begin
-          { Find forward diagonal that maximizes X + Y }
-          FwdX := State.FwdX;
-          FxyBest := -1;
-          FxBest := 0;
-          K := State.FwdEndK;
-          while K >= State.FwdBeginK do
-          begin
-            TmpX := FwdX[K];
-            if TmpX > State.EndA then TmpX := State.EndA;
-            TmpY := TmpX - K;
-            if TmpY > State.EndB then
-            begin
-              TmpX := State.EndB + K;
-              TmpY := State.EndB;
-            end;
-            if TmpX + TmpY > FxyBest then
-            begin
-              FxyBest := TmpX + TmpY;
-              FxBest := TmpX;
-            end;
-            Dec(K, 2);
-          end;
-
-          { Find backward diagonal that minimizes X + Y }
-          BwdX := State.BwdX;
-          BxyBest := MaxInt;
-          BxBest := 0;
-          K := State.BwdEndK;
-          while K >= State.BwdBeginK do
-          begin
-            TmpX := BwdX[K];
-            if TmpX < State.BeginA then TmpX := State.BeginA;
-            TmpY := TmpX - K;
-            if TmpY < State.BeginB then
-            begin
-              TmpX := State.BeginB + K;
-              TmpY := State.BeginB;
-            end;
-            if TmpX + TmpY < BxyBest then
-            begin
-              BxyBest := TmpX + TmpY;
-              BxBest := TmpX;
-            end;
-            Dec(K, 2);
-          end;
-
-          { Use the better of the two diagonals (GNU diffutils line 315) }
-          if (State.EndA + State.EndB) - BxyBest < FxyBest - (State.BeginA + State.BeginB) then
-          begin
-            Edit.BeginA := BxBest;
-            Edit.EndA := BxBest;
-            Edit.BeginB := BxyBest - BxBest;
-            Edit.EndB := Edit.BeginB;
-          end
-          else
-          begin
-            Edit.BeginA := FxBest;
-            Edit.EndA := FxBest;
-            Edit.BeginB := FxyBest - FxBest;
-            Edit.EndB := Edit.BeginB;
-          end;
-          Found := True;
-          Break;
-        end;
-
-        Inc(D);
-      end;
-    end;
-
-    if not Found then
-      Continue;
-
-    // Push the "after" half onto the stack (processed later — LIFO).
-    if (Item.EndA > Edit.EndA) or (Item.EndB > Edit.EndB) then
-    begin
-      K := Edit.EndB - Edit.EndA;
-      X := ForwardSnake(State, K, Edit.EndA);
-      PushWork(X, Item.EndA, K + X, Item.EndB);
-    end;
-
-    // Emit the middle edit itself.
-    if not Edit.IsEmpty then
-      AEdits.Add(Edit);
-
-    // Push the "before" half onto the stack (processed next — LIFO).
-    if (Item.BeginA < Edit.BeginA) or (Item.BeginB < Edit.BeginB) then
-    begin
-      K := Edit.BeginB - Edit.BeginA;
-      X := BackwardSnake(State, K, Edit.BeginA);
-      PushWork(Item.BeginA, X, Item.BeginB, K + X);
-    end;
-  end;
-
-  // The explicit-stack (LIFO) processing emits edits out of positional
-  // order. Sort by BeginA (then BeginB) so EditsToOpcodes can walk them
-  // in order. This is the same approach TextDiff uses — its PushDiff/
-  // PopDiff loop also produces out-of-order edits that are sorted by
-  // position at the end.
-  if AEdits.Count > 1 then
-  begin
-    // Simple insertion sort — edit count is typically small (O(D) where
-    // D is the edit distance, not O(N)). For very large edit counts,
-    // could switch to quicksort, but insertion sort is cache-friendly
-    // and fast for small arrays.
-    for K := 1 to AEdits.Count - 1 do
-    begin
-      Edit := AEdits.Items[K];
-      D := K - 1;
-      while (D >= 0) and
-            ((AEdits.Items[D].BeginA > Edit.BeginA) or
-             ((AEdits.Items[D].BeginA = Edit.BeginA) and
-              (AEdits.Items[D].BeginB > Edit.BeginB))) do
-      begin
-        AEdits.Items[D + 1] := AEdits.Items[D];
-        Dec(D);
-      end;
-      AEdits.Items[D + 1] := Edit;
-    end;
-  end;
+  Result := FCount;
 end;
 
-{ MyersDiffNonCommon: entry point for Myers diff with discard_confusing_lines
-  preprocessing.
-
-  This wrapper decides whether to apply discard_confusing_lines (analyze.c
-  line 942) before running MyersDiffCore. The discard step removes lines
-  that obviously don't match (nmatch == 0) or that match too many lines
-  (provisionally discardable), reducing the input size for Myers and
-  avoiding the O(N*D) trap on files with many unique lines (e.g. log
-  files with timestamps that change on every line).
-
-  Threshold: only apply discard when the region has >= 256 lines on
-  either side. Below that, the overhead of building equiv classes and
-  virtual sequences outweighs the benefit, and Myers is fast enough.
-
-  After Myers runs on the virtual (kept) sequences, the resulting edits
-  are translated back to real line indices, and discarded lines are
-  emitted as standalone INSERT (side B) / DELETE (side A) edits. The
-  final edit list is then sorted by BeginA/BeginB for EditsToOpcodes. }
-function MyersDiffNonCommon(
-  out AEdits: TDiffEditList;
-  const ASeqA, ASeqB: TLineSequence;
-  ARegion: TDiffEdit
-): Boolean;
-const
-  { Below this threshold, skip discard preprocessing — Myers is fast
-    enough on small inputs and the equiv-class overhead isn't worth it. }
-  DISCARD_MIN_LINES = 256;
-var
-  DiscardA, DiscardB: TDiscardMap;
-  VirtSeqA, VirtSeqB: TLineSequence;
-  VirtRegion: TDiffEdit;
-  VirtEdits: TDiffEditList;
-  UseDiscard: Boolean;
-  I, J: Integer;
-  LenA, LenB: Integer;
-  Edit: TDiffEdit;
-  ChangedA, ChangedB: array of Boolean;
-  IA, IB, StartA, StartB: Integer;
-  RealBegin, RealEnd: Integer;
+function TIntList.Get(i: Integer): Integer;
 begin
-  Result := True;
-  AEdits.Init;
-  LenA := ARegion.LengthA;
-  LenB := ARegion.LengthB;
-
-  // Decide whether to apply discard_confusing_lines preprocessing.
-  UseDiscard := (LenA >= DISCARD_MIN_LINES) or
-                (LenB >= DISCARD_MIN_LINES);
-
-  if not UseDiscard then
-  begin
-    // Small input — run Myers directly on the original sequences.
-    Exit(MyersDiffCore(AEdits, ASeqA, ASeqB, ARegion));
-  end;
-
-  // Run discard_confusing_lines on both sides.
-  DiscardConfusingLines(ASeqA, ASeqB, ARegion, DiscardA, DiscardB);
-
-  // If discard didn't remove anything, skip the virtual-sequence path.
-  if (DiscardA.FKeptCount = ARegion.LengthA) and
-     (DiscardB.FKeptCount = ARegion.LengthB) then
-  begin
-    Exit(MyersDiffCore(AEdits, ASeqA, ASeqB, ARegion));
-  end;
-
-  // Build virtual sequences containing only kept lines.
-  BuildVirtualSequence(ASeqA, ARegion.BeginA, DiscardA, VirtSeqA);
-  BuildVirtualSequence(ASeqB, ARegion.BeginB, DiscardB, VirtSeqB);
-
-  // Handle degenerate cases where one side is entirely discarded.
-  if (VirtSeqA.Size = 0) and (VirtSeqB.Size = 0) then
-  begin
-    // Both sides entirely discarded — entire region is a REPLACE.
-    AEdits.Add(ARegion);
-    Exit;
-  end;
-
-  if VirtSeqA.Size = 0 then
-  begin
-    // All of A was discarded. Run Myers on B's kept lines vs nothing
-    // isn't useful — just emit: kept B lines as INSERT, discarded A
-    // lines as DELETE. But wait, the kept B lines might still match
-    // discarded A lines (rare but possible). For correctness, fall
-    // back to core on the original sequences.
-    Exit(MyersDiffCore(AEdits, ASeqA, ASeqB, ARegion));
-  end;
-  if VirtSeqB.Size = 0 then
-  begin
-    Exit(MyersDiffCore(AEdits, ASeqA, ASeqB, ARegion));
-  end;
-
-  // Run Myers on the virtual sequences.
-  VirtRegion := TDiffEdit.Create(0, VirtSeqA.Size, 0, VirtSeqB.Size);
-  VirtEdits.Init;
-  MyersDiffCore(VirtEdits, VirtSeqA, VirtSeqB, VirtRegion);
-
-  // Translate virtual edits back to real line indices using the
-  // build_script approach from GNU diffutils (analyze.c line 793).
-  //
-  // Build changedA[] / changedB[] boolean arrays (indexed by real offset
-  // within the region). Mark:
-  //   - Discarded lines as changed (they're standalone INSERT/DELETE)
-  //   - Virtual edit lines as changed (mapped back via FKeptIdx)
-  // Then walk both arrays in lock-step, grouping consecutive changed
-  // lines into TDiffEdit records. Unchanged lines on both sides become
-  // EQUAL gaps (handled by EditsToOpcodes).
-  SetLength(ChangedA, LenA + 1);  // +1 for sentinel
-  SetLength(ChangedB, LenB + 1);
-  for I := 0 to LenA do ChangedA[I] := False;
-  for I := 0 to LenB do ChangedB[I] := False;
-
-  // Mark discarded lines as changed.
-  for I := 0 to LenA - 1 do
-    if DiscardA.FDiscarded[I] then
-      ChangedA[I] := True;
-  for I := 0 to LenB - 1 do
-    if DiscardB.FDiscarded[I] then
-      ChangedB[I] := True;
-
-  // Mark virtual edit lines as changed (map virtual indices back to real).
-  for I := 0 to VirtEdits.Count - 1 do
-  begin
-    Edit := VirtEdits.Items[I];
-    // A side: map virtual [BeginA, EndA) to real offsets.
-    if Edit.BeginA < Edit.EndA then
-    begin
-      RealBegin := DiscardA.FKeptIdx[Edit.BeginA];
-      RealEnd := DiscardA.FKeptIdx[Edit.EndA - 1] + 1;
-      for J := RealBegin to RealEnd - 1 do
-        ChangedA[J] := True;
-    end;
-    // B side: map virtual [BeginB, EndB) to real offsets.
-    if Edit.BeginB < Edit.EndB then
-    begin
-      RealBegin := DiscardB.FKeptIdx[Edit.BeginB];
-      RealEnd := DiscardB.FKeptIdx[Edit.EndB - 1] + 1;
-      for J := RealBegin to RealEnd - 1 do
-        ChangedB[J] := True;
-    end;
-  end;
-
-  // Walk changedA[] and changedB[] in lock-step, emitting TDiffEdit
-  // records for runs of changed lines. This is a direct port of
-  // build_script (analyze.c line 793).
-  IA := 0;
-  IB := 0;
-  while (IA < LenA) or (IB < LenB) do
-  begin
-    if ChangedA[IA] or ChangedB[IB] then
-    begin
-      StartA := IA;
-      StartB := IB;
-      while ChangedA[IA] do Inc(IA);
-      while ChangedB[IB] do Inc(IB);
-      AEdits.Add(TDiffEdit.Create(
-        ARegion.BeginA + StartA, ARegion.BeginA + IA,
-        ARegion.BeginB + StartB, ARegion.BeginB + IB));
-    end;
-    if IA < LenA then Inc(IA);
-    if IB < LenB then Inc(IB);
-  end;
+  if (i < 0) or (i >= FCount) then
+    raise EArgumentOutOfRangeException.CreateFmt('TIntList.Get(%d) out of range [0, %d)', [i, FCount]);
+  Result := FEntries[i];
 end;
 
-{ ---------- HistogramDiff ---------- }
-{
-  Port of JGit's HistogramDiff.java + HistogramDiffIndex.java.
-  Builds an occurrence-count histogram of A's elements, then walks B
-  looking for the longest common subsequence with the lowest occurrence
-  count. When a hash bucket exceeds max_chain_length distinct elements,
-  gives up on the region and falls back to Myers.
-}
-
-procedure THistogramIndex.Init(AMaxChainLength: Integer; ASeqA, ASeqB: PLineSequence; ARegion: TDiffEdit);
-var
-  Sz, Bits: Integer;
+procedure TIntList.Clear;
 begin
-  FMaxChainLength := AMaxChainLength;
-  FSeqA := ASeqA;
-  FSeqB := ASeqB;
-  FRegion := ARegion;
-  if ARegion.EndA >= MAX_PTR then
-    raise EArgumentException.Create('Sequence too large for diff algorithm');
-  Sz := ARegion.LengthA;
-  Bits := TableBits(Sz);
-  SetLength(FTable, 1 shl Bits);
-  FKeyShift := 32 - Bits;
-  FPtrShift := ARegion.BeginA;
-  if Sz > 0 then
-  begin
-    SetLength(FRecs, MaxI(4, Sz shr 3));
-    SetLength(FNext, Sz);
-    SetLength(FRecIdx, Sz);
-  end
+  FCount := 0;
+end;
+
+procedure TIntList.Add(n: Integer);
+begin
+  if FCount = Length(FEntries) then
+    Grow;
+  FEntries[FCount] := n;
+  Inc(FCount);
+end;
+
+procedure TIntList.SetItem(index: Integer; n: Integer);
+begin
+  if (index < 0) or (index > FCount) then
+    raise EArgumentOutOfRangeException.CreateFmt('TIntList.SetItem(%d) out of range [0, %d]', [index, FCount]);
+  if index = FCount then
+    Add(n)
   else
+    FEntries[index] := n;
+end;
+
+procedure TIntList.FillTo(toIndex: Integer; val: Integer);
+begin
+  while FCount < toIndex do
+    Add(val);
+end;
+
+{ ------------------------------------------------------------------
+  TLongList methods — ported from util/LongList.java
+  ------------------------------------------------------------------ }
+
+constructor TLongList.Create(capacity: Integer);
+begin
+  inherited Create;
+  SetLength(FEntries, capacity);
+  FCount := 0;
+end;
+
+procedure TLongList.Grow;
+var
+  newCap: Integer;
+begin
+  if Length(FEntries) = 0 then
+    newCap := 10
+  else
+    newCap := (Length(FEntries) + 16) * 3 div 2;
+  SetLength(FEntries, newCap);
+end;
+
+function TLongList.Size: Integer;
+begin
+  Result := FCount;
+end;
+
+function TLongList.Get(i: Integer): Int64;
+begin
+  if (i < 0) or (i >= FCount) then
+    raise EArgumentOutOfRangeException.CreateFmt('TLongList.Get(%d) out of range [0, %d)', [i, FCount]);
+  Result := FEntries[i];
+end;
+
+procedure TLongList.Clear;
+begin
+  FCount := 0;
+end;
+
+procedure TLongList.Add(n: Int64);
+begin
+  if FCount = Length(FEntries) then
+    Grow;
+  FEntries[FCount] := n;
+  Inc(FCount);
+end;
+
+procedure TLongList.SetItem(index: Integer; n: Int64);
+begin
+  if (index < 0) or (index > FCount) then
+    raise EArgumentOutOfRangeException.CreateFmt('TLongList.SetItem(%d) out of range [0, %d]', [index, FCount]);
+  if index = FCount then
+    Add(n)
+  else
+    FEntries[index] := n;
+end;
+
+procedure TLongList.FillTo(toIndex: Integer; val: Int64);
+begin
+  while FCount < toIndex do
+    Add(val);
+end;
+
+{ ------------------------------------------------------------------
+  TSequenceComparator — ported from diff/SequenceComparator.java
+  ------------------------------------------------------------------ }
+
+{ Ported from SequenceComparator.reduceCommonStartEnd() (lines 81-99).
+  Default implementation: use equals() to skip common leading and trailing
+  items. Mutates e in place; returns the (modified) e.
+
+  Subclasses (RawTextComparator) override this with a faster byte-level
+  fast path that ultimately calls back into this method via inherited. }
+function TSequenceComparator.ReduceCommonStartEnd(a: TSequence; b: TSequence; var e: TEdit): TEdit;
+begin
+  // Skip over items that are common at the start.
+  while (e.beginA < e.endA) and (e.beginB < e.endB)
+        and Equals(a, e.beginA, b, e.beginB) do
   begin
-    SetLength(FRecs, 4);
-    FNext := nil;
-    FRecIdx := nil;
+    Inc(e.beginA);
+    Inc(e.beginB);
   end;
-  FRecCnt := 0;
-  FLcs := TDiffEdit.Create(0, 0, 0, 0);
-  FCnt := FMaxChainLength + 1;
-  FHasCommon := False;
-  FFallback := False;
-end;
 
-{$PUSH}
-{$RANGECHECKS OFF}  { Cardinal*Cardinal Knuth multiplicative mix wraps
-                       on the assignment to Mixed. }
-function THistogramIndex.HashSeq(ASeq: PLineSequence; AIdx: Integer): Integer;
-var
-  RawHash: Integer;
-  Mixed: Cardinal;
-begin
-  RawHash := ASeq^.HashAt(AIdx);
-  Mixed := Cardinal(RawHash) * HASH_MIX_CONSTANT;
-  Result := Integer(Mixed shr FKeyShift);
-end;
-{$POP}
-
-class function THistogramIndex.RecCreate(ANext, APtr, ACnt: Integer): Int64;
-begin
-  Result := (Int64(ANext) shl REC_NEXT_SHIFT) or
-            (Int64(APtr) shl REC_PTR_SHIFT) or
-            Int64(ACnt);
-end;
-
-{$PUSH}
-{$RANGECHECKS OFF}  { Int64-to-Integer narrowing on the return. }
-class function THistogramIndex.RecNext(ARec: Int64): Integer;
-begin
-  Result := Int64(ARec) shr REC_NEXT_SHIFT;
-end;
-
-class function THistogramIndex.RecPtr(ARec: Int64): Integer;
-begin
-  Result := (Int64(ARec) shr REC_PTR_SHIFT) and REC_PTR_MASK;
-end;
-
-class function THistogramIndex.RecCnt(ARec: Int64): Integer;
-begin
-  Result := Int64(ARec) and REC_CNT_MASK;
-end;
-{$POP}
-
-class function THistogramIndex.TableBits(ASz: Integer): Integer;
-var
-  Bits: Integer;
-begin
-  if ASz <= 0 then
-    Exit(1);
-  Bits := 0;
-  while (1 shl Bits) < ASz do
-    Inc(Bits);
-  if Bits = 0 then
-    Bits := 1;
-  if (1 shl Bits) < ASz then
-    Inc(Bits);
-  Result := Bits;
-end;
-
-function THistogramIndex.ScanA: Boolean;
-var
-  Ptr, TIdx, RIdx, ChainLen, NewCnt: Integer;
-  Rec: Int64;
-  SeqA: PLineSequence;
-  FoundExisting: Boolean;
-begin
-  Result := False;
-  SeqA := FSeqA;
-  Ptr := FRegion.EndA - 1;
-  while Ptr >= FRegion.BeginA do
+  // Skip over items that are common at the end.
+  while (e.beginA < e.endA) and (e.beginB < e.endB)
+        and Equals(a, e.endA - 1, b, e.endB - 1) do
   begin
-    TIdx := HashSeq(FSeqA, Ptr);
-    ChainLen := 0;
-    RIdx := FTable[TIdx];
-    FoundExisting := False;
-    while RIdx <> 0 do
+    Dec(e.endA);
+    Dec(e.endB);
+  end;
+
+  Result := e;
+end;
+
+{ ------------------------------------------------------------------
+  TRawText — ported from diff/RawText.java (lines 41-590)
+  ------------------------------------------------------------------ }
+
+{ Ported from RawText(byte[]) constructor (lines 72-74).
+  Calls RawParseUtils.lineMap(input, 0, input.length) — but with our
+  documented divergence (G8): split on \r\n / \r / \n instead of just \n.
+
+  Builds an IntList with this layout:
+    Index 0     : MIN_VALUE sentinel (matches JGit's `map.fillTo(1, Integer.MIN_VALUE)`)
+    Index 1..N  : byte offset of the start of each line (1-based indexing)
+    Index N+1   : end-of-content (= Length(input))
+
+  For "abc\n":
+    Index 0: MIN_VALUE
+    Index 1: 0    (start of line "abc\n")
+    Index 2: 4    (end of content)
+  -> Size() = 3 - 2 = 1 line.
+
+  For "" (empty input):
+    Index 0: MIN_VALUE
+    Index 1: 0    (end of content)
+  -> Size() = 2 - 2 = 0 lines.
+
+  For "abc" (no terminator):
+    Index 0: MIN_VALUE
+    Index 1: 0    (start of line "abc")
+    Index 2: 3    (end of content)
+  -> Size() = 3 - 2 = 1 line.
+
+  For "a\r\nb\nc\rd" (mixed EOLs):
+    Index 0: MIN_VALUE
+    Index 1: 0    (start of "a\r\n")
+    Index 2: 3    (start of "b\n")
+    Index 3: 5    (start of "c\r")
+    Index 4: 7    (start of "d" - no terminator)
+    Index 5: 8    (end of content)
+  -> Size() = 5 - 2 = 4 lines.
+
+  Edge cases (must match split_lines_safe exactly):
+    1. "abc\n" -> 1 line: "abc\n"
+    2. ""      -> 0 lines
+    3. "abc"   -> 1 line: "abc"
+    4. "a\r\nb\nc\rd" -> 4 lines: "a\r\n", "b\n", "c\r", "d"
+    5. "\r\n"  -> 1 line: "\r\n" (NOT 2 lines)
+    6. "\n\n"  -> 2 lines: "\n", "\n"
+
+  Implementation: scan byte-by-byte. At each position, look for \r\n
+  (treated as ONE boundary), \r, or \n. }
+constructor TRawText.Create(const input: RawByteString);
+var
+  map: TIntList;
+  p, n: Integer;
+  raw: PByte;
+begin
+  inherited Create;
+  FContent := input;
+  UpdateContentPtr;
+  raw := FContentPtr;
+  n := Length(input);
+
+  map := TIntList.Create((n div 36) + 8);
+  FLines := map;
+
+  // JGit: map.fillTo(1, Integer.MIN_VALUE) — index 0 is a MIN_VALUE sentinel.
+  // In Pascal, Low(Integer) = -2147483648 = Java's Integer.MIN_VALUE.
+  map.FillTo(1, Low(Integer));
+
+  p := 0;
+  while p < n do
+  begin
+    map.Add(p);
+    // Find next line boundary: \r\n (one boundary), \r (one boundary), \n (one boundary).
+    // Match RawParseUtils.nextLF() semantics: returns position *after* the LF.
+    while p < n do
     begin
-      Rec := FRecs[RIdx];
-      if SeqA^.EqualsAt(RecPtr(Rec), SeqA^, Ptr) then
+      if raw[p] = $0A then  // \n
       begin
-        NewCnt := RecCnt(Rec) + 1;
-        if NewCnt > MAX_CNT then
-          NewCnt := MAX_CNT;
-        FRecs[RIdx] := RecCreate(RecNext(Rec), Ptr, NewCnt);
-        FNext[Ptr - FPtrShift] := RecPtr(Rec);
-        FRecIdx[Ptr - FPtrShift] := RIdx;
-        FoundExisting := True;
+        Inc(p);  // position *after* the LF
         Break;
-      end;
-      RIdx := RecNext(Rec);
-      Inc(ChainLen);
+      end
+      else if raw[p] = $0D then  // \r
+      begin
+        Inc(p);
+        if (p < n) and (raw[p] = $0A) then  // \r\n
+          Inc(p);
+        Break;
+      end
+      else
+        Inc(p);
+    end;
+  end;
+
+  // Final sentinel: end-of-content. Matches JGit's map.add(end) at the end.
+  map.Add(n);
+end;
+
+destructor TRawText.Destroy;
+begin
+  FLines.Free;
+  inherited Destroy;
+end;
+
+procedure TRawText.UpdateContentPtr;
+begin
+  if Length(FContent) > 0 then
+    FContentPtr := PByte(Pointer(FContent))
+  else
+    FContentPtr := nil;
+end;
+
+{ Ported from RawText.size() (lines 119-126).
+  Line map is always 2 entries larger than line count: index 0 is padding,
+  last index is total buffer length (sentinel). }
+function TRawText.Size: Integer;
+begin
+  Result := FLines.Size - 2;
+end;
+
+{ Ported from RawText.getStart(i) (private, lines 241-243).
+  Uses lines[i+1] because lines[0] is the MIN_VALUE sentinel. }
+function TRawText.GetStart(i: Integer): Integer;
+begin
+  Result := FLines.Get(i + 1);
+end;
+
+{ Ported from RawText.getEnd(i) (private, lines 245-247).
+  Uses lines[i+2] — the next line's start = current line's end. }
+function TRawText.GetEnd(i: Integer): Integer;
+begin
+  Result := FLines.Get(i + 2);
+end;
+
+{ ------------------------------------------------------------------
+  TRawTextComparator methods — ported from diff/RawTextComparator.java
+  ------------------------------------------------------------------ }
+
+constructor TRawTextComparator.Create(AFlags: Integer);
+begin
+  inherited Create;
+  FFlags := AFlags;
+end;
+
+{ Ported from RawTextComparator.hash() (lines 223-228).
+  begin = lines[lno+1], end = lines[lno+2].
+  Delegates to per-subclass HashRegion. }
+function TRawTextComparator.Hash(seq: TSequence; ptr: Integer): Integer;
+var
+  rt: TRawText;
+  lBegin, lEnd: Integer;
+begin
+  rt := seq as TRawText;
+  lBegin := rt.Lines.Get(ptr + 1);
+  lEnd := rt.Lines.Get(ptr + 2);
+  Result := HashRegion(rt.ContentPtr, lBegin, lEnd);
+end;
+
+{ Ported from RawTextComparator.findForwardLine() (lines 284-289).
+  Scans lines forward from idx until lines[idx+2] >= ptr. }
+function FindForwardLine(lines: TIntList; idx, ptr: Integer): Integer;
+var
+  endIdx: Integer;
+begin
+  endIdx := lines.Size - 2;
+  while (idx < endIdx) and (lines.Get(idx + 2) < ptr) do
+    Inc(idx);
+  Result := idx;
+end;
+
+{ Ported from RawTextComparator.findReverseLine() (lines 291-295).
+  Scans lines backward from idx while ptr <= lines[idx]. }
+function FindReverseLine(lines: TIntList; idx, ptr: Integer): Integer;
+begin
+  while (0 < idx) and (ptr <= lines.Get(idx)) do
+    Dec(idx);
+  Result := idx;
+end;
+
+{ Ported from RawTextComparator.reduceCommonStartEnd() (lines 231-282).
+
+  Fast byte-level prefix/suffix trim, then super.reduceCommonStartEnd
+  for line-level trim via equals().
+
+  DIVERGENCE: JGit's source at line 245 reads `bPtr = a.lines.get(e.beginB + 1)`
+  which is almost certainly a typo for `b.lines.get(...)`. We port it
+  correctly with `b.lines.get(...)`. The bug in JGit only matters when
+  a and b have different line layouts (rare); in 99% of cases aPtr and
+  bPtr coincide because the common prefix implies similar line layouts.
+
+  Also: when CASE/NUMBERS/EOL flags are set, the byte-level fast path
+  becomes *conservative* — it stops at the first raw byte difference
+  even though equals() would say the bytes are equivalent (e.g. 'A'
+  vs 'a' with CASE on). This is safe — the slow path picks up the slack
+  via ReduceCommonStartEnd's inherited equals() loop. }
+function TRawTextComparator.ReduceCommonStartEnd(a: TSequence; b: TSequence; var e: TEdit): TEdit;
+var
+  ra, rb: TRawText;
+  aRaw, bRaw: PByte;
+  aPtr, bPtr, aEnd, bEnd: Integer;
+  partialA: Boolean;
+begin
+  ra := a as TRawText;
+  rb := b as TRawText;
+
+  if (e.beginA = e.endA) or (e.beginB = e.endB) then
+    Exit(e);
+
+  aRaw := ra.ContentPtr;
+  bRaw := rb.ContentPtr;
+
+  aPtr := ra.Lines.Get(e.beginA + 1);
+  bPtr := rb.Lines.Get(e.beginB + 1);  // FIX: JGit typo uses `a.lines.get` here
+
+  aEnd := ra.Lines.Get(e.endA + 1);
+  bEnd := rb.Lines.Get(e.endB + 1);
+
+  // Sanity bounds check (matches JGit's ArrayIndexOutOfBoundsException check).
+  if (aPtr < 0) or (bPtr < 0) or (aEnd > Length(ra.Content)) or (bEnd > Length(rb.Content)) then
+    raise ERangeError.Create('TRawTextComparator.ReduceCommonStartEnd: out-of-bounds');
+
+  // Forward byte scan: find first byte where a and b differ.
+  while (aPtr < aEnd) and (bPtr < bEnd) and (aRaw[aPtr] = bRaw[bPtr]) do
+  begin
+    Inc(aPtr);
+    Inc(bPtr);
+  end;
+
+  // Reverse byte scan: find last byte where a and b differ (from the end).
+  while (aPtr < aEnd) and (bPtr < bEnd) and (aRaw[aEnd - 1] = bRaw[bEnd - 1]) do
+  begin
+    Dec(aEnd);
+    Dec(bEnd);
+  end;
+
+  // Map byte positions back to line indices.
+  e.beginA := FindForwardLine(ra.Lines, e.beginA, aPtr);
+  e.beginB := FindForwardLine(rb.Lines, e.beginB, bPtr);
+
+  e.endA := FindReverseLine(ra.Lines, e.endA, aEnd);
+
+  // If a's trimmed end falls mid-line, advance bEnd by the same byte offset
+  // so the next FindReverseLine on b maps to the same line index.
+  partialA := aEnd < ra.Lines.Get(e.endA + 1);
+  if partialA then
+    Inc(bEnd, ra.Lines.Get(e.endA + 1) - aEnd);
+
+  e.endB := FindReverseLine(rb.Lines, e.endB, bEnd);
+
+  // If a wasn't partial but b is, advance endA by one to include the
+  // partial line in b's diff region.
+  if (not partialA) and (bEnd < rb.Lines.Get(e.endB + 1)) then
+    Inc(e.endA);
+
+  // Fall through to super.reduceCommonStartEnd for line-level trim via
+  // equals() — picks up any common lines the byte fast-path missed
+  // (e.g. when CASE/NUMBERS/EOL flags are active).
+  Result := inherited ReduceCommonStartEnd(a, b, e);
+end;
+
+{ ------------------------------------------------------------------
+  TRawTextComparatorDefault — ported from RawTextComparator.DEFAULT
+  (lines 25-53)
+  ------------------------------------------------------------------ }
+
+{ Ported from RawTextComparator.DEFAULT.equals() (lines 27-44).
+  Compares byte ranges [lines[ai+1], lines[ai+2]) and [lines[bi+1], lines[bi+2])
+  for exact byte equality.
+
+  With DIFF_IGN_CASE: applies ASCII tolower per byte (NOT Unicode folding).
+  With DIFF_IGN_NUMBERS: skips digit bytes entirely (compares as if they
+    weren't there).
+  With DIFF_IGN_EOL: trims trailing \r\n / \n / \r before comparing. }
+function TRawTextComparatorDefault.Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean;
+var
+  ra, rb: TRawText;
+  as_, bs, ae, be: Integer;
+  aRaw, bRaw: PByte;
+  ac, bc: Byte;
+begin
+  Inc(ai);
+  Inc(bi);
+  ra := a as TRawText;
+  rb := b as TRawText;
+  as_ := ra.Lines.Get(ai);
+  bs := rb.Lines.Get(bi);
+  ae := ra.Lines.Get(ai + 1);
+  be := rb.Lines.Get(bi + 1);
+
+  // DIFF_IGN_EOL: trim trailing EOL from each line before comparing.
+  as_ := as_;  // (no-op, kept for symmetry with HashRegion)
+  ae := TrimTrailingEOL(ra.ContentPtr, as_, ae, FFlags);
+  be := TrimTrailingEOL(rb.ContentPtr, bs, be, FFlags);
+
+  aRaw := ra.ContentPtr;
+  bRaw := rb.ContentPtr;
+
+  // Default fast path: if no CASE/NUMBERS flags, lengths must match.
+  if (FFlags and (cIgnCase or cIgnNumbers)) = 0 then
+  begin
+    if (ae - as_) <> (be - bs) then
+      Exit(False);
+    while as_ < ae do
+    begin
+      if aRaw[as_] <> bRaw[bs] then
+        Exit(False);
+      Inc(as_);
+      Inc(bs);
+    end;
+    Exit(True);
+  end;
+
+  // Slow path: with CASE/NUMBERS, lengths may differ (digits skipped).
+  while (as_ < ae) and (bs < be) do
+  begin
+    ac := aRaw[as_];
+    if IsSkippedByte(ac, FFlags) then
+    begin
+      Inc(as_);
+      Continue;
+    end;
+    bc := bRaw[bs];
+    if IsSkippedByte(bc, FFlags) then
+    begin
+      Inc(bs);
+      Continue;
+    end;
+    if XformByte(ac, FFlags) <> XformByte(bc, FFlags) then
+      Exit(False);
+    Inc(as_);
+    Inc(bs);
+  end;
+
+  // Skip any trailing skipped bytes (digits) so trailing digits don't
+  // cause a false "unequal" verdict.
+  while (as_ < ae) and IsSkippedByte(aRaw[as_], FFlags) do
+    Inc(as_);
+  while (bs < be) and IsSkippedByte(bRaw[bs], FFlags) do
+    Inc(bs);
+
+  Result := (as_ = ae) and (bs = be);
+end;
+
+{ Ported from RawTextComparator.DEFAULT.hashRegion() (lines 47-52).
+  DJB2 hash with seed 5381, multiplier 33 (implemented as (hash << 5) + hash).
+  Wraps on overflow intentionally (see $PUSH/$R-/$Q- in Djb2Hash/Djb2HashCase).
+
+  With CASE/NUMBERS: applies the transforms per byte. }
+function TRawTextComparatorDefault.HashRegion(raw: PByte; ptr, end_: Integer): Integer;
+begin
+  end_ := TrimTrailingEOL(raw, ptr, end_, FFlags);
+  if (FFlags and (cIgnCase or cIgnNumbers)) = 0 then
+    Result := Djb2Hash(raw, ptr, end_)
+  else
+    Result := Djb2HashCase(raw, ptr, end_, FFlags);
+end;
+
+{ ------------------------------------------------------------------
+  TRawTextComparatorWSIgnoreAll — ported from RawTextComparator.WS_IGNORE_ALL
+  (lines 56-104)
+  ------------------------------------------------------------------ }
+
+{ Ported from RawTextComparator.WS_IGNORE_ALL.equals() (lines 58-92).
+  Ignores all whitespace bytes. Trims trailing WS, then walks both lines
+  in lockstep, skipping any WS bytes encountered.
+
+  With CASE/NUMBERS: applies XformByte/IsSkippedByte in addition to
+  the WS skipping. With EOL: trims trailing EOL before the WS trim. }
+function TRawTextComparatorWSIgnoreAll.Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean;
+var
+  ra, rb: TRawText;
+  as_, bs, ae, be: Integer;
+  aRaw, bRaw: PByte;
+  ac, bc: Byte;
+begin
+  Inc(ai);
+  Inc(bi);
+  ra := a as TRawText;
+  rb := b as TRawText;
+  as_ := ra.Lines.Get(ai);
+  bs := rb.Lines.Get(bi);
+  ae := ra.Lines.Get(ai + 1);
+  be := rb.Lines.Get(bi + 1);
+
+  ae := TrimTrailingEOL(ra.ContentPtr, as_, ae, FFlags);
+  be := TrimTrailingEOL(rb.ContentPtr, bs, be, FFlags);
+  ae := TrimTrailingWhitespace(ra.ContentPtr, as_, ae);
+  be := TrimTrailingWhitespace(rb.ContentPtr, bs, be);
+
+  aRaw := ra.ContentPtr;
+  bRaw := rb.ContentPtr;
+
+  while (as_ < ae) and (bs < be) do
+  begin
+    ac := aRaw[as_];
+    while (as_ < ae - 1) and IsWhitespaceByte(ac) do
+    begin
+      Inc(as_);
+      ac := aRaw[as_];
     end;
 
-    if FoundExisting then
+    bc := bRaw[bs];
+    while (bs < be - 1) and IsWhitespaceByte(bc) do
     begin
-      Dec(Ptr);
+      Inc(bs);
+      bc := bRaw[bs];
+    end;
+
+    // Skip digit bytes (DIFF_IGN_NUMBERS).
+    if IsSkippedByte(ac, FFlags) then
+    begin
+      Inc(as_);
+      Continue;
+    end;
+    if IsSkippedByte(bc, FFlags) then
+    begin
+      Inc(bs);
       Continue;
     end;
 
-    if ChainLen = FMaxChainLength then
+    if XformByte(ac, FFlags) <> XformByte(bc, FFlags) then
       Exit(False);
 
-    Inc(FRecCnt);
-    RIdx := FRecCnt;
-    if RIdx >= Length(FRecs) then
-      SetLength(FRecs, MaxI(Length(FRecs) * 2, RIdx + 1));
+    Inc(as_);
+    Inc(bs);
+  end;
 
-    FRecs[RIdx] := RecCreate(FTable[TIdx], Ptr, 1);
-    FRecIdx[Ptr - FPtrShift] := RIdx;
-    FTable[TIdx] := RIdx;
+  Result := (as_ = ae) and (bs = be);
+end;
 
-    Dec(Ptr);
+{ Ported from RawTextComparator.WS_IGNORE_ALL.hashRegion() (lines 95-103).
+  DJB2 hash that skips whitespace bytes. With CASE/NUMBERS: applies
+  transforms on the non-WS bytes. }
+function TRawTextComparatorWSIgnoreAll.HashRegion(raw: PByte; ptr, end_: Integer): Integer;
+{$PUSH}{$R-}{$Q-}
+var
+  h: Integer;
+  c: Byte;
+begin
+  end_ := TrimTrailingEOL(raw, ptr, end_, FFlags);
+  end_ := TrimTrailingWhitespace(raw, ptr, end_);
+  h := 5381;
+  while ptr < end_ do
+  begin
+    c := raw[ptr];
+    if not IsWhitespaceByte(c) then
+    begin
+      if not IsSkippedByte(c, FFlags) then
+        h := ((h shl 5) + h) + (XformByte(c, FFlags) and $FF);
+    end;
+    Inc(ptr);
+  end;
+  Result := h;
+end;
+{$POP}
+
+{ ------------------------------------------------------------------
+  TRawTextComparatorWSIgnoreLeading — ported from RawTextComparator.WS_IGNORE_LEADING
+  (lines 109-141)
+  ------------------------------------------------------------------ }
+
+function TRawTextComparatorWSIgnoreLeading.Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean;
+var
+  ra, rb: TRawText;
+  as_, bs, ae, be: Integer;
+  aRaw, bRaw: PByte;
+  ac, bc: Byte;
+begin
+  Inc(ai);
+  Inc(bi);
+  ra := a as TRawText;
+  rb := b as TRawText;
+  as_ := ra.Lines.Get(ai);
+  bs := rb.Lines.Get(bi);
+  ae := ra.Lines.Get(ai + 1);
+  be := rb.Lines.Get(bi + 1);
+
+  ae := TrimTrailingEOL(ra.ContentPtr, as_, ae, FFlags);
+  be := TrimTrailingEOL(rb.ContentPtr, bs, be, FFlags);
+
+  as_ := TrimLeadingWhitespace(ra.ContentPtr, as_, ae);
+  bs := TrimLeadingWhitespace(rb.ContentPtr, bs, be);
+
+  aRaw := ra.ContentPtr;
+  bRaw := rb.ContentPtr;
+
+  // After leading-WS trim, default byte comparison with CASE/NUMBERS handling.
+  if (FFlags and (cIgnCase or cIgnNumbers)) = 0 then
+  begin
+    if (ae - as_) <> (be - bs) then
+      Exit(False);
+    while as_ < ae do
+    begin
+      if aRaw[as_] <> bRaw[bs] then
+        Exit(False);
+      Inc(as_);
+      Inc(bs);
+    end;
+    Exit(True);
+  end;
+
+  while (as_ < ae) and (bs < be) do
+  begin
+    ac := aRaw[as_];
+    if IsSkippedByte(ac, FFlags) then
+    begin
+      Inc(as_);
+      Continue;
+    end;
+    bc := bRaw[bs];
+    if IsSkippedByte(bc, FFlags) then
+    begin
+      Inc(bs);
+      Continue;
+    end;
+    if XformByte(ac, FFlags) <> XformByte(bc, FFlags) then
+      Exit(False);
+    Inc(as_);
+    Inc(bs);
+  end;
+  while (as_ < ae) and IsSkippedByte(aRaw[as_], FFlags) do
+    Inc(as_);
+  while (bs < be) and IsSkippedByte(bRaw[bs], FFlags) do
+    Inc(bs);
+  Result := (as_ = ae) and (bs = be);
+end;
+
+function TRawTextComparatorWSIgnoreLeading.HashRegion(raw: PByte; ptr, end_: Integer): Integer;
+{$PUSH}{$R-}{$Q-}
+var
+  h: Integer;
+  c: Byte;
+begin
+  end_ := TrimTrailingEOL(raw, ptr, end_, FFlags);
+  ptr := TrimLeadingWhitespace(raw, ptr, end_);
+  h := 5381;
+  while ptr < end_ do
+  begin
+    c := raw[ptr];
+    if not IsSkippedByte(c, FFlags) then
+      h := ((h shl 5) + h) + (XformByte(c, FFlags) and $FF);
+    Inc(ptr);
+  end;
+  Result := h;
+end;
+{$POP}
+
+{ ------------------------------------------------------------------
+  TRawTextComparatorWSIgnoreTrailing — ported from RawTextComparator.WS_IGNORE_TRAILING
+  (lines 144-176)
+  ------------------------------------------------------------------ }
+
+function TRawTextComparatorWSIgnoreTrailing.Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean;
+var
+  ra, rb: TRawText;
+  as_, bs, ae, be: Integer;
+  aRaw, bRaw: PByte;
+  ac, bc: Byte;
+begin
+  Inc(ai);
+  Inc(bi);
+  ra := a as TRawText;
+  rb := b as TRawText;
+  as_ := ra.Lines.Get(ai);
+  bs := rb.Lines.Get(bi);
+  ae := ra.Lines.Get(ai + 1);
+  be := rb.Lines.Get(bi + 1);
+
+  ae := TrimTrailingEOL(ra.ContentPtr, as_, ae, FFlags);
+  be := TrimTrailingEOL(rb.ContentPtr, bs, be, FFlags);
+  ae := TrimTrailingWhitespace(ra.ContentPtr, as_, ae);
+  be := TrimTrailingWhitespace(rb.ContentPtr, bs, be);
+
+  aRaw := ra.ContentPtr;
+  bRaw := rb.ContentPtr;
+
+  if (FFlags and (cIgnCase or cIgnNumbers)) = 0 then
+  begin
+    if (ae - as_) <> (be - bs) then
+      Exit(False);
+    while as_ < ae do
+    begin
+      if aRaw[as_] <> bRaw[bs] then
+        Exit(False);
+      Inc(as_);
+      Inc(bs);
+    end;
+    Exit(True);
+  end;
+
+  while (as_ < ae) and (bs < be) do
+  begin
+    ac := aRaw[as_];
+    if IsSkippedByte(ac, FFlags) then
+    begin
+      Inc(as_);
+      Continue;
+    end;
+    bc := bRaw[bs];
+    if IsSkippedByte(bc, FFlags) then
+    begin
+      Inc(bs);
+      Continue;
+    end;
+    if XformByte(ac, FFlags) <> XformByte(bc, FFlags) then
+      Exit(False);
+    Inc(as_);
+    Inc(bs);
+  end;
+  while (as_ < ae) and IsSkippedByte(aRaw[as_], FFlags) do
+    Inc(as_);
+  while (bs < be) and IsSkippedByte(bRaw[bs], FFlags) do
+    Inc(bs);
+  Result := (as_ = ae) and (bs = be);
+end;
+
+function TRawTextComparatorWSIgnoreTrailing.HashRegion(raw: PByte; ptr, end_: Integer): Integer;
+{$PUSH}{$R-}{$Q-}
+var
+  h: Integer;
+  c: Byte;
+begin
+  end_ := TrimTrailingEOL(raw, ptr, end_, FFlags);
+  end_ := TrimTrailingWhitespace(raw, ptr, end_);
+  h := 5381;
+  while ptr < end_ do
+  begin
+    c := raw[ptr];
+    if not IsSkippedByte(c, FFlags) then
+      h := ((h shl 5) + h) + (XformByte(c, FFlags) and $FF);
+    Inc(ptr);
+  end;
+  Result := h;
+end;
+{$POP}
+
+{ ------------------------------------------------------------------
+  TRawTextComparatorWSIgnoreChange — ported from RawTextComparator.WS_IGNORE_CHANGE
+  (lines 179-221)
+  ------------------------------------------------------------------ }
+
+function TRawTextComparatorWSIgnoreChange.Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean;
+var
+  ra, rb: TRawText;
+  as_, bs, ae, be: Integer;
+  aRaw, bRaw: PByte;
+  ac, bc: Byte;
+begin
+  Inc(ai);
+  Inc(bi);
+  ra := a as TRawText;
+  rb := b as TRawText;
+  as_ := ra.Lines.Get(ai);
+  bs := rb.Lines.Get(bi);
+  ae := ra.Lines.Get(ai + 1);
+  be := rb.Lines.Get(bi + 1);
+
+  ae := TrimTrailingEOL(ra.ContentPtr, as_, ae, FFlags);
+  be := TrimTrailingEOL(rb.ContentPtr, bs, be, FFlags);
+  ae := TrimTrailingWhitespace(ra.ContentPtr, as_, ae);
+  be := TrimTrailingWhitespace(rb.ContentPtr, bs, be);
+
+  aRaw := ra.ContentPtr;
+  bRaw := rb.ContentPtr;
+
+  while (as_ < ae) and (bs < be) do
+  begin
+    ac := aRaw[as_];
+    Inc(as_);
+    bc := bRaw[bs];
+    Inc(bs);
+
+    if IsWhitespaceByte(ac) and IsWhitespaceByte(bc) then
+    begin
+      as_ := TrimLeadingWhitespace(aRaw, as_, ae);
+      bs := TrimLeadingWhitespace(bRaw, bs, be);
+    end
+    else
+    begin
+      // Skip digit bytes (DIFF_IGN_NUMBERS) — both before XformByte comparison.
+      if IsSkippedByte(ac, FFlags) then
+      begin
+        Dec(as_);
+        Continue;  // re-read same position with new state
+      end;
+      if IsSkippedByte(bc, FFlags) then
+      begin
+        Dec(bs);
+        Continue;
+      end;
+      if XformByte(ac, FFlags) <> XformByte(bc, FFlags) then
+        Exit(False);
+    end;
+  end;
+
+  Result := (as_ = ae) and (bs = be);
+end;
+
+function TRawTextComparatorWSIgnoreChange.HashRegion(raw: PByte; ptr, end_: Integer): Integer;
+{$PUSH}{$R-}{$Q-}
+var
+  h: Integer;
+  c: Byte;
+begin
+  end_ := TrimTrailingEOL(raw, ptr, end_, FFlags);
+  end_ := TrimTrailingWhitespace(raw, ptr, end_);
+  h := 5381;
+  while ptr < end_ do
+  begin
+    c := raw[ptr];
+    Inc(ptr);
+    if IsWhitespaceByte(c) then
+    begin
+      ptr := TrimLeadingWhitespace(raw, ptr, end_);
+      c := $20;  // ' ' — matches JGit's "treat WS run as single space"
+    end;
+    if not IsSkippedByte(c, FFlags) then
+      h := ((h shl 5) + h) + (XformByte(c, FFlags) and $FF);
+  end;
+  Result := h;
+end;
+{$POP}
+
+{ ------------------------------------------------------------------
+  THashedSequence methods — ported from diff/HashedSequence.java
+  ------------------------------------------------------------------ }
+
+constructor THashedSequence.Create(base: TSequence; hashes: array of Integer);
+var
+  i: Integer;
+begin
+  inherited Create;
+  FBase := base;
+  SetLength(FHashes, Length(hashes));
+  for i := 0 to High(hashes) do
+    FHashes[i] := hashes[i];
+end;
+
+function THashedSequence.Size: Integer;
+begin
+  Result := FBase.Size;
+end;
+
+function THashedSequence.GetHash(i: Integer): Integer;
+begin
+  Result := FHashes[i];
+end;
+
+{ ------------------------------------------------------------------
+  THashedSequenceComparator — ported from HashedSequenceComparator.java
+  ------------------------------------------------------------------ }
+
+constructor THashedSequenceComparator.Create(cmp: TSequenceComparator);
+begin
+  inherited Create;
+  FCmp := cmp;
+end;
+
+{ Ported from HashedSequenceComparator.equals() (lines 37-41).
+  Returns true only if cached hashes match AND underlying comparator
+  agrees (avoids hash collisions). }
+function THashedSequenceComparator.Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean;
+var
+  ha, hb: THashedSequence;
+begin
+  ha := a as THashedSequence;
+  hb := b as THashedSequence;
+  Result := (ha.GetHash(ai) = hb.GetHash(bi))
+        and FCmp.Equals(ha.Base, ai, hb.Base, bi);
+end;
+
+{ Ported from HashedSequenceComparator.hash() (lines 44-46).
+  Returns the cached hash. }
+function THashedSequenceComparator.Hash(seq: TSequence; ptr: Integer): Integer;
+var
+  h: THashedSequence;
+begin
+  h := seq as THashedSequence;
+  Result := h.GetHash(ptr);
+end;
+
+{ Delegate to wrapped comparator's reduceCommonStartEnd. JGit uses
+  SequenceComparator<? super S> for the wrapped cmp, which means the
+  HashedSequenceComparator doesn't override reduceCommonStartEnd
+  (it falls through to the default). We mirror that here. }
+function THashedSequenceComparator.ReduceCommonStartEnd(a: TSequence; b: TSequence; var e: TEdit): TEdit;
+begin
+  // JGit uses SequenceComparator<? super S>, so the wrapped comparator
+  // (e.g. RawTextComparator) handles reduceCommonStartEnd. But the
+  // sequences we get are THashedSequence — they need to be unwrapped
+  // before passing to the wrapped comparator.
+  // HOWEVER: in JGit's flow, reduceCommonStartEnd is called on the
+  // OUTER comparator (the one passed to DiffAlgorithm.diff()), not on
+  // the HashedSequenceComparator. The HashedSequenceComparator is only
+  // used inside diffNonCommon after prefix/suffix trim has already
+  // happened. So this method is never reached in practice — but if it
+  // is, fall through to default behavior (which uses Equals()).
+  Result := inherited ReduceCommonStartEnd(a, b, e);
+end;
+
+{ ------------------------------------------------------------------
+  THashedSequencePair — ported from HashedSequencePair.java
+  ------------------------------------------------------------------ }
+
+constructor THashedSequencePair.Create(cmp: TSequenceComparator; a, b: TSequence);
+begin
+  inherited Create;
+  FCmp := cmp;
+  FBaseA := a;
+  FBaseB := b;
+  FCachedA := nil;
+  FCachedB := nil;
+end;
+
+destructor THashedSequencePair.Destroy;
+begin
+  FCachedA.Free;
+  FCachedB.Free;
+  inherited Destroy;
+end;
+
+function THashedSequencePair.GetComparator: THashedSequenceComparator;
+begin
+  Result := THashedSequenceComparator.Create(FCmp);
+end;
+
+function THashedSequencePair.GetA: THashedSequence;
+begin
+  if FCachedA = nil then
+    FCachedA := Wrap(FBaseA);
+  Result := FCachedA;
+end;
+
+function THashedSequencePair.GetB: THashedSequence;
+begin
+  if FCachedB = nil then
+    FCachedB := Wrap(FBaseB);
+  Result := FCachedB;
+end;
+
+{ Ported from HashedSequencePair.wrap() (lines 81-87).
+  Pre-computes hashes for every element of `base`. }
+function THashedSequencePair.Wrap(base: TSequence): THashedSequence;
+var
+  end_: Integer;
+  hashes: array of Integer;
+  ptr: Integer;
+begin
+  end_ := base.Size;
+  SetLength(hashes, end_);
+  for ptr := 0 to end_ - 1 do
+    hashes[ptr] := FCmp.Hash(base, ptr);
+  Result := THashedSequence.Create(base, hashes);
+end;
+
+{ ------------------------------------------------------------------
+  TSubsequence — ported from diff/Subsequence.java
+  ------------------------------------------------------------------ }
+
+constructor TSubsequence.Create(base: TSequence; begn, end_: Integer);
+begin
+  inherited Create;
+  FBase := base;
+  FBegin := begn;
+  FSize := end_ - begn;
+end;
+
+function TSubsequence.Size: Integer;
+begin
+  Result := FSize;
+end;
+
+class function TSubsequence.A(base: TSequence; const region: TEdit): TSubsequence;
+begin
+  Result := TSubsequence.Create(base, region.beginA, region.endA);
+end;
+
+class function TSubsequence.B(base: TSequence; const region: TEdit): TSubsequence;
+begin
+  Result := TSubsequence.Create(base, region.beginB, region.endB);
+end;
+
+class procedure TSubsequence.ToBaseEdit(var e: TEdit; sa, sb: TSubsequence);
+begin
+  Inc(e.beginA, sa.FBegin);
+  Inc(e.endA, sa.FBegin);
+  Inc(e.beginB, sb.FBegin);
+  Inc(e.endB, sb.FBegin);
+end;
+
+class function TSubsequence.ToBaseEditList(edits: TEditList; sa, sb: TSubsequence): TEditList;
+var
+  i: Integer;
+  e: TEdit;
+begin
+  if edits <> nil then
+    for i := 0 to edits.Size - 1 do
+    begin
+      e := edits.Get(i);
+      ToBaseEdit(e, sa, sb);
+      edits.SetItem(i, e);
+    end;
+  Result := edits;
+end;
+
+{ ------------------------------------------------------------------
+  TSubsequenceComparator — ported from SubsequenceComparator.java
+  ------------------------------------------------------------------ }
+
+constructor TSubsequenceComparator.Create(cmp: TSequenceComparator);
+begin
+  inherited Create;
+  FCmp := cmp;
+end;
+
+function TSubsequenceComparator.Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean;
+var
+  sa, sb: TSubsequence;
+begin
+  sa := a as TSubsequence;
+  sb := b as TSubsequence;
+  Result := FCmp.Equals(sa.Base, ai + sa.BeginOffset, sb.Base, bi + sb.BeginOffset);
+end;
+
+function TSubsequenceComparator.Hash(seq: TSequence; ptr: Integer): Integer;
+var
+  s: TSubsequence;
+begin
+  s := seq as TSubsequence;
+  Result := FCmp.Hash(s.Base, ptr + s.BeginOffset);
+end;
+
+function TSubsequenceComparator.ReduceCommonStartEnd(a: TSequence; b: TSequence; var e: TEdit): TEdit;
+begin
+  // Delegate to wrapped comparator (default behavior — matches JGit which
+  // doesn't override reduceCommonStartEnd in SubsequenceComparator).
+  Result := inherited ReduceCommonStartEnd(a, b, e);
+end;
+
+{ ------------------------------------------------------------------
+  TDiffAlgorithm — ported from diff/DiffAlgorithm.java
+  ------------------------------------------------------------------ }
+
+{ Ported from DiffAlgorithm.diff() (lines 79-105).
+  Reduces common start/end, then dispatches by EditType. }
+function TDiffAlgorithm.Diff(cmp: TSequenceComparator; a, b: TSequence): TEditList;
+var
+  region: TEdit;
+  regionType: TEditType;
+  cs: TSubsequenceComparator;
+  as_, bs: TSubsequence;
+  e: TEditList;
+begin
+  // coverEdit(a, b) — full coverage of both sequences.
+  region.beginA := 0;
+  region.endA := a.Size;
+  region.beginB := 0;
+  region.endB := b.Size;
+
+  region := cmp.ReduceCommonStartEnd(a, b, region);
+  regionType := region.GetType;
+
+  case regionType of
+    etInsert, etDelete:
+      Exit(TEditList.Singleton(region));
+
+    etReplace:
+    begin
+      if (region.GetLengthA = 1) and (region.GetLengthB = 1) then
+        Exit(TEditList.Singleton(region));
+
+      cs := TSubsequenceComparator.Create(cmp);
+      try
+        as_ := TSubsequence.A(a, region);
+        bs := TSubsequence.B(b, region);
+        try
+          e := DiffNonCommon(cs, as_, bs);
+          TSubsequence.ToBaseEditList(e, as_, bs);
+          Result := Normalize(cmp, e, a, b);
+          // Result takes ownership of e — Normalize returns the same list.
+          Exit;
+        finally
+          as_.Free;
+          bs.Free;
+        end;
+      finally
+        cs.Free;
+      end;
+    end;
+
+    etEmpty:
+      Exit(TEditList.Create(0));
+  end;
+
+  raise EAssertionFailed.Create('TDiffAlgorithm.Diff: unexpected edit type');
+end;
+
+{ Ported from DiffAlgorithm.normalize() (lines 186-210).
+  Shifts INSERT/DELETE edits to their latest possible position.
+
+  Strategy: walk the edit list from end to beginning. For each INSERT or
+  DELETE, check if the line right after the edit (in the relevant sequence)
+  equals the inserted/deleted line. If so, shift the edit down by 1. Repeat
+  until no more shifts possible.
+
+  Without this, the output won't match `git diff` (G18). }
+class function TDiffAlgorithm.Normalize(cmp: TSequenceComparator; e: TEditList; a, b: TSequence): TEditList;
+var
+  i: Integer;
+  cur: TEdit;
+  prev: TEdit;
+  curType: TEditType;
+  maxA, maxB: Integer;
+  hasPrev: Boolean;
+begin
+  hasPrev := False;
+  prev := Default(TEdit);  // silence "not initialized" warning
+  for i := e.Size - 1 downto 0 do
+  begin
+    cur := e.Get(i);
+    curType := cur.GetType;
+
+    if hasPrev then
+    begin
+      maxA := prev.beginA;
+      maxB := prev.beginB;
+    end
+    else
+    begin
+      maxA := a.Size;
+      maxB := b.Size;
+    end;
+
+    if curType = etInsert then
+    begin
+      while (cur.endA < maxA) and (cur.endB < maxB)
+            and cmp.Equals(b, cur.beginB, b, cur.endB) do
+        cur.Shift(1);
+    end
+    else if curType = etDelete then
+    begin
+      while (cur.endA < maxA) and (cur.endB < maxB)
+            and cmp.Equals(a, cur.beginA, a, cur.endA) do
+        cur.Shift(1);
+    end;
+
+    e.SetItem(i, cur);
+    prev := cur;
+    hasPrev := True;
+  end;
+  Result := e;
+end;
+
+{ ------------------------------------------------------------------
+  TLowLevelDiffAlgorithm — ported from LowLevelDiffAlgorithm.java
+  ------------------------------------------------------------------ }
+
+{ Ported from LowLevelDiffAlgorithm.diffNonCommon() (lines 18-30).
+  Wraps cmp/a/b in HashedSequencePair, then dispatches to the
+  subclass-specific diffNonCommon variant. }
+function TLowLevelDiffAlgorithm.DiffNonCommon(cmp: TSequenceComparator; a, b: TSequence): TEditList;
+var
+  p: THashedSequencePair;
+  hc: THashedSequenceComparator;
+  ha, hb: THashedSequence;
+  res: TEditList;
+  region: TEdit;
+begin
+  p := THashedSequencePair.Create(cmp, a, b);
+  try
+    hc := p.GetComparator;
+    ha := p.GetA;
+    hb := p.GetB;
+
+    res := TEditList.Create;
+    region.beginA := 0;
+    region.endA := a.Size;
+    region.beginB := 0;
+    region.endB := b.Size;
+    DiffNonCommonLow(res, hc, ha, hb, region);
+
+    hc.Free;
+    // Note: ha, hb are owned by p; don't free them here.
+  finally
+    p.Free;
+  end;
+  Result := res;
+end;
+
+{ ------------------------------------------------------------------
+  TMyersDiff — ported from diff/MyersDiff.java
+  ------------------------------------------------------------------ }
+
+type
+  { Forward declarations for nested types }
+  TMyersMiddleEdit = class;
+  TMyersEditPaths = class;
+
+  { Ported from MyersDiff.EditPaths (inner class, lines 281-431).
+    Holds the x-positions and snake end-points for each (d, k) pair
+    during the forward/backward sweep.
+
+    The "snake" is a packed Int64 holding (x, y) where y = k + x.
+    High 32 bits = x, low 32 bits = y. Matches JGit's newSnake/snake2x/snake2y. }
+  TMyersEditPaths = class
+  private
+    Fx: TIntList;
+    Fsnake: TLongList;
+    FbeginK, FendK, FmiddleK: Integer;
+    FprevBeginK, FprevEndK: Integer;
+    FminK, FmaxK: Integer;
+    Fowner: TMyersMiddleEdit;
+
+    { Force k into the [minK, maxK] range, preserving parity
+      (k must have the same parity as middleK ± d). }
+    function ForceKIntoRange(k: Integer): Integer;
+    function GetIndex(d, k: Integer): Integer;
+    function GetX(d, k: Integer): Integer;
+    function GetSnake(d, k: Integer): Int64;
+
+    { Snake end-point packing — matches JGit's newSnake/snake2x/snake2y. }
+    class function NewSnake(k, x: Integer): Int64; static;
+    class function Snake2X(s: Int64): Integer; static; inline;
+    class function Snake2Y(s: Int64): Integer; static; inline;
+
+    { Hook methods — abstract in JGit, virtual here. }
+    function Snake(k, x: Integer): Integer; virtual; abstract;
+    function GetLeft(x: Integer): Integer; virtual; abstract;
+    function GetRight(x: Integer): Integer; virtual; abstract;
+    function IsBetter(left, right: Integer): Boolean; virtual; abstract;
+    procedure AdjustMinMaxK(k, x: Integer); virtual; abstract;
+    function Meets(d, k, x: Integer; const asnake: Int64): Boolean; virtual; abstract;
+
+    function MakeEdit(const snake1, snake2: Int64): Boolean;
+
+    { Ported from MyersDiff.EditPaths.calculate() (lines 372-430).
+      For each d, computes the d-paths for diagonals k = middleK-d, middleK-d+2,
+      ..., middleK+d (k alternates parity with d). Returns True if forward
+      and backward paths meet (we've found the middle). }
+    function Calculate(d: Integer): Boolean;
+  public
+    constructor Create(owner: TMyersMiddleEdit);
+    destructor Destroy; override;
+
+    procedure Initialize(k, x, minK, maxK: Integer);
+
+    property BeginK: Integer read FbeginK;
+    property EndK: Integer read FendK;
+    property MiddleK: Integer read FmiddleK;
+  end;
+
+  { Ported from MyersDiff.ForwardEditPaths (lines 433-479). }
+  TMyersForwardEditPaths = class(TMyersEditPaths)
+  protected
+    function Snake(k, x: Integer): Integer; override;
+    function GetLeft(x: Integer): Integer; override;
+    function GetRight(x: Integer): Integer; override;
+    function IsBetter(left, right: Integer): Boolean; override;
+    procedure AdjustMinMaxK(k, x: Integer); override;
+    function Meets(d, k, x: Integer; const asnake: Int64): Boolean; override;
+  end;
+
+  { Ported from MyersDiff.BackwardEditPaths (lines 481-527). }
+  TMyersBackwardEditPaths = class(TMyersEditPaths)
+  protected
+    function Snake(k, x: Integer): Integer; override;
+    function GetLeft(x: Integer): Integer; override;
+    function GetRight(x: Integer): Integer; override;
+    function IsBetter(left, right: Integer): Boolean; override;
+    procedure AdjustMinMaxK(k, x: Integer); override;
+    function Meets(d, k, x: Integer; const asnake: Int64): Boolean; override;
+  end;
+
+  { Ported from MyersDiff.MiddleEdit (inner class, lines 190-528). }
+  TMyersMiddleEdit = class
+  private
+    Fcmp: THashedSequenceComparator;
+    Fa, Fb: THashedSequence;
+    Fedits: TEditList;
+    FbeginA, FendA, FbeginB, FendB: Integer;
+    Fedit: TEdit;
+    Fforward: TMyersEditPaths;
+    Fbackward: TMyersEditPaths;
+
+    procedure Initialize(beginA, endA, beginB, endB: Integer);
+
+    { Ported from MiddleEdit.calculate() (lines 216-237).
+      Finds the "middle" Edit of the shortest edit path between the
+      given subsequences. Once forward and backward paths meet, we
+      construct the Edit from their snake end-points. }
+    function Calculate(beginA, endA, beginB, endB: Integer): TEdit;
+
+    { Ported from MiddleEdit.calculateEdits (top-level, lines 133-179).
+      Recursive divide-and-conquer entry: find middle, recurse on
+      left part, emit middle edit (if non-empty), recurse on right part. }
+    procedure CalculateEdits(beginA, endA, beginB, endB: Integer);
+  public
+    constructor Create(edits: TEditList; cmp: THashedSequenceComparator;
+      a, b: THashedSequence);
+    destructor Destroy; override;
+  end;
+
+constructor TMyersEditPaths.Create(owner: TMyersMiddleEdit);
+begin
+  inherited Create;
+  Fowner := owner;
+  Fx := TIntList.Create;
+  Fsnake := TLongList.Create;
+end;
+
+destructor TMyersEditPaths.Destroy;
+begin
+  Fx.Free;
+  Fsnake.Free;
+  inherited Destroy;
+end;
+
+procedure TMyersEditPaths.Initialize(k, x, minK, maxK: Integer);
+begin
+  FminK := minK;
+  FmaxK := maxK;
+  FbeginK := k;
+  FendK := k;
+  FmiddleK := k;
+  Fx.Clear;
+  Fx.Add(x);
+  Fsnake.Clear;
+  Fsnake.Add(NewSnake(k, x));
+end;
+
+function TMyersEditPaths.ForceKIntoRange(k: Integer): Integer;
+{ Ported from MyersDiff.EditPaths.forceKIntoRange() (lines 310-317).
+  If k is out of [minK, maxK], clamp it back in, preserving parity. }
+begin
+  if k < FminK then
+    Exit(FminK + ((k xor FminK) and 1))
+  else if k > FmaxK then
+    Exit(FmaxK - ((k xor FmaxK) and 1));
+  Result := k;
+end;
+
+function TMyersEditPaths.GetIndex(d, k: Integer): Integer;
+{ Ported from MyersDiff.EditPaths.getIndex() (lines 289-294).
+  Converts (d, k) into the index into the x and snake arrays.
+  Formula: i = (d + k - middleK) / 2. }
+begin
+  Result := (d + k - FmiddleK) div 2;
+end;
+
+function TMyersEditPaths.GetX(d, k: Integer): Integer;
+{ Ported from MyersDiff.EditPaths.getX() (lines 296-301). }
+begin
+  Result := Fx.Get(GetIndex(d, k));
+end;
+
+function TMyersEditPaths.GetSnake(d, k: Integer): Int64;
+{ Ported from MyersDiff.EditPaths.getSnake() (lines 303-308). }
+begin
+  Result := Fsnake.Get(GetIndex(d, k));
+end;
+
+class function TMyersEditPaths.NewSnake(k, x: Integer): Int64;
+{ Ported from MyersDiff.EditPaths.newSnake() (lines 336-340).
+  Packs (x, y=k+x) into a single Int64: (x << 32) | y. }
+begin
+  Result := (Int64(UInt32(x)) shl 32) or (UInt32(Int64(k) + x));
+end;
+
+class function TMyersEditPaths.Snake2X(s: Int64): Integer;
+{ Ported from MyersDiff.EditPaths.snake2x() (lines 342-344).
+  Returns the upper 32 bits as a signed int. }
+begin
+  Result := Integer(UInt32(UInt64(s) shr 32));
+end;
+
+class function TMyersEditPaths.Snake2Y(s: Int64): Integer;
+{ Ported from MyersDiff.EditPaths.snake2y() (lines 346-348).
+  Returns the lower 32 bits as a signed int. }
+begin
+  Result := Integer(UInt32(UInt64(s) and $FFFFFFFF));
+end;
+
+function TMyersEditPaths.MakeEdit(const snake1, snake2: Int64): Boolean;
+{ Ported from MyersDiff.EditPaths.makeEdit() (lines 350-370).
+  Constructs an Edit from two snake end-points. If the snakes are
+  incompatible (non-overlapping), snap x1/y1 to x2/y2 — this forces
+  a decision in the next recursion step. }
+var
+  x1, x2, y1, y2: Integer;
+begin
+  x1 := Snake2X(snake1);
+  x2 := Snake2X(snake2);
+  y1 := Snake2Y(snake1);
+  y2 := Snake2Y(snake2);
+  if (x1 > x2) or (y1 > y2) then
+  begin
+    x1 := x2;
+    y1 := y2;
+  end;
+  Fowner.Fedit.beginA := x1;
+  Fowner.Fedit.endA := x2;
+  Fowner.Fedit.beginB := y1;
+  Fowner.Fedit.endB := y2;
+  Result := True;
+end;
+
+function TMyersEditPaths.Calculate(d: Integer): Boolean;
+{ Ported from MyersDiff.EditPaths.calculate() (lines 372-430).
+  For each d, walk diagonals k from endK down to beginK (step -2),
+  compute the new x position from the (d-1)-path's neighbors (k-1 and k+1),
+  extend with a snake, and check if forward/backward paths meet. }
+var
+  k: Integer;
+  left, right: Integer;
+  leftSnake, rightSnake: Int64;
+  i: Integer;
+  end_: Integer;
+  newX: Integer;
+  newSnakeVal: Int64;
+begin
+  FprevBeginK := FbeginK;
+  FprevEndK := FendK;
+  FbeginK := ForceKIntoRange(FmiddleK - d);
+  FendK := ForceKIntoRange(FmiddleK + d);
+
+  k := FendK;
+  while k >= FbeginK do
+  begin
+    left := -1;
+    right := -1;
+    leftSnake := -1;
+    rightSnake := -1;
+
+    if k > FprevBeginK then
+    begin
+      i := GetIndex(d - 1, k - 1);
+      left := Fx.Get(i);
+      end_ := Snake(k - 1, left);
+      if left <> end_ then
+        leftSnake := NewSnake(k - 1, end_)
+      else
+        leftSnake := Fsnake.Get(i);
+      if Meets(d, k - 1, end_, leftSnake) then
+        Exit(True);
+      left := GetLeft(end_);
+    end;
+
+    if k < FprevEndK then
+    begin
+      i := GetIndex(d - 1, k + 1);
+      right := Fx.Get(i);
+      end_ := Snake(k + 1, right);
+      if right <> end_ then
+        rightSnake := NewSnake(k + 1, end_)
+      else
+        rightSnake := Fsnake.Get(i);
+      if Meets(d, k + 1, end_, rightSnake) then
+        Exit(True);
+      right := GetRight(end_);
+    end;
+
+    if (k >= FprevEndK) or ((k > FprevBeginK) and IsBetter(left, right)) then
+    begin
+      newX := left;
+      newSnakeVal := leftSnake;
+    end
+    else
+    begin
+      newX := right;
+      newSnakeVal := rightSnake;
+    end;
+
+    if Meets(d, k, newX, newSnakeVal) then
+      Exit(True);
+
+    AdjustMinMaxK(k, newX);
+
+    i := GetIndex(d, k);
+    Fx.SetItem(i, newX);
+    Fsnake.SetItem(i, newSnakeVal);
+
+    Dec(k, 2);
+  end;
+  Result := False;
+end;
+
+{ TMyersForwardEditPaths — ported from MyersDiff.ForwardEditPaths (lines 433-479) }
+
+function TMyersForwardEditPaths.Snake(k, x: Integer): Integer;
+{ Ported from ForwardEditPaths.snake() (lines 435-440).
+  Walks diagonally forward as long as a[x] == b[k+x]. Returns the new x. }
+begin
+  while (x < Fowner.FendA) and ((k + x) < Fowner.FendB) do
+    if not Fowner.Fcmp.Equals(Fowner.Fa, x, Fowner.Fb, k + x) then
+      Break
+    else
+      Inc(x);
+  Result := x;
+end;
+
+function TMyersForwardEditPaths.GetLeft(x: Integer): Integer;
+begin
+  Result := x;
+end;
+
+function TMyersForwardEditPaths.GetRight(x: Integer): Integer;
+begin
+  Result := x + 1;
+end;
+
+function TMyersForwardEditPaths.IsBetter(left, right: Integer): Boolean;
+begin
+  Result := left > right;
+end;
+
+procedure TMyersForwardEditPaths.AdjustMinMaxK(k, x: Integer);
+{ Ported from ForwardEditPaths.adjustMinMaxK() (lines 458-465). }
+begin
+  if (x >= Fowner.FendA) or ((k + x) >= Fowner.FendB) then
+  begin
+    if k > Fowner.Fbackward.MiddleK then
+      FmaxK := k
+    else
+      FminK := k;
+  end;
+end;
+
+function TMyersForwardEditPaths.Meets(d, k, x: Integer; const asnake: Int64): Boolean;
+{ Ported from ForwardEditPaths.meets() (lines 468-478).
+  Checks if the forward d-path meets the backward (d-1)-path at diagonal k. }
+begin
+  if (k < Fowner.Fbackward.BeginK) or (k > Fowner.Fbackward.EndK) then
+    Exit(False);
+  if (((d - 1 + k - Fowner.Fbackward.MiddleK) mod 2) <> 0) then
+    Exit(False);
+  if x < Fowner.Fbackward.GetX(d - 1, k) then
+    Exit(False);
+  MakeEdit(asnake, Fowner.Fbackward.GetSnake(d - 1, k));
+  Result := True;
+end;
+
+{ TMyersBackwardEditPaths — ported from MyersDiff.BackwardEditPaths (lines 481-527) }
+
+function TMyersBackwardEditPaths.Snake(k, x: Integer): Integer;
+{ Ported from BackwardEditPaths.snake() (lines 483-488).
+  Walks diagonally backward as long as a[x-1] == b[k+x-1]. Returns the new x. }
+begin
+  while (x > Fowner.FbeginA) and ((k + x) > Fowner.FbeginB) do
+    if not Fowner.Fcmp.Equals(Fowner.Fa, x - 1, Fowner.Fb, k + x - 1) then
+      Break
+    else
+      Dec(x);
+  Result := x;
+end;
+
+function TMyersBackwardEditPaths.GetLeft(x: Integer): Integer;
+begin
+  Result := x - 1;
+end;
+
+function TMyersBackwardEditPaths.GetRight(x: Integer): Integer;
+begin
+  Result := x;
+end;
+
+function TMyersBackwardEditPaths.IsBetter(left, right: Integer): Boolean;
+begin
+  Result := left < right;
+end;
+
+procedure TMyersBackwardEditPaths.AdjustMinMaxK(k, x: Integer);
+{ Ported from BackwardEditPaths.adjustMinMaxK() (lines 506-513). }
+begin
+  if (x <= Fowner.FbeginA) or ((k + x) <= Fowner.FbeginB) then
+  begin
+    if k > Fowner.Fforward.MiddleK then
+      FmaxK := k
+    else
+      FminK := k;
+  end;
+end;
+
+function TMyersBackwardEditPaths.Meets(d, k, x: Integer; const asnake: Int64): Boolean;
+{ Ported from BackwardEditPaths.meets() (lines 516-526).
+  Checks if the backward d-path meets the forward d-path at diagonal k. }
+begin
+  if (k < Fowner.Fforward.BeginK) or (k > Fowner.Fforward.EndK) then
+    Exit(False);
+  if (((d + k - Fowner.Fforward.MiddleK) mod 2) <> 0) then
+    Exit(False);
+  if x > Fowner.Fforward.GetX(d, k) then
+    Exit(False);
+  MakeEdit(Fowner.Fforward.GetSnake(d, k), asnake);
+  Result := True;
+end;
+
+{ TMyersMiddleEdit — ported from MyersDiff.MiddleEdit (lines 190-528) }
+
+constructor TMyersMiddleEdit.Create(edits: TEditList; cmp: THashedSequenceComparator;
+  a, b: THashedSequence);
+begin
+  inherited Create;
+  Fedits := edits;
+  Fcmp := cmp;
+  Fa := a;
+  Fb := b;
+  Fforward := TMyersForwardEditPaths.Create(Self);
+  Fbackward := TMyersBackwardEditPaths.Create(Self);
+end;
+
+destructor TMyersMiddleEdit.Destroy;
+begin
+  Fforward.Free;
+  Fbackward.Free;
+  inherited Destroy;
+end;
+
+procedure TMyersMiddleEdit.Initialize(beginA, endA, beginB, endB: Integer);
+{ Ported from MiddleEdit.initialize() (lines 191-203).
+  Strips common parts on either end via snake() — this is the
+  initial prefix/suffix trim that runs BEFORE the middle-search. }
+var
+  k, x: Integer;
+begin
+  FbeginA := beginA;
+  FendA := endA;
+  FbeginB := beginB;
+  FendB := endB;
+
+  // Strip common prefix.
+  k := beginB - beginA;
+  x := Fforward.Snake(k, beginA);
+  FbeginA := x;
+  FbeginB := k + x;
+
+  // Strip common suffix.
+  k := endB - endA;
+  x := Fbackward.Snake(k, endA);
+  FendA := x;
+  FendB := k + x;
+end;
+
+function TMyersMiddleEdit.Calculate(beginA, endA, beginB, endB: Integer): TEdit;
+{ Ported from MiddleEdit.calculate() (lines 216-237).
+  If either side is empty, return immediately. Otherwise, set up forward
+  and backward EditPaths and iterate d=1,2,... until they meet. }
+var
+  minK, maxK, d: Integer;
+begin
+  if (beginA = endA) or (beginB = endB) then
+  begin
+    Fedit.beginA := beginA;
+    Fedit.endA := endA;
+    Fedit.beginB := beginB;
+    Fedit.endB := endB;
+    Exit(Fedit);
+  end;
+  FbeginA := beginA;
+  FendA := endA;
+  FbeginB := beginB;
+  FendB := endB;
+
+  minK := beginB - endA;
+  maxK := endB - beginA;
+
+  Fforward.Initialize(beginB - beginA, beginA, minK, maxK);
+  Fbackward.Initialize(endB - endA, endA, minK, maxK);
+
+  d := 1;
+  while True do
+  begin
+    if Fforward.Calculate(d) or Fbackward.Calculate(d) then
+      Break;
+    Inc(d);
+  end;
+  Result := Fedit;
+end;
+
+procedure TMyersMiddleEdit.CalculateEdits(beginA, endA, beginB, endB: Integer);
+{ Ported from MyersDiff.calculateEdits() (lines 160-179).
+  Recursive: find middle edit, recurse on left part, emit middle (if non-empty),
+  recurse on right part. Uses snake() to find where the common prefix/suffix
+  of each part ends, so we don't re-process them. }
+var
+  edit: TEdit;
+  k, x: Integer;
+begin
+  edit := Calculate(beginA, endA, beginB, endB);
+
+  if (beginA < edit.beginA) or (beginB < edit.beginB) then
+  begin
+    k := edit.beginB - edit.beginA;
+    x := Fbackward.Snake(k, edit.beginA);
+    CalculateEdits(beginA, x, beginB, k + x);
+  end;
+
+  if edit.GetType <> etEmpty then
+    Fedits.Add(edit);
+
+  if (endA > edit.endA) or (endB > edit.endB) then
+  begin
+    k := edit.endB - edit.endA;
+    x := Fforward.Snake(k, edit.endA);
+    CalculateEdits(x, endA, k + x, endB);
+  end;
+end;
+
+{ TMyersDiff main entry — ported from MyersDiff constructor + calculateEdits }
+
+procedure TMyersDiff.DiffNonCommonLow(edits: TEditList;
+  cmp: THashedSequenceComparator;
+  a, b: THashedSequence;
+  const region: TEdit);
+{ Ported from MyersDiff constructor (lines 116-123) + calculateEdits (lines 133-141).
+  Initializes a MiddleEdit, then calls CalculateEdits with the region. }
+var
+  middle: TMyersMiddleEdit;
+  bA, eA, bB, eB: Integer;
+begin
+  middle := TMyersMiddleEdit.Create(edits, cmp, a, b);
+  try
+    bA := region.beginA;
+    eA := region.endA;
+    bB := region.beginB;
+    eB := region.endB;
+    middle.Initialize(bA, eA, bB, eB);
+    // Use the trimmed bounds from middle's Initialize (which strips common
+    // prefix/suffix via snake()).
+    if (middle.FbeginA < middle.FendA) or (middle.FbeginB < middle.FendB) then
+      middle.CalculateEdits(middle.FbeginA, middle.FendA,
+                            middle.FbeginB, middle.FendB);
+  finally
+    middle.Free;
+  end;
+end;
+
+{ Note: middle's FbeginA etc. are private to TMyersMiddleEdit, but
+  TMyersDiff is in the same unit's implementation section, so it can
+  access them. We exposed them as private (not strict private) to
+  allow this cross-class access within the same unit. }
+
+{ ------------------------------------------------------------------
+  THistogramDiff — ported from diff/HistogramDiff.java
+  ------------------------------------------------------------------ }
+
+constructor THistogramDiff.Create;
+begin
+  inherited Create;
+  FFallback := TMyersDiff.Create;
+  FMaxChainLength := 64;
+end;
+
+procedure THistogramDiff.SetFallbackAlgorithm(alg: TDiffAlgorithm);
+begin
+  FFallback := alg;
+end;
+
+procedure THistogramDiff.SetMaxChainLength(maxLen: Integer);
+begin
+  FMaxChainLength := maxLen;
+end;
+
+type
+  { ----------------------------------------------------------------
+    THistogramDiffIndex — ported from diff/HistogramDiffIndex.java
+    ----------------------------------------------------------------
+    Computes occurrence counts of elements in a region of A, then scans B
+    for the longest common subsequence with the lowest occurrence count. }
+  THistogramDiffIndex = class
+  private
+    FMaxChainLength: Integer;
+    FCmp: THashedSequenceComparator;
+    Fa, Fb: THashedSequence;
+    FRegion: TEdit;
+
+    { Hash table — keyed by hash(s, idx). Index into recs. }
+    Ftable: array of Integer;
+    FkeyShift: Integer;
+
+    { Records — packed 3-tuples (next, ptr, count) in a single Int64. }
+    Frecs: array of Int64;
+    FrecCnt: Integer;
+
+    { For element ptr in A, next[ptr - ptrShift] is the next occurrence
+      of the same element in A (or 0 for end of chain). }
+    Fnext: array of Integer;
+    { For element ptr in A, recIdx[ptr - ptrShift] is the index into recs
+      describing all occurrences of this element. }
+    FrecIdx: array of Integer;
+
+    FptrShift: Integer;
+
+    Flcs: TEdit;
+    Fcnt: Integer;
+    FhasCommon: Boolean;
+
+    { Ported from HistogramDiffIndex.hash() (lines 276-278).
+      Knuth multiplicative hash: (cmp.hash(s, idx) * $9E370001) >>> keyShift.
+      Wraps on overflow intentionally (G10). }
+    function Hash(s: THashedSequence; idx: Integer): Integer;
+    class function RecCreate(nextRec, ptr, cnt: Integer): Int64; static; inline;
+    class function RecNext(rec: Int64): Integer; static; inline;
+    class function RecPtr(rec: Int64): Integer; static; inline;
+    class function RecCnt(rec: Int64): Integer; static; inline;
+    class function TableBits(sz: Integer): Integer; static;
+
+    function ScanA: Boolean;
+    function TryLongestCommonSequence(bPtr: Integer): Integer;
+  public
+    constructor Create(maxChainLength: Integer;
+      cmp: THashedSequenceComparator;
+      a, b: THashedSequence;
+      const r: TEdit);
+
+    { Ported from HistogramDiffIndex.findLongestCommonSequence() (lines 137-148).
+      Returns a TEdit. To distinguish "null" (JGit's null return) from
+      a real empty edit, we use a sentinel: Result.beginA = -1 means null.
+      Caller checks `lcs.beginA = -1` for null, else checks `lcs.IsEmpty`. }
+    function FindLongestCommonSequence: TEdit;
+  end;
+
+  { ----------------------------------------------------------------
+    THistogramDiffState — ported from HistogramDiff.State (lines 108-187).
+    ---------------------------------------------------------------- }
+  THistogramDiffState = class
+  private
+    FCmp: THashedSequenceComparator;
+    Fa, Fb: THashedSequence;
+    FQueue: TEditList;
+    Fedits: TEditList;
+    FOwner: THistogramDiff;
+    procedure DiffReplace(const r: TEdit);
+    procedure Diff(const r: TEdit);
+    function Subcmp: TSubsequenceComparator;
+  public
+    constructor Create(edits: TEditList;
+      cmp: THashedSequenceComparator;
+      a, b: THashedSequence;
+      owner: THistogramDiff);
+    destructor Destroy; override;
+    procedure DiffRegion(const r: TEdit);
+  end;
+
+procedure THistogramDiff.DiffNonCommonLow(edits: TEditList;
+  cmp: THashedSequenceComparator;
+  a, b: THashedSequence;
+  const region: TEdit);
+{ Ported from HistogramDiff.diffNonCommon() (lines 101-106).
+  Creates a State and calls diffRegion on the region. }
+var
+  state: THistogramDiffState;
+begin
+  state := THistogramDiffState.Create(edits, cmp, a, b, Self);
+  try
+    state.DiffRegion(region);
+  finally
+    state.Free;
+  end;
+end;
+
+{ THistogramDiffIndex implementation }
+
+constructor THistogramDiffIndex.Create(maxChainLength: Integer;
+  cmp: THashedSequenceComparator;
+  a, b: THashedSequence;
+  const r: TEdit);
+{ Ported from HistogramDiffIndex constructor (lines 114-135). }
+var
+  sz, tb: Integer;
+begin
+  inherited Create;
+  FMaxChainLength := maxChainLength;
+  FCmp := cmp;
+  Fa := a;
+  Fb := b;
+  FRegion := r;
+
+  if FRegion.endA >= HDI_MAX_PTR then
+    raise EArgumentException.Create('Sequence too large for diff algorithm');
+
+  sz := r.GetLengthA;
+  tb := TableBits(sz);
+  SetLength(Ftable, 1 shl tb);
+  FkeyShift := 32 - tb;
+  FptrShift := r.beginA;
+
+  if sz > 32 then
+    SetLength(Frecs, sz div 8)
+  else
+    SetLength(Frecs, 4);
+  SetLength(Fnext, sz);
+  SetLength(FrecIdx, sz);
+end;
+
+function THistogramDiffIndex.Hash(s: THashedSequence; idx: Integer): Integer;
+{$PUSH}{$R-}{$Q-}
+const
+  KNUTH_MULTIPLIER = $9E370001;
+begin
+  Result := Integer(UInt32((UInt32(FCmp.Hash(s, idx)) * UInt32(KNUTH_MULTIPLIER))) shr FkeyShift);
+end;
+{$POP}
+
+class function THistogramDiffIndex.RecCreate(nextRec, ptr, cnt: Integer): Int64;
+begin
+  Result := (Int64(UInt32(nextRec)) shl HDI_REC_NEXT_SHIFT)
+        or (Int64(UInt32(ptr)) shl HDI_REC_PTR_SHIFT)
+        or (UInt32(cnt) and HDI_REC_CNT_MASK);
+end;
+
+class function THistogramDiffIndex.RecNext(rec: Int64): Integer;
+begin
+  Result := Integer(UInt32(UInt64(rec) shr HDI_REC_NEXT_SHIFT));
+end;
+
+class function THistogramDiffIndex.RecPtr(rec: Int64): Integer;
+begin
+  Result := Integer(UInt32(UInt64(rec) shr HDI_REC_PTR_SHIFT) and HDI_REC_PTR_MASK);
+end;
+
+class function THistogramDiffIndex.RecCnt(rec: Int64): Integer;
+begin
+  Result := Integer(UInt32(rec) and HDI_REC_CNT_MASK);
+end;
+
+class function THistogramDiffIndex.TableBits(sz: Integer): Integer;
+{ Ported from HistogramDiffIndex.tableBits() (lines 298-305).
+  Computes ceil(log2(sz)), with a minimum of 1. }
+var
+  bits: Integer;
+  temp: Cardinal;
+begin
+  // 31 - numberOfLeadingZeros(sz)
+  // FPC has BitSizeOf / LeadByte? Use the simple loop form.
+  bits := 0;
+  temp := Cardinal(sz);
+  while temp > 1 do
+  begin
+    temp := temp shr 1;
+    Inc(bits);
+  end;
+  // bits = floor(log2(sz))
+  if bits = 0 then
+    bits := 1;
+  if (1 shl bits) < sz then
+    Inc(bits);
+  Result := bits;
+end;
+
+function THistogramDiffIndex.ScanA: Boolean;
+{ Ported from HistogramDiffIndex.scanA() (lines 150-198).
+  Scans A backwards, building the hash table. Returns False if any
+  chain exceeds maxChainLength (region should fall back to Myers). }
+label
+  SCAN;
+var
+  ptr, tIdx, rIdx, chainLen, newCnt: Integer;
+  rec: Int64;
+  sz, tmp: Integer;
+  n: array of Int64;
+begin
+  ptr := FRegion.endA - 1;
+  while ptr >= FRegion.beginA do
+  begin
+    tIdx := Hash(Fa, ptr);
+    chainLen := 0;
+    rIdx := Ftable[tIdx];
+    while rIdx <> 0 do
+    begin
+      rec := Frecs[rIdx];
+      if FCmp.Equals(Fa, RecPtr(rec), Fa, ptr) then
+      begin
+        // ptr is identical to another element. Insert onto front of existing chain.
+        newCnt := RecCnt(rec) + 1;
+        if newCnt > HDI_MAX_CNT then
+          newCnt := HDI_MAX_CNT;
+        Frecs[rIdx] := RecCreate(RecNext(rec), ptr, newCnt);
+        Fnext[ptr - FptrShift] := RecPtr(rec);
+        FrecIdx[ptr - FptrShift] := rIdx;
+        goto SCAN;  // continue outer loop
+      end;
+      rIdx := RecNext(rec);
+      Inc(chainLen);
+    end;
+
+    if chainLen = FMaxChainLength then
+      Exit(False);
+
+    // New unique element — add a record.
+    Inc(FrecCnt);
+    rIdx := FrecCnt;
+    if rIdx = Length(Frecs) then
+    begin
+      sz := Length(Frecs) * 2;
+      tmp := 1 + FRegion.GetLengthA;
+      if tmp < sz then sz := tmp;
+      SetLength(n, sz);
+      Move(Frecs[0], n[0], Length(Frecs) * SizeOf(Int64));
+      Frecs := n;
+    end;
+    Frecs[rIdx] := RecCreate(Ftable[tIdx], ptr, 1);
+    FrecIdx[ptr - FptrShift] := rIdx;
+    Ftable[tIdx] := rIdx;
+
+  SCAN:
+    Dec(ptr);
   end;
   Result := True;
 end;
 
-function THistogramIndex.TryLongestCommonSequence(ABPtr: Integer): Integer;
+function THistogramDiffIndex.TryLongestCommonSequence(bPtr: Integer): Integer;
+{ Ported from HistogramDiffIndex.tryLongestCommonSequence() (lines 200-274).
+  For each element of B starting at bPtr, scans A's hash chain for matches.
+  Tracks the longest LCS with the lowest occurrence count. }
 var
-  BNext, RIdx, As_, Bs, Ae, Be, Rc, Np: Integer;
-  Rec: Int64;
-  SeqA, SeqB: PLineSequence;
-  Done: Boolean;
+  bNext: Integer;
+  rIdx: Integer;
+  rec: Int64;
+  as_, bs, ae, be, np, rc: Integer;
+  tmp: Integer;
+label
+  TRY_LOCATIONS, BREAK_TRY;
 begin
-  SeqA := FSeqA;
-  SeqB := FSeqB;
-  BNext := ABPtr + 1;
-  RIdx := FTable[HashSeq(FSeqB, ABPtr)];
-  while RIdx <> 0 do
+  bNext := bPtr + 1;
+  rIdx := Ftable[Hash(Fb, bPtr)];
+  while rIdx <> 0 do
   begin
-    Rec := FRecs[RIdx];
+    rec := Frecs[rIdx];
 
-    if RecCnt(Rec) > FCnt then
+    // If there are more occurrences in A than current best, skip this chain.
+    if RecCnt(rec) > Fcnt then
     begin
-      if not FHasCommon then
-        FHasCommon := SeqA^.EqualsAt(RecPtr(Rec), SeqB^, ABPtr);
-      RIdx := RecNext(Rec);
+      if not FhasCommon then
+        FhasCommon := FCmp.Equals(Fa, RecPtr(rec), Fb, bPtr);
+      rIdx := RecNext(rec);
       Continue;
     end;
 
-    As_ := RecPtr(Rec);
-    if not SeqA^.EqualsAt(As_, SeqB^, ABPtr) then
+    as_ := RecPtr(rec);
+    if not FCmp.Equals(Fa, as_, Fb, bPtr) then
     begin
-      RIdx := RecNext(Rec);
+      rIdx := RecNext(rec);
       Continue;
     end;
 
-    FHasCommon := True;
-    Done := False;
-    while not Done do
-    begin
-      Np := FNext[As_ - FPtrShift];
-      Bs := ABPtr;
-      Ae := As_ + 1;
-      Be := Bs + 1;
-      Rc := RecCnt(Rec);
+    FhasCommon := True;
 
-      while (FRegion.BeginA < As_) and (FRegion.BeginB < Bs) and
-            SeqA^.EqualsAt(As_ - 1, SeqB^, Bs - 1) do
+    // TRY_LOCATIONS loop
+    TRY_LOCATIONS:
+      np := Fnext[as_ - FptrShift];
+      bs := bPtr;
+      ae := as_ + 1;
+      be := bs + 1;
+      rc := RecCnt(rec);
+
+      // Extend backwards.
+      while (FRegion.beginA < as_) and (FRegion.beginB < bs)
+            and FCmp.Equals(Fa, as_ - 1, Fb, bs - 1) do
       begin
-        Dec(As_);
-        Dec(Bs);
-        if Rc > 1 then
-          Rc := MinI(Rc, RecCnt(FRecs[FRecIdx[As_ - FPtrShift]]));
-      end;
-
-      while (Ae < FRegion.EndA) and (Be < FRegion.EndB) and
-            SeqA^.EqualsAt(Ae, SeqB^, Be) do
-      begin
-        if Rc > 1 then
-          Rc := MinI(Rc, RecCnt(FRecs[FRecIdx[Ae - FPtrShift]]));
-        Inc(Ae);
-        Inc(Be);
-      end;
-
-      if BNext < Be then
-        BNext := Be;
-
-      if (FLcs.LengthA < (Ae - As_)) or (Rc < FCnt) then
-      begin
-        FLcs.BeginA := As_;
-        FLcs.BeginB := Bs;
-        FLcs.EndA := Ae;
-        FLcs.EndB := Be;
-        FCnt := Rc;
-      end;
-
-      if Np = 0 then
-        Done := True
-      else
-      begin
-        while Np < Ae do
+        Dec(as_);
+        Dec(bs);
+        if rc > 1 then
         begin
-          Np := FNext[Np - FPtrShift];
-          if Np = 0 then
-            Break;
+          tmp := RecCnt(Frecs[FrecIdx[as_ - FptrShift]]);
+          if tmp < rc then rc := tmp;
         end;
-        if Np = 0 then
-          Done := True
-        else
-          As_ := Np;
       end;
-    end;
 
-    RIdx := RecNext(Rec);
+      // Extend forwards.
+      while (ae < FRegion.endA) and (be < FRegion.endB)
+            and FCmp.Equals(Fa, ae, Fb, be) do
+      begin
+        if rc > 1 then
+        begin
+          tmp := RecCnt(Frecs[FrecIdx[ae - FptrShift]]);
+          if tmp < rc then rc := tmp;
+        end;
+        Inc(ae);
+        Inc(be);
+      end;
+
+      if bNext < be then
+        bNext := be;
+      if (Flcs.GetLengthA < ae - as_) or (rc < Fcnt) then
+      begin
+        Flcs.beginA := as_;
+        Flcs.beginB := bs;
+        Flcs.endA := ae;
+        Flcs.endB := be;
+        Fcnt := rc;
+      end;
+
+      if np = 0 then
+        goto BREAK_TRY;
+
+      while np < ae do
+      begin
+        np := Fnext[np - FptrShift];
+        if np = 0 then
+          goto BREAK_TRY;
+      end;
+
+      as_ := np;
+      goto TRY_LOCATIONS;
+
+    BREAK_TRY:
+    rIdx := RecNext(rec);
   end;
-  Result := BNext;
+  Result := bNext;
 end;
 
-function THistogramIndex.FindLongestCommonSequence: TDiffEdit;
+function THistogramDiffIndex.FindLongestCommonSequence: TEdit;
+{ Ported from HistogramDiffIndex.findLongestCommonSequence() (lines 137-148).
+  Returns a TEdit. To distinguish JGit's "null" return from a real
+  (possibly empty) edit, we use the sentinel beginA = -1 for null.
+  Caller checks `lcs.beginA = -1` for null, else checks `lcs.IsEmpty`. }
 var
-  BPtr, NewBPtr: Integer;
+  bPtr: Integer;
 begin
   if not ScanA then
   begin
-    // Chain exceeded in A — caller must fall back to Myers.
-    FFallback := True;
-    Exit(TDiffEdit.Create(0, 0, 0, 0));
+    // ScanA failed (chain length exceeded) — return null sentinel.
+    Result.beginA := -1;
+    Result.endA := -1;
+    Result.beginB := -1;
+    Result.endB := -1;
+    Exit;
   end;
 
-  FLcs := TDiffEdit.Create(0, 0, 0, 0);
-  FCnt := FMaxChainLength + 1;
+  Flcs.beginA := 0;
+  Flcs.endA := 0;
+  Flcs.beginB := 0;
+  Flcs.endB := 0;
+  Fcnt := FMaxChainLength + 1;
 
-  BPtr := FRegion.BeginB;
-  // Safety: if TryLongestCommonSequence ever returns a value <= BPtr
-  // (doesn't advance), force advance to prevent infinite loop.
-  while BPtr < FRegion.EndB do
+  bPtr := FRegion.beginB;
+  while bPtr < FRegion.endB do
+    bPtr := TryLongestCommonSequence(bPtr);
+
+  if FhasCommon and (FMaxChainLength < Fcnt) then
   begin
-    NewBPtr := TryLongestCommonSequence(BPtr);
-    if NewBPtr <= BPtr then
-      BPtr := BPtr + 1
-    else
-      BPtr := NewBPtr;
-  end;
-
-  // If common elements exist but all have occurrence count > max_chain_length,
-  // fall back to Myers. JGit signals this by returning null; we use FFallback.
-  if FHasCommon and (FMaxChainLength < FCnt) then
-  begin
-    FFallback := True;
-    Exit(TDiffEdit.Create(0, 0, 0, 0));
-  end;
-  Result := FLcs;
+    // Common elements exist but none had a small-enough chain length.
+    // Return null sentinel so caller falls back to fallback algorithm.
+    Result.beginA := -1;
+    Result.endA := -1;
+    Result.beginB := -1;
+    Result.endB := -1;
+  end
+  else
+    Result := Flcs;
 end;
 
-{ HistogramDiff driver. Mirrors JGit's HistogramDiff.State.diffRegion. }
-function HistogramDiffNonCommon(
-  out AEdits: TDiffEditList;
-  const ASeqA, ASeqB: TLineSequence;
-  ARegion: TDiffEdit
-): Boolean;
-var
-  Queue: TDiffEditList;
+{ THistogramDiffState implementation }
 
-  procedure DiffReplace(const ARegion: TDiffEdit);
-  var
-    Index: THistogramIndex;
-    Lcs: TDiffEdit;
-  begin
-    Index.Init(HISTOGRAM_MAX_CHAIN_LENGTH, @ASeqA, @ASeqB, ARegion);
-    Lcs := Index.FindLongestCommonSequence;
-
-    if Index.FFallback then
-    begin
-      // Fallback to Myers on this region.
-      MyersDiffNonCommon(AEdits, ASeqA, ASeqB, ARegion);
-    end
-    else if Lcs.IsEmpty then
-    begin
-      // No common element at all in this region: emit as a single REPLACE.
-      AEdits.Add(ARegion);
-    end
-    else
-    begin
-      // Split region around LCS, queue the before/after parts for further
-      // processing. Queue order: after first, then before — so we pop
-      // before first (LIFO), matching JGit's processing order.
-      Queue.Add(ARegion.After(Lcs));
-      Queue.Add(ARegion.Before(Lcs));
-    end;
-  end;
-
-  procedure DiffQueueItem(const ARegion: TDiffEdit);
-  var
-    T: TDiffEditType;
-  begin
-    T := ARegion.GetType;
-    case T of
-      detInsert, detDelete:
-        AEdits.Add(ARegion);
-      detReplace:
-        if (ARegion.LengthA = 1) and (ARegion.LengthB = 1) then
-          AEdits.Add(ARegion)
-        else
-          DiffReplace(ARegion);
-      detEmpty:
-        ; // skip
-    end;
-  end;
-
-var
-  E: TDiffEdit;
+constructor THistogramDiffState.Create(edits: TEditList;
+  cmp: THashedSequenceComparator;
+  a, b: THashedSequence;
+  owner: THistogramDiff);
 begin
-  Result := True;
-  AEdits.Init;
-  Queue.Init;
+  inherited Create;
+  FCmp := cmp;
+  Fa := a;
+  Fb := b;
+  Fedits := edits;
+  FOwner := owner;
+  FQueue := TEditList.Create;
+end;
 
-  DiffReplace(ARegion);
-  while Queue.Count > 0 do
+destructor THistogramDiffState.Destroy;
+begin
+  FQueue.Free;
+  inherited Destroy;
+end;
+
+procedure THistogramDiffState.DiffRegion(const r: TEdit);
+{ Ported from State.diffRegion() (lines 125-129). }
+var
+  e: TEdit;
+begin
+  DiffReplace(r);
+  while FQueue.Size > 0 do
   begin
-    E := Queue.FItems[Queue.FCount - 1];
-    Dec(Queue.FCount);
-    DiffQueueItem(E);
+    e := FQueue.RemoveLast;
+    Diff(e);
   end;
 end;
 
-{ ---------- Common preprocessing ---------- }
-
-function ReduceCommonStartEnd(
-  const ASeqA, ASeqB: TLineSequence;
-  AEdit: TDiffEdit
-): TDiffEdit;
-begin
-  Result := AEdit;
-  while (Result.BeginA < Result.EndA) and (Result.BeginB < Result.EndB) and
-        ASeqA.EqualsAt(Result.BeginA, ASeqB, Result.BeginB) do
-  begin
-    Inc(Result.BeginA);
-    Inc(Result.BeginB);
-  end;
-  while (Result.BeginA < Result.EndA) and (Result.BeginB < Result.EndB) and
-        ASeqA.EqualsAt(Result.EndA - 1, ASeqB, Result.EndB - 1) do
-  begin
-    Dec(Result.EndA);
-    Dec(Result.EndB);
-  end;
-end;
-
-{ JGit's normalize pass: shift pure INSERT/DELETE edits to their latest
-  possible position. Produces consistent diff output regardless of
-  which path the algorithm took through ties. }
-procedure NormalizeEdits(var AEdits: TDiffEditList;
-  const ASeqA, ASeqB: TLineSequence);
+procedure THistogramDiffState.DiffReplace(const r: TEdit);
+{ Ported from State.diffReplace() (lines 131-162).
+  Finds the LCS in the region; if found and non-empty, queues before/after
+  parts for further diffing. If empty, adds the region as a REPLACE.
+  If no LCS, falls back to the fallback algorithm (Myers by default). }
 var
-  I: Integer;
-  Cur, Prev: TDiffEdit;
-  MaxA, MaxB: Integer;
-  T: TDiffEditType;
+  idx: THistogramDiffIndex;
+  lcs: TEdit;
+  cs: TSubsequenceComparator;
+  as_, bs: TSubsequence;
+  res: TEditList;
+  fbLow: TLowLevelDiffAlgorithm;
 begin
-  if AEdits.Count = 0 then Exit;
-  Prev := TDiffEdit.Create(0, 0, 0, 0);
-  for I := AEdits.Count - 1 downto 0 do
+  idx := THistogramDiffIndex.Create(FOwner.MaxChainLength, FCmp, Fa, Fb, r);
+  try
+    lcs := idx.FindLongestCommonSequence;
+  finally
+    idx.Free;
+  end;
+
+  // Check for "null" sentinel (beginA = -1).
+  if lcs.beginA <> -1 then
   begin
-    Cur := AEdits.Items[I];
-    T := Cur.GetType;
-    if I = AEdits.Count - 1 then
+    if lcs.IsEmpty then
     begin
-      MaxA := ASeqA.Size;
-      MaxB := ASeqB.Size;
+      // Nothing in common — replace the entire region.
+      Fedits.Add(r);
     end
     else
     begin
-      MaxA := Prev.BeginA;
-      MaxB := Prev.BeginB;
+      FQueue.Add(r.After(lcs));
+      FQueue.Add(r.Before(lcs));
     end;
-
-    if T = detInsert then
-    begin
-      while (Cur.EndA < MaxA) and (Cur.EndB < MaxB) and
-            ASeqB.EqualsAt(Cur.BeginB, ASeqB, Cur.EndB) do
-        Cur.Shift(1);
-    end
-    else if T = detDelete then
-    begin
-      while (Cur.EndA < MaxA) and (Cur.EndB < MaxB) and
-            ASeqA.EqualsAt(Cur.BeginA, ASeqA, Cur.EndA) do
-        Cur.Shift(1);
-    end;
-    AEdits.Items[I] := Cur;
-    Prev := Cur;
-  end;
-end;
-
-{ Convert an edit list to difflib-compatible opcodes.
-  Walks the edit list in order, emitting 'equal' opcodes for the
-  common regions between edits and the appropriate tag for each edit. }
-function EditsToOpcodes(const AEdits: TDiffEditList;
-  ALenA, ALenB: Integer): TDiffOpcodeArray;
-var
-  Result_: TDiffOpcodeArray;
-  ResultCount: Integer;
-  PrevEndA, PrevEndB: Integer;
-  I: Integer;
-  E: TDiffEdit;
-  T: TDiffEditType;
-
-  procedure Emit(ATag: Integer; AI1, AI2, AJ1, AJ2: Integer);
+  end
+  else if FOwner.Fallback is TLowLevelDiffAlgorithm then
   begin
-    if ResultCount >= Length(Result_) then
-      SetLength(Result_, MaxI(Length(Result_) * 2, ResultCount + 16));
-    Result_[ResultCount].Tag := ATag;
-    Result_[ResultCount].I1 := AI1;
-    Result_[ResultCount].I2 := AI2;
-    Result_[ResultCount].J1 := AJ1;
-    Result_[ResultCount].J2 := AJ2;
-    Inc(ResultCount);
-  end;
-
-begin
-  SetLength(Result_, MaxI(16, AEdits.Count + 1));
-  ResultCount := 0;
-  PrevEndA := 0;
-  PrevEndB := 0;
-
-  for I := 0 to AEdits.Count - 1 do
+    // Fallback is low-level (Myers): call diffNonCommon directly on hashed seqs.
+    fbLow := TLowLevelDiffAlgorithm(FOwner.Fallback);
+    fbLow.DiffNonCommonLow(Fedits, FCmp, Fa, Fb, r);
+  end
+  else if FOwner.Fallback <> nil then
   begin
-    E := AEdits.Items[I];
-    if (E.BeginA > PrevEndA) or (E.BeginB > PrevEndB) then
-      Emit(DIFF_TAG_EQUAL, PrevEndA, E.BeginA, PrevEndB, E.BeginB);
-
-    T := E.GetType;
-    case T of
-      detInsert:  Emit(DIFF_TAG_INSERT,  E.BeginA, E.EndA, E.BeginB, E.EndB);
-      detDelete:  Emit(DIFF_TAG_DELETE,  E.BeginA, E.EndA, E.BeginB, E.EndB);
-      detReplace: Emit(DIFF_TAG_REPLACE, E.BeginA, E.EndA, E.BeginB, E.EndB);
-      detEmpty:   ;
-    end;
-
-    PrevEndA := E.EndA;
-    PrevEndB := E.EndB;
-  end;
-
-  if (PrevEndA < ALenA) or (PrevEndB < ALenB) then
-    Emit(DIFF_TAG_EQUAL, PrevEndA, ALenA, PrevEndB, ALenB);
-
-  SetLength(Result_, ResultCount);
-  Result := Result_;
-end;
-
-{ ---------- Public entry points ---------- }
-
-function DoDiffLines(
-  const ALinesA, ALinesB: array of string;
-  AAlgo: Integer;
-  AFlags: Integer
-): TDiffOpcodeArray;
-var
-  SeqA, SeqB: TLineSequence;
-  Region, Reduced: TDiffEdit;
-  Edits: TDiffEditList;
-  RegionType: TDiffEditType;
-begin
-  SetLength(Result, 0);
-
-  SeqA.Init(ALinesA, AFlags);
-  SeqB.Init(ALinesB, AFlags);
-
-  Region := TDiffEdit.Create(0, SeqA.Size, 0, SeqB.Size);
-  Reduced := ReduceCommonStartEnd(SeqA, SeqB, Region);
-  RegionType := Reduced.GetType;
-
-  case RegionType of
-    detEmpty:
-      Edits.Init;
-    detInsert, detDelete:
-    begin
-      Edits.Init;
-      Edits.Add(Reduced);
-    end;
-    detReplace:
-    begin
-      if (Reduced.LengthA = 1) and (Reduced.LengthB = 1) then
-      begin
-        Edits.Init;
-        Edits.Add(Reduced);
-      end
-      else
-      begin
-        case AAlgo of
-          DIFF_ALGO_MYERS:
-            MyersDiffNonCommon(Edits, SeqA, SeqB, Reduced);
-          DIFF_ALGO_HISTOGRAM:
-            HistogramDiffNonCommon(Edits, SeqA, SeqB, Reduced);
-          else
-            raise EArgumentException.Create('Unknown diff algorithm');
+    // Non-low-level fallback (we don't currently use this path, but
+    // port the logic for completeness).
+    cs := Subcmp;
+    try
+      as_ := TSubsequence.A(Fa, r);
+      bs := TSubsequence.B(Fb, r);
+      try
+        res := FOwner.Fallback.DiffNonCommon(cs, as_, bs);
+        try
+          TSubsequence.ToBaseEditList(res, as_, bs);
+          Fedits.AddAll(res);
+        finally
+          res.Free;
         end;
+      finally
+        as_.Free;
+        bs.Free;
       end;
+    finally
+      cs.Free;
     end;
+  end
+  else
+  begin
+    // No fallback — emit as REPLACE.
+    Fedits.Add(r);
   end;
-
-  NormalizeEdits(Edits, SeqA, SeqB);
-  Result := EditsToOpcodes(Edits, SeqA.Size, SeqB.Size);
 end;
 
-function SplitLinesKeepEnds(const AText: string): TStringArray;
+procedure THistogramDiffState.Diff(const r: TEdit);
+{ Ported from State.diff() (lines 164-182). }
 var
-  S: AnsiString;
-  I, Start, N, Count: Integer;
+  rType: TEditType;
 begin
-  SetLength(Result, 0);
-  S := AnsiString(AText);
-  N := Length(S);
-  if N = 0 then
+  rType := r.GetType;
+  case rType of
+    etInsert, etDelete:
+      Fedits.Add(r);
+    etReplace:
+    begin
+      if (r.GetLengthA = 1) and (r.GetLengthB = 1) then
+        Fedits.Add(r)
+      else
+        DiffReplace(r);
+    end;
+    etEmpty:
+      raise Exception.Create('THistogramDiffState.Diff: unexpected EMPTY edit');
+  end;
+end;
+
+function THistogramDiffState.Subcmp: TSubsequenceComparator;
+begin
+  Result := TSubsequenceComparator.Create(FCmp);
+end;
+
+{ Note: Math_Min was originally a standalone helper, but it caused
+  forward-declaration issues because ScanA and TryLongestCommonSequence
+  are defined before it. We inline the comparisons directly instead.
+  This keeps the file self-contained without reordering methods. }
+
+{ ------------------------------------------------------------------
+  Internal helpers — choose comparator + algorithm based on flags.
+  ------------------------------------------------------------------ }
+
+{ Chooses the right TRawTextComparator subclass based on the WS flags.
+  Precedence (G31): WS_IGNORE_ALL > WS_IGNORE_CHANGE > WS_IGNORE_TRAILING > WS_IGNORE_LEADING. }
+function CreateComparator(AFlags: Integer): TRawTextComparator;
+var
+  nonWSFlags: Integer;
+begin
+  // CASE, NUMBERS, EOL, BLANK_LINES are orthogonal — pass them to the
+  // comparator's FFlags so per-byte transforms apply uniformly.
+  nonWSFlags := AFlags and (cIgnCase or cIgnNumbers or cIgnEOL);
+
+  if (AFlags and cIgnWhitespace) <> 0 then
+    Result := TRawTextComparatorWSIgnoreAll.Create(nonWSFlags)
+  else if (AFlags and cIgnWhitespaceChange) <> 0 then
+    Result := TRawTextComparatorWSIgnoreChange.Create(nonWSFlags)
+  else if (AFlags and cIgnWhitespaceEOL) <> 0 then
+    Result := TRawTextComparatorWSIgnoreTrailing.Create(nonWSFlags)
+  else if (AFlags and cIgnWhitespaceBeginning) <> 0 then
+    Result := TRawTextComparatorWSIgnoreLeading.Create(nonWSFlags)
+  else
+    Result := TRawTextComparatorDefault.Create(nonWSFlags);
+end;
+
+{ Chooses the right diff algorithm. }
+function CreateAlgorithm(AAlgo: Integer): TDiffAlgorithm;
+begin
+  case AAlgo of
+    cAlgoHistogram:
+      Result := THistogramDiff.Create
+    else
+      Result := TMyersDiff.Create;
+  end;
+end;
+
+{ ------------------------------------------------------------------
+  EditList -> TDiffOpcodeArray conversion (with EQUAL synthesis).
+  Ported conceptually from G3: JGit's EditList contains only
+  INSERT/DELETE/REPLACE — equal regions must be synthesized by walking
+  the list and filling gaps.
+  ------------------------------------------------------------------ }
+function EditListToOpcodes(const edits: TEditList;
+  sizeA, sizeB: Integer): TDiffOpcodeArray;
+var
+  i: Integer;
+  op: TDiffOpcode;
+  curA, curB: Integer;
+  e: TEdit;
+  eType: TEditType;
+  raw: TDiffOpcodeArray;
+  rawCount: Integer;
+begin
+  Result := nil;  // silence "managed type not initialized" warning
+  SetLength(raw, edits.Size * 2 + 1);
+  rawCount := 0;
+
+  curA := 0;
+  curB := 0;
+  for i := 0 to edits.Size - 1 do
+  begin
+    e := edits.Get(i);
+    eType := e.GetType;
+
+    // Synthesize EQUAL for the gap between the previous edit and this one.
+    if (e.beginA > curA) or (e.beginB > curB) then
+    begin
+      op.Tag := cTagEqual;
+      op.I1 := curA;
+      op.I2 := e.beginA;
+      op.J1 := curB;
+      op.J2 := e.beginB;
+      raw[rawCount] := op;
+      Inc(rawCount);
+    end;
+
+    case eType of
+      etInsert:
+      begin
+        op.Tag := cTagInsert;
+        op.I1 := e.beginA;
+        op.I2 := e.endA;
+        op.J1 := e.beginB;
+        op.J2 := e.endB;
+      end;
+      etDelete:
+      begin
+        op.Tag := cTagDelete;
+        op.I1 := e.beginA;
+        op.I2 := e.endA;
+        op.J1 := e.beginB;
+        op.J2 := e.endB;
+      end;
+      etReplace:
+      begin
+        op.Tag := cTagReplace;
+        op.I1 := e.beginA;
+        op.I2 := e.endA;
+        op.J1 := e.beginB;
+        op.J2 := e.endB;
+      end;
+      etEmpty:
+        Continue;  // skip EMPTY edits (no-op)
+    end;
+    raw[rawCount] := op;
+    Inc(rawCount);
+
+    curA := e.endA;
+    curB := e.endB;
+  end;
+
+  // Final EQUAL for the trailing gap.
+  if (curA < sizeA) or (curB < sizeB) then
+  begin
+    op.Tag := cTagEqual;
+    op.I1 := curA;
+    op.I2 := sizeA;
+    op.J1 := curB;
+    op.J2 := sizeB;
+    raw[rawCount] := op;
+    Inc(rawCount);
+  end;
+
+  // Copy to result of exact size.
+  SetLength(Result, rawCount);
+  if rawCount > 0 then
+    Move(raw[0], Result[0], rawCount * SizeOf(TDiffOpcode));
+end;
+
+{ ------------------------------------------------------------------
+  DIFF_IGN_BLANK_LINES — post-diff hunk suppression pass (G7).
+  ------------------------------------------------------------------
+
+  Ported conceptually from GNU diff -B (diffutils/src/util.c:767-783,
+  util.c:798-874, analyze.c:989-1019).
+
+  A hunk (REPLACE block, or adjacent INSERT+DELETE forming a logical change)
+  is suppressed if EVERY deleted line AND every inserted line in that hunk
+  is blank. 'Blank' definition depends on other ignore flags:
+    - If ignore_all_space or ignore_space_change is also on → "blank" = whitespace-only
+    - Otherwise → "blank" = truly empty (length 0 or first byte is \r/\n)
+
+  INSERT-only or DELETE-only hunks (pure additions/removals of blank lines)
+  are also suppressed. The result: blank-line-only changes don't appear in
+  the diff output, but non-blank changes are unaffected. }
+function IsLineBlank(rt: TRawText; lineIdx: Integer; AFlags: Integer): Boolean;
+var
+  p, end_: Integer;
+  raw: PByte;
+  hasWSIgnore: Boolean;
+begin
+  if lineIdx >= rt.Size then
+    Exit(True);
+  p := rt.GetStart(lineIdx);
+  end_ := rt.GetEnd(lineIdx);
+  raw := rt.ContentPtr;
+
+  // Empty line (zero-length or starts with EOL byte).
+  if (p >= end_) or (raw[p] = $0A) or (raw[p] = $0D) then
+    Exit(True);
+
+  // If WS_IGNORE_ALL or WS_IGNORE_CHANGE is set, "blank" = whitespace-only.
+  hasWSIgnore := ((AFlags and cIgnWhitespace) <> 0)
+             or ((AFlags and cIgnWhitespaceChange) <> 0);
+  if not hasWSIgnore then
+    Exit(False);  // truly-empty check already passed above
+
+  // Whitespace-only check.
+  while p < end_ do
+  begin
+    if (raw[p] <> $20) and (raw[p] <> $09) and (raw[p] <> $0D) and (raw[p] <> $0A) then
+      Exit(False);
+    Inc(p);
+  end;
+  Result := True;
+end;
+
+{ Suppress blank-line-only hunks from the opcode list.
+  Walks the list; groups adjacent INSERT and DELETE opcodes (a "change hunk");
+  if every line in the hunk is blank, removes all opcodes in the hunk. }
+function SuppressBlankLineHunks(const ops: TDiffOpcodeArray;
+  rtA, rtB: TRawText; AFlags: Integer): TDiffOpcodeArray;
+var
+  i, j, outCount: Integer;
+  groupStart: Integer;
+  allBlank: Boolean;
+  cur: TDiffOpcode;
+  out: TDiffOpcodeArray;
+  aStart, aEnd, bStart, bEnd: Integer;
+  k: Integer;
+begin
+  if Length(ops) = 0 then
+  begin
+    Result := nil;
+    SetLength(Result, 0);
+    Exit;
+  end;
+
+  SetLength(out, Length(ops));
+  outCount := 0;
+  i := 0;
+  while i < Length(ops) do
+  begin
+    cur := ops[i];
+
+    // Only INSERT or DELETE can be part of a blank-line hunk.
+    if (cur.Tag = cTagInsert) or (cur.Tag = cTagDelete) then
+    begin
+      // Collect adjacent INSERT/DELETE/REPLACE opcodes into a hunk.
+      groupStart := i;
+      aStart := cur.I1;
+      aEnd := cur.I2;
+      bStart := cur.J1;
+      bEnd := cur.J2;
+      j := i;
+      while (j < Length(ops)) and
+            ((ops[j].Tag = cTagInsert) or (ops[j].Tag = cTagDelete) or (ops[j].Tag = cTagReplace)) do
+      begin
+        aEnd := ops[j].I2;
+        bEnd := ops[j].J2;
+        Inc(j);
+      end;
+
+      // Check if all A-lines and B-lines in [aStart..aEnd) and [bStart..bEnd) are blank.
+      allBlank := True;
+      for k := aStart to aEnd - 1 do
+        if not IsLineBlank(rtA, k, AFlags) then
+        begin
+          allBlank := False;
+          Break;
+        end;
+      if allBlank then
+        for k := bStart to bEnd - 1 do
+          if not IsLineBlank(rtB, k, AFlags) then
+          begin
+            allBlank := False;
+            Break;
+          end;
+
+      if allBlank then
+      begin
+        // Suppress this hunk — skip without emitting.
+        i := j;
+        Continue;
+      end;
+
+      // Hunk has non-blank lines — emit unchanged.
+      // To keep difflib invariants valid (first opcode must start at (0,0)),
+      // we need to merge any gap left by suppression into the next EQUAL.
+      // For simplicity, emit each opcode in the group as-is.
+      for k := groupStart to j - 1 do
+      begin
+        out[outCount] := ops[k];
+        Inc(outCount);
+      end;
+      i := j;
+      Continue;
+    end;
+
+    // EQUAL — emit as-is.
+    out[outCount] := cur;
+    Inc(outCount);
+    Inc(i);
+  end;
+
+  // Now we need to fix up the boundaries: if the first opcode is now INSERT/DELETE
+  // (because the leading EQUAL was suppressed along with blank lines), we need to
+  // synthesize an empty EQUAL at (0,0). Similarly, adjacent EQUAL opcodes may have
+  // been left after suppression — they should be merged.
+  // Simplest correct approach: rebuild the list with proper boundary fixup.
+
+  SetLength(Result, outCount);
+  if outCount > 0 then
+    Move(out[0], Result[0], outCount * SizeOf(TDiffOpcode));
+
+  // Fix up: merge adjacent EQUAL opcodes and ensure first opcode starts at (0,0).
+  // Walk the list, coalescing.
+  if Length(Result) = 0 then
     Exit;
 
-  Count := 1;
-  for I := 1 to N do
-    if S[I] = #10 then
-      Inc(Count);
-  SetLength(Result, Count);
-
-  Count := 0;
-  Start := 1;
-  I := 1;
-  while I <= N do
+  // Coalesce adjacent EQUAL opcodes.
+  outCount := 0;
+  for i := 0 to High(Result) do
   begin
-    if S[I] = #10 then
+    if (outCount > 0) and (Result[outCount - 1].Tag = cTagEqual) and (Result[i].Tag = cTagEqual) then
     begin
-      Result[Count] := string(Copy(S, Start, I - Start + 1));
-      Inc(Count);
-      Start := I + 1;
+      // Extend the previous EQUAL.
+      Result[outCount - 1].I2 := Result[i].I2;
+      Result[outCount - 1].J2 := Result[i].J2;
+    end
+    else
+    begin
+      Result[outCount] := Result[i];
+      Inc(outCount);
     end;
-    Inc(I);
   end;
-  if Start <= N then
+  SetLength(Result, outCount);
+
+  // Ensure first opcode starts at (0, 0). If the first opcode's I1 or J1
+  // is > 0 (because a leading blank-line hunk was suppressed), synthesize
+  // an empty EQUAL at (0, 0) — difflib requires opcodes to start at (0, 0).
+  if (Length(Result) > 0) and ((Result[0].I1 > 0) or (Result[0].J1 > 0)) then
   begin
-    Result[Count] := string(Copy(S, Start, N - Start + 1));
-    Inc(Count);
+    SetLength(out, Length(Result) + 1);
+    out[0].Tag := cTagEqual;
+    out[0].I1 := 0;
+    out[0].I2 := Result[0].I1;
+    out[0].J1 := 0;
+    out[0].J2 := Result[0].J1;
+    Move(Result[0], out[1], Length(Result) * SizeOf(TDiffOpcode));
+    Result := out;
   end;
-  // If the text ended with #10, Count is one less than allocated.
-  SetLength(Result, Count);
+
+  // Also ensure boundaries match between adjacent opcodes (defensive).
+  // The suppression may have left gaps; fill them with EQUALs.
+  // Actually, this case shouldn't happen because we only suppress whole
+  // INSERT/DELETE/REPLACE groups, not partial ones. But let's be safe.
 end;
 
-function DoDiffText(
-  const ATextA, ATextB: string;
-  AAlgo: Integer;
-  AFlags: Integer
-): TDiffOpcodeArray;
+{ ------------------------------------------------------------------
+  Public entry point
+  ------------------------------------------------------------------ }
+function DoDiffTexts(const ATextA, ATextB: string;
+                     AAlgo: Integer;
+                     AFlags: Integer): TDiffOpcodeArray;
 var
-  LinesA, LinesB: TStringArray;
+  rtA, rtB: TRawText;
+  cmp: TRawTextComparator;
+  algo: TDiffAlgorithm;
+  edits: TEditList;
+  sizeA, sizeB: Integer;
+  ops: TDiffOpcodeArray;
 begin
-  LinesA := SplitLinesKeepEnds(ATextA);
-  LinesB := SplitLinesKeepEnds(ATextB);
-  Result := DoDiffLines(LinesA, LinesB, AAlgo, AFlags);
+  Result := nil;  // silence "managed type not initialized" warning
+  // Construct RawTexts from raw UTF-8 byte buffers.
+  rtA := TRawText.Create(RawByteString(ATextA));
+  rtB := TRawText.Create(RawByteString(ATextB));
+  try
+    sizeA := rtA.Size;
+    sizeB := rtB.Size;
+
+    // G16: empty-input behavior.
+    if (sizeA = 0) and (sizeB = 0) then
+    begin
+      SetLength(Result, 0);
+      Exit;
+    end;
+
+    cmp := CreateComparator(AFlags);
+    try
+      algo := CreateAlgorithm(AAlgo);
+      try
+        edits := algo.Diff(cmp, rtA, rtB);
+        try
+          ops := EditListToOpcodes(edits, sizeA, sizeB);
+        finally
+          edits.Free;
+        end;
+      finally
+        algo.Free;
+      end;
+    finally
+      cmp.Free;
+    end;
+
+    // G7: post-diff blank-line suppression.
+    if (AFlags and cIgnBlankLines) <> 0 then
+      ops := SuppressBlankLineHunks(ops, rtA, rtB, AFlags);
+
+    Result := ops;
+  finally
+    rtA.Free;
+    rtB.Free;
+  end;
 end;
 
 end.
