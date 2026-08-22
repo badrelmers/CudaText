@@ -2325,29 +2325,29 @@ Possible values of "id_action":
 
  diff_proc(id, param1, param2, algo=0, flags=0)
 
-Compares two texts using the built-in native diff engine (Free Pascal port of JGit's MyersDiff and HistogramDiff). Returns difflib-compatible opcodes — the same format as Python's <code>difflib.SequenceMatcher.get_opcodes()</code>.
+Compares two texts using the built-in native diff engine (Free Pascal port of JGit's MyersDiff and HistogramDiff, from JGit tag v7.7.1.202607240634-r). Returns difflib-compatible opcodes — the same format as Python's <code>difflib.SequenceMatcher.get_opcodes()</code>.
 
 Param "id" specifies the action:
 
-* DIF_TEXTS: Line-level diff. Param "param1" and "param2" are LF-separated strings (text of file A and file B). The engine splits them into lines and compares line-by-line.
-* DIF_CHARS: Char-level diff. Param "param1" and "param2" are two strings compared at character granularity (typically single lines, but works on any strings). Uses word-tokenize + word-level Myers + byte-level prefix/suffix trim (the WinMerge approach).
+* DIF_TEXTS: Line-level diff. Param "param1" and "param2" are raw text strings (text of file A and file B). The engine splits them into lines internally on <code>\r\n</code> (CRLF, treated as one boundary), <code>\r</code> (lone CR), and <code>\n</code> (lone LF) — NOT on VT/FF/NEL/LS/PS or other Unicode line boundaries. This matches CudaText's editor behavior (only CR/LF/CRLF are line breaks). The line-terminator is preserved at the end of each line (keepends semantics), so <code>"abc\n"</code> is one line and <code>""</code> is zero lines. For files with <code>\r\n</code> or <code>\n</code> endings (99% of real-world files), this matches JGit's <code>RawParseUtils.lineMap()</code> exactly; only files with lone <code>\r</code> endings (old Mac style, rare) produce a different line count.
+* DIF_CHARS: Char-level diff. Param "param1" and "param2" are two strings compared at character granularity (typically single lines, but works on any strings). Internally converts both inputs to UTF-32 code point arrays and operates on code point indices (NOT byte indices — so <code>len(line_a)</code> in Python equals the index range returned by DIF_CHARS, even for non-ASCII strings).
 
 Param "algo" selects the diff algorithm (only used for DIF_TEXTS, ignored for DIF_CHARS):
 
 * DIFF_ALGO_MYERS: Myers O(ND) with linear-space middle-snake optimization (port of JGit's MyersDiff). The algorithm git uses for <code>git diff --myers</code>.
 * DIFF_ALGO_HISTOGRAM: Histogram diff with max_chain_length=64 fallback to Myers (port of JGit's HistogramDiff). The algorithm git uses for <code>git diff --histogram</code>. Behaves like Patience diff when unique common elements exist, with graceful fallback when they don't.
 
-Param "flags" is a bitmask of ignore options (combine with <code>|</code>):
+Param "flags" is a bitmask of ignore options (combine with <code>|</code>). Whitespace flags follow JGit's precedence order: <code>DIFF_IGN_WHITESPACE > DIFF_IGN_WHITESPACE_CHANGE > DIFF_IGN_WHITESPACE_EOL > DIFF_IGN_WHITESPACE_BEGINNING</code> — if multiple are set, the strictest one wins:
 
 * DIFF_IGN_NONE (0): Strict equality (default).
-* DIFF_IGN_CASE (1): Case-insensitive comparison.
-* DIFF_IGN_WHITESPACE (2): All whitespace ignored.
-* DIFF_IGN_WHITESPACE_CHANGE (4): Whitespace runs treated as equal, but presence matters.
-* DIFF_IGN_WHITESPACE_EOL (8): Trailing whitespace ignored.
-* DIFF_IGN_WHITESPACE_BEGINNING (16): Leading whitespace ignored.
-* DIFF_IGN_BLANK_LINES (32): Blank lines ignored for matching.
-* DIFF_IGN_EOL (64): CR/LF vs LF treated equal.
-* DIFF_IGN_NUMBERS (128): Digit runs treated as equal (useful for comparing logs with timestamps).
+* DIFF_IGN_CASE (1): Case-insensitive comparison. Implemented as ASCII-only <code>tolower</code> per byte (matching WinMerge's <code>io.c:348</code> behavior), NOT Unicode case folding. This is a documented divergence from JGit (which has no case-insensitive comparator) — necessary because Unicode case folding can change byte length (e.g. <code>İ</code> → <code>i̇</code>), which would break the byte-level hashing model. Matches what users expect from <code>git diff -i</code> (also ASCII-only on bytes).
+* DIFF_IGN_WHITESPACE (2): All whitespace ignored. Equivalent to JGit's <code>WS_IGNORE_ALL</code>.
+* DIFF_IGN_WHITESPACE_CHANGE (4): Whitespace runs treated as equal, but presence matters. Equivalent to JGit's <code>WS_IGNORE_CHANGE</code>.
+* DIFF_IGN_WHITESPACE_EOL (8): Trailing whitespace ignored. Equivalent to JGit's <code>WS_IGNORE_TRAILING</code>.
+* DIFF_IGN_WHITESPACE_BEGINNING (16): Leading whitespace ignored. Equivalent to JGit's <code>WS_IGNORE_LEADING</code>.
+* DIFF_IGN_BLANK_LINES (32): Blank lines ignored for matching. Implemented as a post-diff hunk-suppression pass over the edit list, matching GNU <code>diff -B</code> semantics (NOT a comparator tweak). A hunk (one or more adjacent INSERT/DELETE/REPLACE opcodes) is suppressed only if every deleted line and every inserted line in that hunk is blank. "Blank" = empty line (length 0 or first byte is <code>\r</code>/<code>\n</code>) when no whitespace-ignore flag is set; otherwise "blank" = whitespace-only line.
+* DIFF_IGN_EOL (64): <code>\r\n</code> vs <code>\n</code> vs <code>\r</code> treated as equal. A documented divergence from JGit (which has no EOL comparator) — trims trailing line terminators before hashing/comparing.
+* DIFF_IGN_NUMBERS (128): Digit runs treated as equal (useful for comparing logs with timestamps). Implemented as skip-digit-bytes-entirely when hashing/comparing (matching WinMerge's <code>io.c:307,334,345,356,382,393</code> behavior — <code>continue</code> on <code>isdigit(c)</code>), NOT as "replace each digit run with a sentinel byte". Only ASCII <code>[0-9]</code> counts; non-ASCII digits (Arabic-Indic, Devanagari, fullwidth) are NOT skipped. A documented divergence from JGit (which has no numbers comparator). This way <code>12:34:56.789</code> matches <code>12:34:56.790</code>.
 
 Returns: list of 5-tuples <code>(tag, i1, i2, j1, j2)</code> where:
 
@@ -2356,7 +2356,9 @@ Returns: list of 5-tuples <code>(tag, i1, i2, j1, j2)</code> where:
 * <code>j1, j2</code> is a half-open range into the second text (param2).
 * Adjacent tuples share boundaries; the first starts at <code>(0, 0)</code>; the last ends at <code>(len(param1), len(param2))</code>.
 
-For DIF_TEXTS, offsets are line indices. For DIF_CHARS, offsets are character indices.
+For DIF_TEXTS, offsets are line indices. For DIF_CHARS, offsets are character (code point) indices — equivalent to Python's <code>str</code> indexing, NOT byte indices.
+
+Empty-input behavior (DIF_TEXTS): both texts empty <code>""</code> vs <code>""</code> returns <code>[]</code> (zero opcodes). One empty returns a single <code>('insert', 0, 0, 0, N)</code> or <code>('delete', 0, N, 0, 0)</code>. Both non-empty and identical returns a single <code>('equal', 0, N, 0, N)</code>.
 
 Opcode semantics:
 

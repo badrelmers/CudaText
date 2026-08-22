@@ -11105,7 +11105,8 @@ end;
 
 //diff_proc(id, param1, param2, algo=0, flags=0)
 //Compares two texts and returns difflib-compatible opcodes.
-//  id: DIF_TEXTS (1) -- param1, param2 are LF-separated strings.
+//  id: DIF_TEXTS (1) -- param1, param2 are raw text strings. The native
+//      engine splits them internally on \r\n / \r / \n (CRLF/CR/LF).
 //      DIF_CHARS (2) -- param1, param2 are two strings compared at char level.
 //  algo: DIFF_ALGO_MYERS (0) or DIFF_ALGO_HISTOGRAM (1).
 //        Ignored for DIF_CHARS (char diff always uses word-Myers + byte-trim).
@@ -11119,10 +11120,8 @@ var
   Ptr1, Ptr2: PChar;
   Str1, Str2: string;
   NAlgo, NFlags: Integer;
-  LinesA, LinesB: CudaDiff.TStringArray;
   Opcodes: CudaDiff.TDiffOpcodeArray;
   OpcodesChars: CudaDiffChars.TDiffOpcodeArray;
-  I: Integer;
   TagStr: string;
   TagPtr: PChar;
 
@@ -11207,9 +11206,11 @@ begin
       case IdAction of
         DIF_TEXTS:
           begin
-            LinesA := CudaDiff.SplitLinesKeepEnds(Str1);
-            LinesB := CudaDiff.SplitLinesKeepEnds(Str2);
-            Opcodes := CudaDiff.DoDiffLines(LinesA, LinesB, NAlgo, NFlags);
+            // RawText takes the raw text strings directly; line splitting on
+            // \r\n / \r / \n happens inside CudaDiff.DoDiffTexts (matching
+            // JGit's RawText(byte[]) constructor, with the documented CRLF/CR
+            // divergence from JGit's \n-only lineMap).
+            Opcodes := CudaDiff.DoDiffTexts(Str1, Str2, NAlgo, NFlags);
             BuildOpcodeList(Opcodes);
           end;
         DIF_CHARS:
