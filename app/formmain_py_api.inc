@@ -11120,12 +11120,42 @@ var
   Ptr1, Ptr2: PChar;
   Str1, Str2: string;
   NAlgo, NFlags: Integer;
-  Opcodes: CudaDiff.TDiffOpcodeArray;
+  OpcodesMyers: CudaDiffMyers.TDiffOpcodeArray;
+  OpcodesHistogram: CudaDiffHistogram.TDiffOpcodeArray;
   OpcodesChars: CudaDiffChars.TDiffOpcodeArray;
   TagStr: string;
   TagPtr: PChar;
 
-  procedure BuildOpcodeList(const AOpcodes: CudaDiff.TDiffOpcodeArray);
+  procedure BuildOpcodeListMyers(const AOpcodes: CudaDiffMyers.TDiffOpcodeArray);
+  var
+    J: Integer;
+    LTagStr: string;
+    LTagPtr: PChar;
+  begin
+    with AppPython.Engine do
+    begin
+      Result := PyList_New(Length(AOpcodes));
+      if not Assigned(Result) then
+        raise EPythonError.Create(msgPythonListError);
+      for J := 0 to High(AOpcodes) do
+      begin
+        case AOpcodes[J].Tag of
+          DIFF_TAG_EQUAL:   LTagStr := 'equal';
+          DIFF_TAG_DELETE:  LTagStr := 'delete';
+          DIFF_TAG_INSERT:  LTagStr := 'insert';
+          DIFF_TAG_REPLACE: LTagStr := 'replace';
+          else              LTagStr := 'equal';
+        end;
+        LTagPtr := PChar(LTagStr);
+        PyList_SetItem(Result, J,
+          Py_BuildValue('(siiii)', LTagPtr,
+            AOpcodes[J].I1, AOpcodes[J].I2,
+            AOpcodes[J].J1, AOpcodes[J].J2));
+      end;
+    end;
+  end;
+
+  procedure BuildOpcodeListHistogram(const AOpcodes: CudaDiffHistogram.TDiffOpcodeArray);
   var
     J: Integer;
     LTagStr: string;
@@ -11206,17 +11236,45 @@ begin
       case IdAction of
         DIF_TEXTS:
           begin
-            // RawText takes the raw text strings directly; line splitting on
-            // \r\n / \r / \n happens inside CudaDiff.DoDiffTexts (matching
-            // JGit's RawText(byte[]) constructor, with the documented CRLF/CR
-            // divergence from JGit's \n-only lineMap).
-            Opcodes := CudaDiff.DoDiffTexts(Str1, Str2, NAlgo, NFlags);
-            BuildOpcodeList(Opcodes);
+            // Dispatch on NAlgo to the correct engine.
+            // DIFF_ALGO_MYERS (0)    → CudaDiffMyers    (GNU diffutils Myers, fast)
+            // DIFF_ALGO_HISTOGRAM (1) → CudaDiffHistogram (JGit HistogramDiff)
+            //
+            // CudaDiffHistogram.DoDiffTexts internally dispatches on AAlgo too
+            // (0=JGit Myers, 1=JGit Histogram). We ALWAYS pass AAlgo=1 so it
+            // runs HistogramDiff — JGit's standalone MyersDiff is slow and not
+            // exposed directly (it's only used as HistogramDiff's internal
+            // fallback for sub-regions, which is correct behavior).
+            case NAlgo of
+              DIFF_ALGO_HISTOGRAM:
+                begin
+                  OpcodesHistogram := CudaDiffHistogram.DoDiffTexts(
+                    Str1, Str2, {AAlgo=}DIFF_ALGO_HISTOGRAM, NFlags);
+                  BuildOpcodeListHistogram(OpcodesHistogram);
+                end;
+              DIFF_ALGO_MYERS:
+                begin
+                  OpcodesMyers := CudaDiffMyers.DoDiffTexts(
+                    Str1, Str2, {AAlgo=}DIFF_ALGO_MYERS, NFlags);
+                  BuildOpcodeListMyers(OpcodesMyers);
+                end;
+            else
+              begin
+                // Default to WinMerge Myers for any unrecognized NAlgo value.
+                // Log a warning: NAlgo was neither DIFF_ALGO_MYERS (0) nor
+                // DIFF_ALGO_HISTOGRAM (1).
+                MsgLogConsole('WARNING: diff_proc got unknown algo ' +
+                  IntToStr(NAlgo) + ', defaulting to Myers');
+                OpcodesMyers := CudaDiffMyers.DoDiffTexts(
+                  Str1, Str2, {AAlgo=}DIFF_ALGO_MYERS, NFlags);
+                BuildOpcodeListMyers(OpcodesMyers);
+              end;
+            end;
           end;
         DIF_CHARS:
         begin
           // Char-level diff. NAlgo is ignored — char diff always uses
-          // word-Myers + byte-trim internally.
+          // WinMerge's stringdiffs (ONP algorithm) internally.
           OpcodesChars := CudaDiffChars.DoDiffChars(Str1, Str2, NFlags);
           BuildOpcodeListChars(OpcodesChars);
         end;

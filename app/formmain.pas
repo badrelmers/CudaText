@@ -1322,7 +1322,8 @@ uses
   {$endif}
   ATSynEdit_ClipRecents,
   ATSynEdit_CanvasProc_FillRect,
-  CudaDiff,
+  CudaDiffMyers,
+  CudaDiffHistogram,
   CudaDiffChars;
 
 {$R *.lfm}
