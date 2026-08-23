@@ -419,7 +419,8 @@ begin
     newElem.pk := k + 1;
   end;
   newElem.pi := Length(es[esBase + newElem.pk]) - 1;
-  es[esBase + k] := Concat(es[esBase + k], [newElem]);
+  SetLength(es[esBase + k], Length(es[esBase + k]) + 1);
+  es[esBase + k, High(es[esBase + k])] := newElem;
 end;
 
 { ------------------------------------------------------------------
@@ -1000,8 +1001,12 @@ begin
   begin
     esi := es[esBase + k][i];
     for j := 0 to esi.neq - 1 do
-      ses := Concat(ses, [Char('=')]);
-    ses := Concat(ses, [Char(esi.op)]);
+    begin
+      SetLength(ses, Length(ses) + 1);
+      ses[High(ses)] := Char('=');
+    end;
+    SetLength(ses, Length(ses) + 1);
+    ses[High(ses)] := Char(esi.op);
     i := esi.pi;
     k := esi.pk;
   end;
@@ -1112,7 +1117,8 @@ begin
       e1 := FWords1[i].end_;
       s2 := FWords2[j-1].end_ + 1;
       e2 := s2 - 1;
-      FWdiffs := Concat(FWdiffs, [Twdiff.Create(s1, e1, s2, e2)]);
+      SetLength(FWdiffs, Length(FWdiffs) + 1);
+      FWdiffs[High(FWdiffs)] := Twdiff.Create(s1, e1, s2, e2);
       Inc(i);
     end
     else if FEdscript[k] = '+' then
@@ -1135,7 +1141,8 @@ begin
       e1 := s1 - 1;
       s2 := FWords2[j].start;
       e2 := FWords2[j].end_;
-      FWdiffs := Concat(FWdiffs, [Twdiff.Create(s1, e1, s2, e2)]);
+      SetLength(FWdiffs, Length(FWdiffs) + 1);
+      FWdiffs[High(FWdiffs)] := Twdiff.Create(s1, e1, s2, e2);
       Inc(j);
     end
     else if FEdscript[k] = '!' then
@@ -1158,7 +1165,8 @@ begin
       e1 := FWords1[i].end_;
       s2 := FWords2[j].start;
       e2 := FWords2[j].end_;
-      FWdiffs := Concat(FWdiffs, [Twdiff.Create(s1, e1, s2, e2)]);
+      SetLength(FWdiffs, Length(FWdiffs) + 1);
+      FWdiffs[High(FWdiffs)] := Twdiff.Create(s1, e1, s2, e2);
       Inc(i); Inc(j);
     end
     else  // '='
@@ -1265,7 +1273,8 @@ begin
     if not skipIt then
     begin
       { Append to caller's pDiffs list. }
-      FPDiffs^ := Concat(FPDiffs^, [FWdiffs[i]]);
+      SetLength(FPDiffs^, Length(FPDiffs^) + 1);
+      FPDiffs^[High(FPDiffs^)] := FWdiffs[i];
     end;
   end;
 end;
