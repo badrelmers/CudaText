@@ -742,30 +742,41 @@ end;
   Real tokens start at index 1. The 1-based indexing is used by onp/snake. }
 function TStringDiff.BuildWordsArray(const S: TCodePointArray): TWordArray;
 var
-  words: TWordArray;
   i, begin_: Integer;
   break_type, prev_break_type: Integer;
   ch: TCodePoint;
   iLen: Integer;
-  w: TWord;
+  count: Integer;
 begin
-  SetLength(words, 1);
-  // Dummy sentinel word(0, -1, 0, 0) — index 0 is reserved.
-  words[0].start := 0;
-  words[0].end_ := -1;
-  words[0].bBreak := 0;
-  words[0].hash := 0;
+  iLen := Length(S);
+  if iLen = 0 then
+  begin
+    { Both empty: just the dummy sentinel. }
+    SetLength(Result, 1);
+    Result[0].start := 0;
+    Result[0].end_ := -1;
+    Result[0].bBreak := 0;
+    Result[0].hash := 0;
+    Exit;
+  end;
+
+  { Pre-allocate up-front (O(N)) and trim at the end.
+    Worst case is 1 token per code point + 1 dummy sentinel + 1 final
+    token = iLen + 2 slots. The previous version used `Concat` per token
+    which is O(N^2) on long lines because Concat reallocates + copies
+    the whole array each time. This mirrors the optimisation used in
+    agent2's BuildWordsArray while preserving Agent1's EOL_AS_SPACE
+    branch (which agent2 omits). }
+  SetLength(Result, iLen + 2);
+  count := 1;  // index 0 is reserved for the dummy sentinel
+  Result[0].start := 0;
+  Result[0].end_ := -1;
+  Result[0].bBreak := 0;
+  Result[0].hash := 0;
 
   i := 0;
   begin_ := 0;
   prev_break_type := 0;
-  iLen := Length(S);
-
-  if iLen = 0 then
-  begin
-    Result := words;
-    Exit;
-  end;
 
   while i < iLen do
   begin
@@ -801,11 +812,11 @@ begin
       ((prev_break_type = dleol) and not ((S[i-1] = $0D) and (ch = $0A)))
     ) then
     begin
-      w.start := begin_;
-      w.end_ := i - 1;
-      w.bBreak := prev_break_type;
-      w.hash := Hash(S, begin_, i - 1, 0);
-      words := Concat(words, [w]);
+      Result[count].start := begin_;
+      Result[count].end_ := i - 1;
+      Result[count].bBreak := prev_break_type;
+      Result[count].hash := Hash(S, begin_, i - 1, 0);
+      Inc(count);
       begin_ := i;
     end;
 
@@ -831,13 +842,14 @@ begin
   end;
 
   { Final token. }
-  w.start := begin_;
-  w.end_ := i - 1;
-  w.bBreak := break_type;
-  w.hash := Hash(S, begin_, i - 1, 0);
-  words := Concat(words, [w]);
+  Result[count].start := begin_;
+  Result[count].end_ := i - 1;
+  Result[count].bBreak := break_type;
+  Result[count].hash := Hash(S, begin_, i - 1, 0);
+  Inc(count);
 
-  Result := words;
+  { Trim to actual size. }
+  SetLength(Result, count);
 end;
 
 { Ported from stringdiffs.cpp:732-749 — snake (diagonal extension).
