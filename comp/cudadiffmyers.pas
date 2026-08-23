@@ -165,7 +165,7 @@
       valid difflib opcodes.
 *)
 
-unit CudaDiff;
+unit CudaDiffMyers;
 
 {$mode objfpc}{$H+}
 {$ModeSwitch advancedrecords}
