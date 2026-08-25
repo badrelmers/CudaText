@@ -753,14 +753,27 @@ begin
     else
       Beg0 := PrefixEnd0 + (N0 - N1);
 
-    { Scan back until chars don't match or we reach beg0 }
+    { Scan back until chars don't match or we reach beg0.
+      C original (io.c:845-852):
+        while (p0 != beg0)
+          if (*--p0 != *--p1)
+            { ++p0, ++p1; beg0 = p0; break; }
+      The C decrements p0/p1 BEFORE comparing and RESTORES them on
+      mismatch, so on exit p0 keeps its loop-top value = position of
+      the first char of the matching suffix. We compare (P0-1)^/(P1-1)^
+      WITHOUT decrementing, so P0/P1 ALREADY point at the suffix start
+      here — no Inc is needed. The previous Inc(P0)/Inc(P1) was an
+      off-by-one transcription error: it moved the suffix start one
+      byte too far, and when the two inputs' LAST bytes differ (one
+      ends '\r', the other '\n' — e.g. mixed-EOL texts compared
+      without DIFF_IGN_EOL) the mismatch fired on the first compare
+      and produced SuffixBegin = BufEnd + 1, so FindAndHashEachLine
+      scanned past the buffer end (access violation). }
     while P0 <> Beg0 do
     begin
       if (P0 - 1)^ <> (P1 - 1)^ then
       begin
-        Inc(P0);  { Point at the first char of the matching suffix }
-        Inc(P1);
-        Beg0 := P0;
+        Beg0 := P0;  { P0 already points at the first char of the matching suffix }
         Break;
       end;
       Dec(P0);
@@ -810,8 +823,11 @@ begin
   while P0 <> PrefixEnd0 do
   begin
     Inc(PrefixLines);
-    { Advance past this line's terminator }
-    while True do
+    { Advance past this line's terminator. Defensive bound
+      (P0 < PrefixEnd0): PrefixEnd0 is always a line start, so a
+      terminator precedes it and the bound never fires in normal
+      operation; it only caps a pathological walk. }
+    while P0 < PrefixEnd0 do
     begin
       if P0^ = $0A then
       begin
@@ -1109,8 +1125,14 @@ begin
   P := F^.PrefixEnd;
 
   { Main hashing loop: walk from prefix_end to suffix_begin, hashing each
-    line and recording linbuf/equivs entries (io.c:289-444). }
-  while P < SuffixBegin do
+    line and recording linbuf/equivs entries (io.c:289-444).
+    Defensive bound (P < BufEnd): SuffixBegin comes from
+    FindIdenticalEnds and must never exceed BufEnd; this bound keeps
+    the hashing scans below inside the buffer even if that invariant
+    is ever violated again (it was violated by the suffix-scan
+    off-by-one fixed in FindIdenticalEnds, which pushed SuffixBegin to
+    BufEnd + 1 and caused access violations past the buffer end). }
+  while (P < SuffixBegin) and (P < BufEnd) do
   begin
     Ip := P;
 
@@ -1131,14 +1153,21 @@ begin
       NOT \n). A '\r' that is followed by '\n' is hashed as a normal
       byte and the '\n' then ends the line, so a CRLF pair terminates
       exactly one line and the terminator stays inside the line
-      (keepends), matching TRawText.Create in cudadiffhistogram.pas. }
+      (keepends), matching TRawText.Create in cudadiffhistogram.pas.
+
+      All six branch loops are defensively bounded by (P < BufEnd):
+      LoadFile guarantees the buffer ends with a line terminator, so
+      the bound never fires in normal operation — it only caps the
+      scan if the SuffixBegin invariant is ever violated. The post-Inc
+      P^ reads land in the 4-byte zero sentinel after BufEnd, which is
+      inside the GetMem(SrcLen + 8) allocation, so they stay valid. }
     H := 0;
     if Ctx.IgnoreCaseFlag <> 0 then
     begin
       if Ctx.IgnoreAllSpaceFlag <> 0 then
       begin
         { Branch A: ignore_case + ignore_all_space (io.c:304-311) }
-        while True do
+        while P < BufEnd do
         begin
           C := P^; Inc(P);
           if (C = $0A) or ((C = $0D) and (P^ <> $0A)) then Break;
@@ -1151,14 +1180,14 @@ begin
       else if Ctx.IgnoreSpaceChangeFlag <> 0 then
       begin
         { Branch B: ignore_case + ignore_space_change (io.c:312-341) }
-        while True do
+        while P < BufEnd do
         begin
           C := P^; Inc(P);
           if (C = $0A) or ((C = $0D) and (P^ <> $0A)) then Break;
           if IsWSpace(C) then
           begin
             { skip whitespace after whitespace (io.c:318-320) }
-            while True do
+            while P < BufEnd do
             begin
               C := P^; Inc(P);
               if not IsWSpace(C) then Break;
@@ -1180,7 +1209,7 @@ begin
       else
       begin
         { Branch C: ignore_case only (io.c:342-349) }
-        while True do
+        while P < BufEnd do
         begin
           C := P^; Inc(P);
           if (C = $0A) or ((C = $0D) and (P^ <> $0A)) then Break;
@@ -1195,7 +1224,7 @@ begin
       if Ctx.IgnoreAllSpaceFlag <> 0 then
       begin
         { Branch D: ignore_all_space only (io.c:353-361) }
-        while True do
+        while P < BufEnd do
         begin
           C := P^; Inc(P);
           if (C = $0A) or ((C = $0D) and (P^ <> $0A)) then Break;
@@ -1208,14 +1237,14 @@ begin
       else if Ctx.IgnoreSpaceChangeFlag <> 0 then
       begin
         { Branch E: ignore_space_change only (io.c:362-389) }
-        while True do
+        while P < BufEnd do
         begin
           C := P^; Inc(P);
           if (C = $0A) or ((C = $0D) and (P^ <> $0A)) then Break;
           if IsWSpace(C) then
           begin
             { skip whitespace after whitespace (io.c:368-370) }
-            while True do
+            while P < BufEnd do
             begin
               C := P^; Inc(P);
               if not IsWSpace(C) then Break;
@@ -1237,7 +1266,7 @@ begin
       else
       begin
         { Branch F: no ignore flags (io.c:390-397) }
-        while True do
+        while P < BufEnd do
         begin
           C := P^; Inc(P);
           if (C = $0A) or ((C = $0D) and (P^ <> $0A)) then Break;
@@ -1328,7 +1357,7 @@ begin
       SetLength(F^.Equivs, AllocLines);
     end;
     F^.Linbuf[Line] := P;
-    if P = BufEnd then
+    if P >= BufEnd then
     begin
       if P = IncompleteTail then
         F^.Linbuf[Line] := P - 1;
@@ -1338,10 +1367,17 @@ begin
     { Advance p to next line (io.c:475-477): scan until '\n' or a LONE '\r'
       (a '\r' followed by '\n' is passed over — the '\n' then stops the
       scan), then skip the terminator byte. CRLF is consumed as ONE
-      terminator, matching the main hashing loop above. }
-    while (P^ <> $0A) and not ((P^ = $0D) and ((P + 1)^ <> $0A)) do
+      terminator, matching the main hashing loop above.
+      Defensive bounds: the scan is capped at BufEnd (LoadFile
+      guarantees a terminator at the end, so the cap never fires in
+      normal operation), the terminator skip only happens when a
+      terminator was actually found, and the loop guard uses >= so a
+      P past BufEnd can never start a new scan. The (P + 1)^ read at
+      the last byte lands in the zero sentinel inside the allocation. }
+    while (P < BufEnd) and (P^ <> $0A) and not ((P^ = $0D) and ((P + 1)^ <> $0A)) do
       Inc(P);
-    Inc(P);
+    if P < BufEnd then
+      Inc(P);
   end;
 
   { Done with cache in local variables (io.c:480-487) }
