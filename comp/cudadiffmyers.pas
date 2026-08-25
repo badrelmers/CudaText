@@ -605,17 +605,35 @@ begin
 
   { prepare_text_end (io.c:498-722) — simplified for in-memory UTF-8 input.
 
-    Step 1: If buffer doesn't end in \n or \r, append \n (and remember
-    missing_newline). This is needed so the line-splitting loop in
-    find_and_hash_each_line can find a terminator for the last line. }
-  if (BufLen = 0) or ((Buf[BufLen - 1] <> $0A) and (Buf[BufLen - 1] <> $0D)) then
+    Step 1: Append a trailing \n only when the buffer is non-empty AND
+    does not already end in \n or \r. This mirrors io.c:678-685 exactly:
+
+        if (buffered_chars - bomsize == 0
+            || p[buffered_chars - 1] == '\n'
+            || p[buffered_chars - 1] == '\r')
+            current->missing_newline = 0;
+        else {
+            p[buffered_chars++] = '\n';
+            current->missing_newline = 1;
+        }
+
+    The Pascal port previously INVERTED the empty-buffer case, putting
+    BufLen=0 on the append side. That turned empty input ("") into a
+    1-byte buffer [\n] and reported 1 line — diverging from upstream C
+    (which reports 0 lines) and from cudadiffhistogram.pas (TRawText.Create
+    with n=0 produces a 2-entry line-map and Size()=0). With this fix the
+    empty case correctly stays at 0 lines, matching both upstream and the
+    Histogram engine, so a "" vs "" compare produces an empty edit list in
+    both engines, and a "" vs "abc\n" compare yields a single insert in
+    both engines. }
+  if (BufLen = 0) or (Buf[BufLen - 1] = $0A) or (Buf[BufLen - 1] = $0D) then
+    F^.MissingNewline := 0
+  else
   begin
     Buf[BufLen] := $0A;
     Inc(BufLen);
     F^.MissingNewline := 1;
-  end
-  else
-    F^.MissingNewline := 0;
+  end;
 
   { Step 2: If ignore_eol_diff, normalize EOL: \r\n → \n, lone \r → \n.
     This is done in-place forward (write pointer never exceeds read pointer,
