@@ -1124,7 +1124,14 @@ begin
           if ignore_all_space_flag:        branch D (io.c:353-361)
           else if ignore_space_change_flag: branch E (io.c:362-389)
           else:                            branch F (io.c:390-397)
-      Each branch contains an optional ignore_numbers_flag check. }
+      Each branch contains an optional ignore_numbers_flag check.
+
+      Line termination (io.c:305/314/343/354/364/391): the loop stops
+      after consuming '\n' or a LONE '\r' (C = \r and the NEXT byte is
+      NOT \n). A '\r' that is followed by '\n' is hashed as a normal
+      byte and the '\n' then ends the line, so a CRLF pair terminates
+      exactly one line and the terminator stays inside the line
+      (keepends), matching TRawText.Create in cudadiffhistogram.pas. }
     H := 0;
     if Ctx.IgnoreCaseFlag <> 0 then
     begin
@@ -1134,7 +1141,7 @@ begin
         while True do
         begin
           C := P^; Inc(P);
-          if (C = $0A) or ((C = $0D) and (P^ = $0A)) then Break;
+          if (C = $0A) or ((C = $0D) and (P^ <> $0A)) then Break;
           if (Ctx.IgnoreNumbersFlag <> 0) and IsAsciiDigit(C) then
             Continue;
           if not IsWSpace(C) then
@@ -1147,7 +1154,7 @@ begin
         while True do
         begin
           C := P^; Inc(P);
-          if (C = $0A) or ((C = $0D) and (P^ = $0A)) then Break;
+          if (C = $0A) or ((C = $0D) and (P^ <> $0A)) then Break;
           if IsWSpace(C) then
           begin
             { skip whitespace after whitespace (io.c:318-320) }
@@ -1176,7 +1183,7 @@ begin
         while True do
         begin
           C := P^; Inc(P);
-          if (C = $0A) or ((C = $0D) and (P^ = $0A)) then Break;
+          if (C = $0A) or ((C = $0D) and (P^ <> $0A)) then Break;
           if (Ctx.IgnoreNumbersFlag <> 0) and IsAsciiDigit(C) then
             Continue;
           H := HashByte(H, ToAsciiLower(C));
@@ -1191,7 +1198,7 @@ begin
         while True do
         begin
           C := P^; Inc(P);
-          if (C = $0A) or ((C = $0D) and (P^ = $0A)) then Break;
+          if (C = $0A) or ((C = $0D) and (P^ <> $0A)) then Break;
           if (Ctx.IgnoreNumbersFlag <> 0) and IsAsciiDigit(C) then
             Continue;
           if not IsWSpace(C) then
@@ -1204,7 +1211,7 @@ begin
         while True do
         begin
           C := P^; Inc(P);
-          if (C = $0A) or ((C = $0D) and (P^ = $0A)) then Break;
+          if (C = $0A) or ((C = $0D) and (P^ <> $0A)) then Break;
           if IsWSpace(C) then
           begin
             { skip whitespace after whitespace (io.c:368-370) }
@@ -1233,7 +1240,7 @@ begin
         while True do
         begin
           C := P^; Inc(P);
-          if (C = $0A) or ((C = $0D) and (P^ = $0A)) then Break;
+          if (C = $0A) or ((C = $0D) and (P^ <> $0A)) then Break;
           if (Ctx.IgnoreNumbersFlag <> 0) and IsAsciiDigit(C) then
             Continue;
           H := HashByte(H, C);
@@ -1328,8 +1335,11 @@ begin
       Break;
     end;
     Inc(Line);
-    { Advance p to next line (io.c:475-477) }
-    while (P^ <> $0A) and not ((P^ = $0D) and ((P + 1)^ = $0A)) do
+    { Advance p to next line (io.c:475-477): scan until '\n' or a LONE '\r'
+      (a '\r' followed by '\n' is passed over — the '\n' then stops the
+      scan), then skip the terminator byte. CRLF is consumed as ONE
+      terminator, matching the main hashing loop above. }
+    while (P^ <> $0A) and not ((P^ = $0D) and ((P + 1)^ <> $0A)) do
       Inc(P);
     Inc(P);
   end;
