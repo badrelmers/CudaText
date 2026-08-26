@@ -1059,16 +1059,13 @@ DIFF_ALGO_HISTOGRAM    = 1
 
 # diff_proc: bitmask flags for the flags parameter.
 # Combine with the bitwise 'or' operator, e.g.
-#   flags = cudatext.DIFF_IGN_CASE | cudatext.DIFF_IGN_WHITESPACE_EOL
-DIFF_IGN_NONE                 = 0
-DIFF_IGN_CASE                 = 1       # case-insensitive comparison
-DIFF_IGN_WHITESPACE           = 2       # all whitespace ignored
-DIFF_IGN_WHITESPACE_CHANGE    = 4       # runs equal, presence matters
-DIFF_IGN_WHITESPACE_EOL       = 8       # trailing whitespace ignored
-DIFF_IGN_WHITESPACE_BEGINNING = 16      # leading whitespace ignored
-DIFF_IGN_BLANK_LINES          = 32      # blank lines ignored for matching
-DIFF_IGN_EOL                  = 64      # CR/LF vs LF treated equal
-DIFF_IGN_NUMBERS              = 128     # digit runs treated as equal (for logs)
+#   flags = cudatext.DIFF_IGN_CASE | cudatext.DIFF_IGN_WHITESPACE
+DIFF_IGN_NONE        = 0
+DIFF_IGN_CASE        = 1       # case-insensitive comparison
+DIFF_IGN_WHITESPACE  = 2       # all whitespace ignored
+DIFF_IGN_BLANK_LINES = 4       # blank lines ignored for matching
+DIFF_IGN_EOL         = 8       # CR/LF vs LF vs CR treated equal
+DIFF_IGN_NUMBERS     = 16      # digit runs treated as equal (for logs)
 
 HOWREP_CANCEL  = 0
 HOWREP_REPLACE = 1
