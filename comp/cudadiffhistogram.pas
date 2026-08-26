@@ -69,7 +69,11 @@
 
   3. DIFF_IGN_NUMBERS (G6): JGit has no equivalent. We skip digit bytes
      entirely when hashing/comparing (matching WinMerge's io.c:307,334,345,356,
-     382,393 behavior — `continue` on isdigit(c)).
+     382,393 behavior — `continue` on isdigit(c)). Both comparators perform a
+     trailing cleanup pass after their main loops so leftover digits (and, in
+     WS_IGNORE_ALL, leftover whitespace) do not cause a false "unequal" verdict
+     when the other side is exhausted — keeps Equals consistent with
+     HashRegion ("v33" == "v" under WHITESPACE|NUMBERS).
 
   4. DIFF_IGN_EOL (G9): JGit has no equivalent. We trim trailing \r\n / \n / \r
      from the line before hashing/comparing.
@@ -1424,6 +1428,24 @@ begin
     Inc(as_);
     Inc(bs);
   end;
+
+  { Trailing cleanup — same idea as TRawTextComparatorDefault.Equals:
+    the main loop above exits as soon as ONE side is exhausted, so the
+    other side can still hold skippable bytes (digits under
+    DIFF_IGN_NUMBERS, and whitespace that sits between/after digit
+    runs — the in-loop WS skip is bounded by ae-1/be-1 and the
+    trailing-WS trim ran before digit positions were known).
+    Without this cleanup, "v33" vs "v" compared UNEQUAL under
+    WHITESPACE|NUMBERS while hashRegion (which skips both WS and
+    digits everywhere) hashed them identically — an Equals/hash
+    inconsistency that made HashedSequenceComparator reject the pair
+    and the diff report a change (DIFF_IGN_NUMBERS bug). }
+  while (as_ < ae) and (IsSkippedByte(aRaw[as_], FFlags)
+                        or IsWhitespaceByte(aRaw[as_])) do
+    Inc(as_);
+  while (bs < be) and (IsSkippedByte(bRaw[bs], FFlags)
+                        or IsWhitespaceByte(bRaw[bs])) do
+    Inc(bs);
 
   Result := (as_ = ae) and (bs = be);
 end;
