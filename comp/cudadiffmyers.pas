@@ -132,9 +132,13 @@
      arithmetic intentionally use unsigned wraparound and negative indexing,
      so we wrap the affected code in $PUSH/$R-/$Q-...$POP.
 
-  10. DIFF_IGN_WHITESPACE_EOL / DIFF_IGN_WHITESPACE_BEGINNING (G5): Both
-      map to diffutils' ignore_space_change_flag. GNU diffutils has no
-      separate leading/trailing mode — ignore_space_change handles both.
+  10. Whitespace flags (G5): Only DIFF_IGN_WHITESPACE remains; it maps to
+      diffutils' ignore_all_space_flag. The former API flags
+      DIFF_IGN_WHITESPACE_CHANGE / DIFF_IGN_WHITESPACE_EOL /
+      DIFF_IGN_WHITESPACE_BEGINNING were removed from diff_proc, so no
+      public flag maps to ignore_space_change_flag anymore — it stays 0
+      and the ported diffutils code paths behind it are unreachable
+      (kept only for fidelity to the ported diffutils sources).
 
   11. DIFF_IGN_CASE (G6): ASCII-only tolower per byte (matching WinMerge
       io.c:348 behavior), NOT Unicode case folding. Bytes 0x80-0xFF pass
@@ -186,14 +190,11 @@ const
   cAlgoHistogram = 1;
 
   { Ignore flags — must match proc_py_const.pas DIFF_IGN_* }
-  cIgnCase                 = 1;      // DIFF_IGN_CASE
-  cIgnWhitespace           = 2;      // DIFF_IGN_WHITESPACE
-  cIgnWhitespaceChange     = 4;      // DIFF_IGN_WHITESPACE_CHANGE
-  cIgnWhitespaceEol        = 8;      // DIFF_IGN_WHITESPACE_EOL
-  cIgnWhitespaceBeginning  = 16;     // DIFF_IGN_WHITESPACE_BEGINNING
-  cIgnBlankLines           = 32;     // DIFF_IGN_BLANK_LINES
-  cIgnEol                  = 64;     // DIFF_IGN_EOL
-  cIgnNumbers              = 128;    // DIFF_IGN_NUMBERS
+  cIgnCase        = 1;      // DIFF_IGN_CASE
+  cIgnWhitespace  = 2;      // DIFF_IGN_WHITESPACE
+  cIgnBlankLines  = 4;      // DIFF_IGN_BLANK_LINES
+  cIgnEol         = 8;      // DIFF_IGN_EOL
+  cIgnNumbers     = 16;     // DIFF_IGN_NUMBERS
 
   { Opcode tag values — must match proc_py_const.pas DIFF_TAG_* }
   cTagEqual   = 0;
@@ -461,25 +462,15 @@ procedure InitContext(out Ctx: TDiffContext; AFlags: Integer);
 begin
   FillChar(Ctx, SizeOf(Ctx), 0);
 
-  { Whitespace precedence (G30):
-    - DIFF_IGN_WHITESPACE (2) wins → ignore_all_space_flag = 1, ignore_space_change_flag = 0
-    - Else if any of (4, 8, 16) set → ignore_space_change_flag = 1, ignore_all_space_flag = 0
-    - Else → both 0 }
+  { Whitespace (G30): DIFF_IGN_WHITESPACE is the only whitespace flag —
+    it maps to ignore_all_space_flag. ignore_space_change_flag has no
+    public mapping anymore (DIFF_IGN_WHITESPACE_CHANGE / _EOL / _BEGINNING
+    were removed from diff_proc) and stays 0. }
   if (AFlags and cIgnWhitespace) <> 0 then
-  begin
-    Ctx.IgnoreAllSpaceFlag := 1;
-    Ctx.IgnoreSpaceChangeFlag := 0;
-  end
-  else if (AFlags and (cIgnWhitespaceChange or cIgnWhitespaceEol or cIgnWhitespaceBeginning)) <> 0 then
-  begin
-    Ctx.IgnoreAllSpaceFlag := 0;
-    Ctx.IgnoreSpaceChangeFlag := 1;
-  end
+    Ctx.IgnoreAllSpaceFlag := 1
   else
-  begin
     Ctx.IgnoreAllSpaceFlag := 0;
-    Ctx.IgnoreSpaceChangeFlag := 0;
-  end;
+  Ctx.IgnoreSpaceChangeFlag := 0;
 
   { Direct flag mappings (G5) }
   if (AFlags and cIgnCase) <> 0 then
