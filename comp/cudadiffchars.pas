@@ -142,9 +142,11 @@
       lines are a line-level concept. DoDiffChars accepts the bit but
       doesn't use it.
 
-  15. DIFF_IGN_WHITESPACE_EOL / DIFF_IGN_WHITESPACE_BEGINNING (G5): Both
-      map to WHITESPACE_IGNORE_CHANGE at char-level (trailing/leading ws
-      is a line-level concept).
+  15. Whitespace flags (G5): Only DIFF_IGN_WHITESPACE exists; it maps to
+      WHITESPACE_IGNORE_ALL at char-level (whitespace tokens are dropped).
+      The former flags DIFF_IGN_WHITESPACE_CHANGE / _EOL / _BEGINNING were
+      removed from diff_proc — their old mapping to
+      WHITESPACE_IGNORE_CHANGE is gone with them.
 
   16. BREAK_CHARS (G6): Fixed to the WinMerge default ",.;:" — the
       SetBreakChars API is not exposed via diff_proc.
@@ -176,16 +178,12 @@ const
 
   { DIFF_IGN_* flag values — must match proc_py_const.pas exactly.
     Defined privately here because cudadiffchars.pas is standalone
-    (does NOT `uses CudaDiff` or proc_py_const). Using integer literals
-    directly in the flag-mapping code is cleaner — no risk of drift. }
-  DIFF_IGN_CASE_Private                 = 1;
-  DIFF_IGN_WHITESPACE_Private           = 2;
-  DIFF_IGN_WHITESPACE_CHANGE_Private    = 4;
-  DIFF_IGN_WHITESPACE_EOL_Private       = 8;
-  DIFF_IGN_WHITESPACE_BEGINNING_Private = 16;
-  DIFF_IGN_BLANK_LINES_Private          = 32;
-  DIFF_IGN_EOL_Private                  = 64;
-  DIFF_IGN_NUMBERS_Private               = 128;
+    (does NOT `uses CudaDiff` or proc_py_const). }
+  DIFF_IGN_CASE_Private        = 1;
+  DIFF_IGN_WHITESPACE_Private  = 2;
+  DIFF_IGN_BLANK_LINES_Private = 4;
+  DIFF_IGN_EOL_Private         = 8;
+  DIFF_IGN_NUMBERS_Private     = 16;
 
   { Word-class constants — ported from stringdiffsi.h:22-29.
     Note: WinMerge Pascal-cases these as enum values; we use lowercase
@@ -1821,27 +1819,26 @@ begin
   end;
 
   { Map DIFF_IGN_* flags to WinMerge options (see G5). }
-  CaseSensitive := (AFlags and 1) = 0;                // DIFF_IGN_CASE = 1
-  IgnoreNumbers := (AFlags and 128) <> 0;             // DIFF_IGN_NUMBERS = 128
+  CaseSensitive := (AFlags and DIFF_IGN_CASE_Private) = 0;
+  IgnoreNumbers := (AFlags and DIFF_IGN_NUMBERS_Private) <> 0;
 
-  if (AFlags and 64) <> 0 then                         // DIFF_IGN_EOL = 64
+  if (AFlags and DIFF_IGN_EOL_Private) <> 0 then
     EolMode := eolIgnore
   else
     EolMode := eolStrict;
   { EOL_AS_SPACE is never used via DoDiffChars — only EOL_STRICT and EOL_IGNORE. }
 
-  { Whitespace flag precedence (G5):
-    DIFF_IGN_WHITESPACE (2) wins → WHITESPACE_IGNORE_ALL
-    else if any of (4, 8, 16) set → WHITESPACE_IGNORE_CHANGE
-    else → WHITESPACE_COMPARE_ALL }
-  if (AFlags and 2) <> 0 then                          // DIFF_IGN_WHITESPACE
+  { Whitespace flag (G5):
+    DIFF_IGN_WHITESPACE → WHITESPACE_IGNORE_ALL
+    else → WHITESPACE_COMPARE_ALL
+    (DIFF_IGN_WHITESPACE_CHANGE / _EOL / _BEGINNING were removed from the
+    API — nothing maps to WHITESPACE_IGNORE_CHANGE anymore.) }
+  if (AFlags and DIFF_IGN_WHITESPACE_Private) <> 0 then
     Whitespace := WHITESPACE_IGNORE_ALL
-  else if (AFlags and (4 or 8 or 16)) <> 0 then        // CHANGE / EOL / BEGINNING
-    Whitespace := WHITESPACE_IGNORE_CHANGE
   else
     Whitespace := WHITESPACE_COMPARE_ALL;
 
-  { DIFF_IGN_BLANK_LINES (32) is silently ignored at char-level (G7). }
+  { DIFF_IGN_BLANK_LINES is silently ignored at char-level (G7). }
 
   BreakType := 1;    { always break on punctuation — matches Differ plugin expectations }
   ByteLevel := True; { always refine to char level — Differ plugin uses char-level highlights }
