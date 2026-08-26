@@ -80,15 +80,14 @@
 
   6. Structural divergence (G31): JGit's RawTextComparator exposes WS_IGNORE_*
      as mutually-exclusive singletons (DEFAULT, WS_IGNORE_ALL, WS_IGNORE_LEADING,
-     WS_IGNORE_TRAILING, WS_IGNORE_CHANGE). We keep these as separate Pascal
-     subclasses (TRawTextComparatorDefault, TRawTextComparatorWSIgnoreAll,
-     TRawTextComparatorWSIgnoreLeading, TRawTextComparatorWSIgnoreTrailing,
-     TRawTextComparatorWSIgnoreChange) — same class names, same logic, byte-for-byte
-     identical hash values. CASE/NUMBERS/EOL flags are layered on top via
-     helper functions (XformByte, IsSkippedByte, TrimTrailingEOL) called inline
-     in each subclass's Equals/HashRegion. JGit has no precedent for this
-     layering — it's documented as a divergence but produces the same result
-     a Java-side ad-hoc comparator would produce.
+     WS_IGNORE_TRAILING, WS_IGNORE_CHANGE). The Pascal port originally kept all
+     five as subclasses, but after DIFF_IGN_WHITESPACE_CHANGE / _EOL / _BEGINNING
+     were removed from diff_proc only two remain: TRawTextComparatorDefault and
+     TRawTextComparatorWSIgnoreAll. CASE/NUMBERS/EOL flags are layered on top
+     via helper functions (XformByte, IsSkippedByte, TrimTrailingEOL) called
+     inline in each subclass's Equals/HashRegion. JGit has no precedent for
+     this layering — it's documented as a divergence but produces the same
+     result a Java-side ad-hoc comparator would produce.
 
   7. Compiler mode (G10, G12): CudaText is compiled with -Cr -Co (range +
      overflow checks). DJB2 and Knuth multiplicative hash intentionally wrap
@@ -128,14 +127,11 @@ const
   cAlgoHistogram = 1;
 
   { Ignore flags — must match proc_py_const.pas DIFF_IGN_* }
-  cIgnCase                 = 1;      // DIFF_IGN_CASE
-  cIgnWhitespace           = 2;      // DIFF_IGN_WHITESPACE
-  cIgnWhitespaceChange     = 4;      // DIFF_IGN_WHITESPACE_CHANGE
-  cIgnWhitespaceEOL        = 8;      // DIFF_IGN_WHITESPACE_EOL
-  cIgnWhitespaceBeginning  = 16;     // DIFF_IGN_WHITESPACE_BEGINNING
-  cIgnBlankLines           = 32;     // DIFF_IGN_BLANK_LINES
-  cIgnEOL                  = 64;     // DIFF_IGN_EOL
-  cIgnNumbers              = 128;    // DIFF_IGN_NUMBERS
+  cIgnCase        = 1;      // DIFF_IGN_CASE
+  cIgnWhitespace  = 2;      // DIFF_IGN_WHITESPACE
+  cIgnBlankLines  = 4;      // DIFF_IGN_BLANK_LINES
+  cIgnEOL         = 8;      // DIFF_IGN_EOL
+  cIgnNumbers     = 16;     // DIFF_IGN_NUMBERS
 
   { Opcode tag values — must match proc_py_const.pas DIFF_TAG_* }
   cTagEqual   = 0;
@@ -314,12 +310,14 @@ type
     ----------------------------------------------------------------
     Equivalence function for TRawText.
 
-    Subclasses (one per JGit singleton):
-      TRawTextComparatorDefault        -> RawTextComparator.DEFAULT
-      TRawTextComparatorWSIgnoreAll    -> RawTextComparator.WS_IGNORE_ALL
-      TRawTextComparatorWSIgnoreLeading -> RawTextComparator.WS_IGNORE_LEADING
-      TRawTextComparatorWSIgnoreTrailing -> RawTextComparator.WS_IGNORE_TRAILING
-      TRawTextComparatorWSIgnoreChange  -> RawTextComparator.WS_IGNORE_CHANGE
+    Subclasses (one per JGit singleton that is still reachable from
+      diff_proc flags):
+      TRawTextComparatorDefault     -> RawTextComparator.DEFAULT
+      TRawTextComparatorWSIgnoreAll -> RawTextComparator.WS_IGNORE_ALL
+
+    JGit's WS_IGNORE_LEADING / WS_IGNORE_TRAILING / WS_IGNORE_CHANGE
+    singletons are NOT ported: their diff_proc flags
+    (DIFF_IGN_WHITESPACE_BEGINNING / _EOL / _CHANGE) were removed.
 
     Each subclass overrides Equals + HashRegion. The Hash() and
     ReduceCommonStartEnd() implementations live here (shared across subclasses).
@@ -360,30 +358,6 @@ type
   { WS_IGNORE_ALL: ignores all whitespace.
     Ported from RawTextComparator.WS_IGNORE_ALL (lines 56-104). }
   TRawTextComparatorWSIgnoreAll = class(TRawTextComparator)
-  public
-    function Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean; override;
-    function HashRegion(raw: PByte; ptr, end_: Integer): Integer; override;
-  end;
-
-  { WS_IGNORE_LEADING: ignore leading whitespace.
-    Ported from RawTextComparator.WS_IGNORE_LEADING (lines 109-141). }
-  TRawTextComparatorWSIgnoreLeading = class(TRawTextComparator)
-  public
-    function Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean; override;
-    function HashRegion(raw: PByte; ptr, end_: Integer): Integer; override;
-  end;
-
-  { WS_IGNORE_TRAILING: ignore trailing whitespace.
-    Ported from RawTextComparator.WS_IGNORE_TRAILING (lines 144-176). }
-  TRawTextComparatorWSIgnoreTrailing = class(TRawTextComparator)
-  public
-    function Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean; override;
-    function HashRegion(raw: PByte; ptr, end_: Integer): Integer; override;
-  end;
-
-  { WS_IGNORE_CHANGE: ignore whitespace occurring between non-whitespace chars.
-    Ported from RawTextComparator.WS_IGNORE_CHANGE (lines 179-221). }
-  TRawTextComparatorWSIgnoreChange = class(TRawTextComparator)
   public
     function Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean; override;
     function HashRegion(raw: PByte; ptr, end_: Integer): Integer; override;
@@ -628,15 +602,10 @@ begin
   Result := p + 1;
 end;
 
-{ Trims leading whitespace bytes from [ptr, end_).
-  Ported from RawCharUtil.trimLeadingWhitespace() (util/RawCharUtil.java:73-78).
-  Returns the new start position. }
-function TrimLeadingWhitespace(raw: PByte; start, end_: Integer): Integer; inline;
-begin
-  while (start < end_) and IsWhitespaceByte(raw[start]) do
-    Inc(start);
-  Result := start;
-end;
+{ NOTE: RawCharUtil.trimLeadingWhitespace() (util/RawCharUtil.java:73-78) is
+  NOT ported — it was only used by the WS_IGNORE_LEADING / WS_IGNORE_CHANGE
+  comparators, which are not ported (their diff_proc flags
+  DIFF_IGN_WHITESPACE_BEGINNING / DIFF_IGN_WHITESPACE_CHANGE were removed). }
 
 { Trims trailing EOL (\r\n, \n, \r) from [ptr, end_) when DIFF_IGN_EOL is set.
   DIVERGENCE from JGit (G9) — JGit has no such comparator. }
@@ -1485,272 +1454,12 @@ begin
 end;
 {$POP}
 
-{ ------------------------------------------------------------------
-  TRawTextComparatorWSIgnoreLeading — ported from RawTextComparator.WS_IGNORE_LEADING
-  (lines 109-141)
-  ------------------------------------------------------------------ }
-
-function TRawTextComparatorWSIgnoreLeading.Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean;
-var
-  ra, rb: TRawText;
-  as_, bs, ae, be: Integer;
-  aRaw, bRaw: PByte;
-  ac, bc: Byte;
-begin
-  Inc(ai);
-  Inc(bi);
-  ra := a as TRawText;
-  rb := b as TRawText;
-  as_ := ra.Lines.Get(ai);
-  bs := rb.Lines.Get(bi);
-  ae := ra.Lines.Get(ai + 1);
-  be := rb.Lines.Get(bi + 1);
-
-  ae := TrimTrailingEOL(ra.ContentPtr, as_, ae, FFlags);
-  be := TrimTrailingEOL(rb.ContentPtr, bs, be, FFlags);
-
-  as_ := TrimLeadingWhitespace(ra.ContentPtr, as_, ae);
-  bs := TrimLeadingWhitespace(rb.ContentPtr, bs, be);
-
-  aRaw := ra.ContentPtr;
-  bRaw := rb.ContentPtr;
-
-  // After leading-WS trim, default byte comparison with CASE/NUMBERS handling.
-  if (FFlags and (cIgnCase or cIgnNumbers)) = 0 then
-  begin
-    if (ae - as_) <> (be - bs) then
-      Exit(False);
-    while as_ < ae do
-    begin
-      if aRaw[as_] <> bRaw[bs] then
-        Exit(False);
-      Inc(as_);
-      Inc(bs);
-    end;
-    Exit(True);
-  end;
-
-  while (as_ < ae) and (bs < be) do
-  begin
-    ac := aRaw[as_];
-    if IsSkippedByte(ac, FFlags) then
-    begin
-      Inc(as_);
-      Continue;
-    end;
-    bc := bRaw[bs];
-    if IsSkippedByte(bc, FFlags) then
-    begin
-      Inc(bs);
-      Continue;
-    end;
-    if XformByte(ac, FFlags) <> XformByte(bc, FFlags) then
-      Exit(False);
-    Inc(as_);
-    Inc(bs);
-  end;
-  while (as_ < ae) and IsSkippedByte(aRaw[as_], FFlags) do
-    Inc(as_);
-  while (bs < be) and IsSkippedByte(bRaw[bs], FFlags) do
-    Inc(bs);
-  Result := (as_ = ae) and (bs = be);
-end;
-
-function TRawTextComparatorWSIgnoreLeading.HashRegion(raw: PByte; ptr, end_: Integer): Integer;
-{$PUSH}{$R-}{$Q-}
-var
-  h: Integer;
-  c: Byte;
-begin
-  end_ := TrimTrailingEOL(raw, ptr, end_, FFlags);
-  ptr := TrimLeadingWhitespace(raw, ptr, end_);
-  h := 5381;
-  while ptr < end_ do
-  begin
-    c := raw[ptr];
-    if not IsSkippedByte(c, FFlags) then
-      h := ((h shl 5) + h) + (XformByte(c, FFlags) and $FF);
-    Inc(ptr);
-  end;
-  Result := h;
-end;
-{$POP}
-
-{ ------------------------------------------------------------------
-  TRawTextComparatorWSIgnoreTrailing — ported from RawTextComparator.WS_IGNORE_TRAILING
-  (lines 144-176)
-  ------------------------------------------------------------------ }
-
-function TRawTextComparatorWSIgnoreTrailing.Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean;
-var
-  ra, rb: TRawText;
-  as_, bs, ae, be: Integer;
-  aRaw, bRaw: PByte;
-  ac, bc: Byte;
-begin
-  Inc(ai);
-  Inc(bi);
-  ra := a as TRawText;
-  rb := b as TRawText;
-  as_ := ra.Lines.Get(ai);
-  bs := rb.Lines.Get(bi);
-  ae := ra.Lines.Get(ai + 1);
-  be := rb.Lines.Get(bi + 1);
-
-  ae := TrimTrailingEOL(ra.ContentPtr, as_, ae, FFlags);
-  be := TrimTrailingEOL(rb.ContentPtr, bs, be, FFlags);
-  ae := TrimTrailingWhitespace(ra.ContentPtr, as_, ae);
-  be := TrimTrailingWhitespace(rb.ContentPtr, bs, be);
-
-  aRaw := ra.ContentPtr;
-  bRaw := rb.ContentPtr;
-
-  if (FFlags and (cIgnCase or cIgnNumbers)) = 0 then
-  begin
-    if (ae - as_) <> (be - bs) then
-      Exit(False);
-    while as_ < ae do
-    begin
-      if aRaw[as_] <> bRaw[bs] then
-        Exit(False);
-      Inc(as_);
-      Inc(bs);
-    end;
-    Exit(True);
-  end;
-
-  while (as_ < ae) and (bs < be) do
-  begin
-    ac := aRaw[as_];
-    if IsSkippedByte(ac, FFlags) then
-    begin
-      Inc(as_);
-      Continue;
-    end;
-    bc := bRaw[bs];
-    if IsSkippedByte(bc, FFlags) then
-    begin
-      Inc(bs);
-      Continue;
-    end;
-    if XformByte(ac, FFlags) <> XformByte(bc, FFlags) then
-      Exit(False);
-    Inc(as_);
-    Inc(bs);
-  end;
-  while (as_ < ae) and IsSkippedByte(aRaw[as_], FFlags) do
-    Inc(as_);
-  while (bs < be) and IsSkippedByte(bRaw[bs], FFlags) do
-    Inc(bs);
-  Result := (as_ = ae) and (bs = be);
-end;
-
-function TRawTextComparatorWSIgnoreTrailing.HashRegion(raw: PByte; ptr, end_: Integer): Integer;
-{$PUSH}{$R-}{$Q-}
-var
-  h: Integer;
-  c: Byte;
-begin
-  end_ := TrimTrailingEOL(raw, ptr, end_, FFlags);
-  end_ := TrimTrailingWhitespace(raw, ptr, end_);
-  h := 5381;
-  while ptr < end_ do
-  begin
-    c := raw[ptr];
-    if not IsSkippedByte(c, FFlags) then
-      h := ((h shl 5) + h) + (XformByte(c, FFlags) and $FF);
-    Inc(ptr);
-  end;
-  Result := h;
-end;
-{$POP}
-
-{ ------------------------------------------------------------------
-  TRawTextComparatorWSIgnoreChange — ported from RawTextComparator.WS_IGNORE_CHANGE
-  (lines 179-221)
-  ------------------------------------------------------------------ }
-
-function TRawTextComparatorWSIgnoreChange.Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean;
-var
-  ra, rb: TRawText;
-  as_, bs, ae, be: Integer;
-  aRaw, bRaw: PByte;
-  ac, bc: Byte;
-begin
-  Inc(ai);
-  Inc(bi);
-  ra := a as TRawText;
-  rb := b as TRawText;
-  as_ := ra.Lines.Get(ai);
-  bs := rb.Lines.Get(bi);
-  ae := ra.Lines.Get(ai + 1);
-  be := rb.Lines.Get(bi + 1);
-
-  ae := TrimTrailingEOL(ra.ContentPtr, as_, ae, FFlags);
-  be := TrimTrailingEOL(rb.ContentPtr, bs, be, FFlags);
-  ae := TrimTrailingWhitespace(ra.ContentPtr, as_, ae);
-  be := TrimTrailingWhitespace(rb.ContentPtr, bs, be);
-
-  aRaw := ra.ContentPtr;
-  bRaw := rb.ContentPtr;
-
-  while (as_ < ae) and (bs < be) do
-  begin
-    ac := aRaw[as_];
-    Inc(as_);
-    bc := bRaw[bs];
-    Inc(bs);
-
-    if IsWhitespaceByte(ac) and IsWhitespaceByte(bc) then
-    begin
-      as_ := TrimLeadingWhitespace(aRaw, as_, ae);
-      bs := TrimLeadingWhitespace(bRaw, bs, be);
-    end
-    else
-    begin
-      // Skip digit bytes (DIFF_IGN_NUMBERS) — both before XformByte comparison.
-      if IsSkippedByte(ac, FFlags) then
-      begin
-        Dec(as_);
-        Continue;  // re-read same position with new state
-      end;
-      if IsSkippedByte(bc, FFlags) then
-      begin
-        Dec(bs);
-        Continue;
-      end;
-      if XformByte(ac, FFlags) <> XformByte(bc, FFlags) then
-        Exit(False);
-    end;
-  end;
-
-  Result := (as_ = ae) and (bs = be);
-end;
-
-function TRawTextComparatorWSIgnoreChange.HashRegion(raw: PByte; ptr, end_: Integer): Integer;
-{$PUSH}{$R-}{$Q-}
-var
-  h: Integer;
-  c: Byte;
-begin
-  end_ := TrimTrailingEOL(raw, ptr, end_, FFlags);
-  end_ := TrimTrailingWhitespace(raw, ptr, end_);
-  h := 5381;
-  while ptr < end_ do
-  begin
-    c := raw[ptr];
-    Inc(ptr);
-    if IsWhitespaceByte(c) then
-    begin
-      ptr := TrimLeadingWhitespace(raw, ptr, end_);
-      c := $20;  // ' ' — matches JGit's "treat WS run as single space"
-    end;
-    if not IsSkippedByte(c, FFlags) then
-      h := ((h shl 5) + h) + (XformByte(c, FFlags) and $FF);
-  end;
-  Result := h;
-end;
-{$POP}
+{ NOTE: TRawTextComparatorWSIgnoreLeading / WSIgnoreTrailing / WSIgnoreChange
+  (JGit's RawTextComparator.WS_IGNORE_LEADING / WS_IGNORE_TRAILING /
+  WS_IGNORE_CHANGE singletons) are NOT ported — their diff_proc flags
+  (DIFF_IGN_WHITESPACE_BEGINNING / DIFF_IGN_WHITESPACE_EOL /
+  DIFF_IGN_WHITESPACE_CHANGE) were removed from the API, so no code path
+  could ever instantiate them. }
 
 { ------------------------------------------------------------------
   THashedSequence methods — ported from diff/HashedSequence.java
@@ -3222,8 +2931,9 @@ end;
   Internal helpers — choose comparator + algorithm based on flags.
   ------------------------------------------------------------------ }
 
-{ Chooses the right TRawTextComparator subclass based on the WS flags.
-  Precedence (G31): WS_IGNORE_ALL > WS_IGNORE_CHANGE > WS_IGNORE_TRAILING > WS_IGNORE_LEADING. }
+{ Chooses the right TRawTextComparator subclass based on the WS flag.
+  Only two subclasses exist (G31): WS_IGNORE_ALL (DIFF_IGN_WHITESPACE)
+  and DEFAULT. }
 function CreateComparator(AFlags: Integer): TRawTextComparator;
 var
   nonWSFlags: Integer;
@@ -3234,12 +2944,6 @@ begin
 
   if (AFlags and cIgnWhitespace) <> 0 then
     Result := TRawTextComparatorWSIgnoreAll.Create(nonWSFlags)
-  else if (AFlags and cIgnWhitespaceChange) <> 0 then
-    Result := TRawTextComparatorWSIgnoreChange.Create(nonWSFlags)
-  else if (AFlags and cIgnWhitespaceEOL) <> 0 then
-    Result := TRawTextComparatorWSIgnoreTrailing.Create(nonWSFlags)
-  else if (AFlags and cIgnWhitespaceBeginning) <> 0 then
-    Result := TRawTextComparatorWSIgnoreLeading.Create(nonWSFlags)
   else
     Result := TRawTextComparatorDefault.Create(nonWSFlags);
 end;
@@ -3358,7 +3062,7 @@ end;
   A hunk (REPLACE block, or adjacent INSERT+DELETE forming a logical change)
   is suppressed if EVERY deleted line AND every inserted line in that hunk
   is blank. 'Blank' definition depends on other ignore flags:
-    - If ignore_all_space or ignore_space_change is also on → "blank" = whitespace-only
+    - If DIFF_IGN_WHITESPACE is also on → "blank" = whitespace-only
     - Otherwise → "blank" = truly empty (length 0 or first byte is \r/\n)
 
   INSERT-only or DELETE-only hunks (pure additions/removals of blank lines)
@@ -3368,7 +3072,6 @@ function IsLineBlank(rt: TRawText; lineIdx: Integer; AFlags: Integer): Boolean;
 var
   p, end_: Integer;
   raw: PByte;
-  hasWSIgnore: Boolean;
 begin
   if lineIdx >= rt.Size then
     Exit(True);
@@ -3380,10 +3083,8 @@ begin
   if (p >= end_) or (raw[p] = $0A) or (raw[p] = $0D) then
     Exit(True);
 
-  // If WS_IGNORE_ALL or WS_IGNORE_CHANGE is set, "blank" = whitespace-only.
-  hasWSIgnore := ((AFlags and cIgnWhitespace) <> 0)
-             or ((AFlags and cIgnWhitespaceChange) <> 0);
-  if not hasWSIgnore then
+  // If DIFF_IGN_WHITESPACE is set, "blank" = whitespace-only.
+  if (AFlags and cIgnWhitespace) = 0 then
     Exit(False);  // truly-empty check already passed above
 
   // Whitespace-only check.
