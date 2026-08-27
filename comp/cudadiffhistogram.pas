@@ -114,13 +114,19 @@
      DIFF_IGN_WHITESPACE alone in this engine but DIFFERENT in Myers —
      an inconsistency.
 
- 10. DIFF_IGN_BLANK_LINES was removed from diff_proc (G37): the
-     IsLineBlank / SuppressBlankLineHunks post-diff pass was deleted with
-     it. WinMerge renders suppressed blank-line hunks with a dedicated
-     "ignored difference" gap type and color so the panes stay aligned;
-     CudaText's diff UI has a single gap type, so a correct
-     DIFF_IGN_BLANK_LINES is not renderable there — the flag is gone
-     rather than shipped half-working.
+ 10. DIFF_IGN_BLANK_LINES is a post-pass over the finished opcode
+      list (G37): a hunk (insert/delete/replace) whose lines are ALL
+      blank on both sides is re-tagged as a single 'ignore' opcode
+      (ranges behave like 'replace'). Blank = empty after the EOL
+      terminator, or - when DIFF_IGN_WHITESPACE is also set - only
+      spaces/tabs (verified against GNU 'diff -B' / 'diff -B -b' ground
+      truth: space-only lines are NOT blank under -B alone).
+      'equal' opcodes are never touched, so i2-i1 == j2-j1 always holds
+      for them; the Differ plugin paints 'ignore' regions with a
+      distinct color and compensates the length mismatch with an
+      inter-line gap (Editor.gap supports per-gap color + tag), the way
+      WinMerge renders its "ignored differences". The same logic lives
+      in cudadiffmyers.pas.
 *)
 
 unit CudaDiffHistogram;
@@ -148,18 +154,20 @@ const
   cIgnWhitespace  = 2;      // DIFF_IGN_WHITESPACE
   cIgnEOL         = 4;      // DIFF_IGN_EOL
   cIgnNumbers     = 8;      // DIFF_IGN_NUMBERS
+  cIgnBlankLines  = 16;     // DIFF_IGN_BLANK_LINES
 
   { Opcode tag values — must match proc_py_const.pas DIFF_TAG_* }
   cTagEqual   = 0;
   cTagDelete  = 1;
   cTagInsert  = 2;
   cTagReplace = 3;
+  cTagIgnore  = 4;      // all-blank hunk suppressed by DIFF_IGN_BLANK_LINES
 
 type
   { Public opcode type. Same layout as CudaDiffChars.TDiffOpcode but a
     SEPARATE Pascal type (G14) — the two units must not alias. }
   TDiffOpcode = record
-    Tag: Integer;   // 0=equal, 1=delete, 2=insert, 3=replace
+    Tag: Integer;   // 0=equal, 1=delete, 2=insert, 3=replace, 4=ignore (suppressed all-blank hunk)
     I1, I2, J1, J2: Integer;
   end;
   TDiffOpcodeArray = array of TDiffOpcode;
@@ -3097,6 +3105,115 @@ begin
 end;
 
 { ------------------------------------------------------------------
+  DIFF_IGN_BLANK_LINES suppression (G37) — WinMerge-style
+  "ignored differences". Identical logic lives in cudadiffmyers.pas
+  (its Section 18); see the header note there for the full rationale.
+
+  Every hunk (insert/delete/replace) whose lines are ALL blank on both
+  sides is re-tagged as a single 'ignore' opcode (ranges behave like
+  'replace'). 'equal' opcodes are never touched, so i2-i1 == j2-j1
+  keeps holding for them; the Differ plugin paints 'ignore' regions
+  with a distinct color and compensates the length mismatch with an
+  inter-line gap (Editor.gap supports per-gap color + tag), the way
+  WinMerge renders its "ignored differences".
+
+  Blank (verified against GNU diffutils -B / -B -b): empty after
+  stripping the EOL terminator, or — with DIFF_IGN_WHITESPACE — only
+  spaces/tabs. Space-only lines are NOT blank without the whitespace
+  flag. Line spans come from the engine's own TRawText line map, so
+  the check can never disagree with the engine's line splitting.
+  ------------------------------------------------------------------ }
+
+{ True when the line content (EOL terminator stripped) is empty, or
+  consists only of spaces/tabs under AWhitespaceAlso. }
+function IsBlankLineRaw(rt: TRawText; ALine: Integer;
+  AWhitespaceAlso: Boolean): Boolean;
+var
+  raw: PByte;
+  P, PEnd: Integer;
+begin
+  if (ALine < 0) or (ALine >= rt.Size) then
+    Exit(False);
+  raw := rt.ContentPtr;
+  P := rt.GetStart(ALine);
+  PEnd := rt.GetEnd(ALine);
+
+  // Strip the trailing EOL terminator (LF / CR / CRLF).
+  while (PEnd > P) and ((raw[PEnd - 1] = 10) or (raw[PEnd - 1] = 13)) do
+    Dec(PEnd);
+
+  while P < PEnd do
+  begin
+    if not (AWhitespaceAlso and ((raw[P] = 32) or (raw[P] = 9))) then
+      Exit(False);
+    Inc(P);
+  end;
+  Result := True;
+end;
+
+{ True when every line of the opcode's ranges on BOTH sides is blank.
+  An empty range (pure insert/delete hunks) is vacuously blank. }
+function HunkAllBlank(rtA, rtB: TRawText; const Op: TDiffOpcode;
+  AWhitespaceAlso: Boolean): Boolean;
+var
+  K: Integer;
+begin
+  for K := Op.I1 to Op.I2 - 1 do
+    if not IsBlankLineRaw(rtA, K, AWhitespaceAlso) then
+      Exit(False);
+  for K := Op.J1 to Op.J2 - 1 do
+    if not IsBlankLineRaw(rtB, K, AWhitespaceAlso) then
+      Exit(False);
+  Result := True;
+end;
+
+{ Re-tag every all-blank non-equal hunk as 'ignore'. Directly-adjacent
+  all-blank hunks (e.g. a delete followed by an insert) merge into a
+  single 'ignore' opcode — opcodes tile the inputs, so the run's union
+  is contiguous and replaces the run exactly. }
+procedure MarkIgnoredBlankHunks(rtA, rtB: TRawText; AWhitespaceAlso: Boolean;
+  var Ops: TDiffOpcodeArray);
+var
+  I, J, K, Shift: Integer;
+  I2Max, J2Max: Integer;
+begin
+  I := 0;
+  while I < Length(Ops) do
+  begin
+    if (Ops[I].Tag <> cTagEqual) and
+       HunkAllBlank(rtA, rtB, Ops[I], AWhitespaceAlso) then
+    begin
+      I2Max := Ops[I].I2;
+      J2Max := Ops[I].J2;
+      J := I + 1;
+      while (J < Length(Ops)) and (Ops[J].Tag <> cTagEqual) and
+            HunkAllBlank(rtA, rtB, Ops[J], AWhitespaceAlso) do
+      begin
+        I2Max := Ops[J].I2;
+        J2Max := Ops[J].J2;
+        Inc(J);
+      end;
+
+      Ops[I].Tag := cTagIgnore;
+      Ops[I].I2 := I2Max;
+      Ops[I].J2 := J2Max;
+
+      // Delete the merged-away ops [I+1 .. J-1].
+      Shift := J - I - 1;
+      if Shift > 0 then
+      begin
+        for K := J to High(Ops) do
+          Ops[K - Shift] := Ops[K];
+        SetLength(Ops, Length(Ops) - Shift);
+      end;
+      Inc(I);
+    end
+    else
+      Inc(I);
+  end;
+end;
+
+{ ------------------------------------------------------------------
   Public entry point
   ------------------------------------------------------------------ }
 function DoDiffTexts(const ATextA, ATextB: string;
@@ -3132,6 +3249,12 @@ begin
         edits := algo.Diff(cmp, rtA, rtB);
         try
           ops := EditListToOpcodes(edits, sizeA, sizeB);
+          // DIFF_IGN_BLANK_LINES: re-tag all-blank hunks as 'ignore'
+          // (G37). Runs on the final opcodes — the algorithm above is
+          // untouched.
+          if (AFlags and cIgnBlankLines) <> 0 then
+            MarkIgnoredBlankHunks(rtA, rtB,
+              (AFlags and cIgnWhitespace) <> 0, ops);
         finally
           edits.Free;
         end;
