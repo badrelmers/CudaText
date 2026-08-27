@@ -928,12 +928,14 @@ const
   DIFF_IGN_WHITESPACE  = 2;      // all whitespace ignored
   DIFF_IGN_EOL         = 4;      // CR/LF vs LF vs CR treated equal
   DIFF_IGN_NUMBERS     = 8;      // digit runs treated as equal (for logs)
+  DIFF_IGN_BLANK_LINES = 16;     // all-blank hunks suppressed -> 'ignore' opcodes
 
   // diff_proc: opcode tag values
   DIFF_TAG_EQUAL   = 0;
   DIFF_TAG_DELETE  = 1;
   DIFF_TAG_INSERT  = 2;
   DIFF_TAG_REPLACE = 3;
+  DIFF_TAG_IGNORE  = 4;      // difference suppressed by DIFF_IGN_BLANK_LINES
 
 implementation
 

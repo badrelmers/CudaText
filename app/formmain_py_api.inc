@@ -11112,8 +11112,12 @@ end;
 //        Ignored for DIF_CHARS (char diff always uses word-Myers + byte-trim).
 //  flags: bitmask of DIFF_IGN_* values (case/whitespace/numbers/etc).
 //Returns: list of (tag, i1, i2, j1, j2) tuples where tag is a lowercase
-//  string 'equal'/'delete'/'insert'/'replace'. Format matches
-//  difflib.SequenceMatcher.get_opcodes() exactly.
+//  string 'equal'/'delete'/'insert'/'replace'/'ignore'. Format matches
+//  difflib.SequenceMatcher.get_opcodes() exactly. 'ignore' is a CudaText
+//  extension tag: a real difference that DIFF_IGN_BLANK_LINES suppressed
+//  (an all-blank hunk) — ranges behave like 'replace', and consumers
+//  should render the region with a distinct color and compensate the
+//  length mismatch with Editor.gap() so lines below stay aligned.
 function api_diff_proc(Self, Args: PPyObject): PPyObject; cdecl;
 var
   IdAction: Integer;
@@ -11144,6 +11148,7 @@ var
           DIFF_TAG_DELETE:  LTagStr := 'delete';
           DIFF_TAG_INSERT:  LTagStr := 'insert';
           DIFF_TAG_REPLACE: LTagStr := 'replace';
+          DIFF_TAG_IGNORE:  LTagStr := 'ignore';
           else              LTagStr := 'equal';
         end;
         LTagPtr := PChar(LTagStr);
@@ -11173,6 +11178,7 @@ var
           DIFF_TAG_DELETE:  LTagStr := 'delete';
           DIFF_TAG_INSERT:  LTagStr := 'insert';
           DIFF_TAG_REPLACE: LTagStr := 'replace';
+          DIFF_TAG_IGNORE:  LTagStr := 'ignore';
           else              LTagStr := 'equal';
         end;
         LTagPtr := PChar(LTagStr);
@@ -11202,6 +11208,7 @@ var
           DIFF_TAG_DELETE:  LTagStr := 'delete';
           DIFF_TAG_INSERT:  LTagStr := 'insert';
           DIFF_TAG_REPLACE: LTagStr := 'replace';
+          DIFF_TAG_IGNORE:  LTagStr := 'ignore';  // DIF_TEXTS only — chars never emits it
           else              LTagStr := 'equal';
         end;
         LTagPtr := PChar(LTagStr);

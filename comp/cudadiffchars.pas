@@ -2023,8 +2023,11 @@ begin
   else
     Whitespace := WHITESPACE_COMPARE_ALL;
 
-  { Note: DIFF_IGN_BLANK_LINES was removed from diff_proc (G37) — blank
-    lines are a line-level concept and had no char-level meaning anyway. }
+  { Note: DIFF_IGN_BLANK_LINES is accepted but has no effect here —
+    blank lines are a line-level concept (all-blank hunks are suppressed
+    by the DIF_TEXTS engines and re-tagged as 'ignore' opcodes); at
+    char level there is no hunk to suppress. DIF_CHARS never emits
+    DIFF_TAG_IGNORE. }
 
   BreakType := 1;    { always break on punctuation — matches Differ plugin expectations }
   ByteLevel := True; { always refine to char level — Differ plugin uses char-level highlights }

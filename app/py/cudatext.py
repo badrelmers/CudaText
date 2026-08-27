@@ -1065,6 +1065,7 @@ DIFF_IGN_CASE        = 1       # case-insensitive comparison
 DIFF_IGN_WHITESPACE  = 2       # all whitespace ignored
 DIFF_IGN_EOL         = 4       # CR/LF vs LF vs CR treated equal
 DIFF_IGN_NUMBERS     = 8       # digit runs treated as equal (for logs)
+DIFF_IGN_BLANK_LINES = 16      # all-blank hunks suppressed, returned as 'ignore' opcodes
 
 HOWREP_CANCEL  = 0
 HOWREP_REPLACE = 1
