@@ -149,14 +149,18 @@
       ignore_eol_diff work correctly with the rolling hash (otherwise \r\n
       vs \n would produce different hashes and never reach line_cmp).
 
-  13. DIFF_IGN_BLANK_LINES (G7): Implemented exactly like WinMerge: after
-      BuildScript, each change is checked via AnalyzeHunk. If trivial (all
-      deleted+inserted lines in the hunk are blank), the change is marked
-      trivial=1. In ChangesToOpcodes, trivial changes are suppressed — an
-      equal region is emitted for the matched portion and the remainder
-      (when Deleted <> Inserted) is still emitted as delete/insert, the way
-      WinMerge renders it: blank lines between similar lines are ignored,
-      blank lines mixed into a hunk with non-blank changes are not.
+  13. DIFF_IGN_BLANK_LINES (G7, G34, G35): Implemented like WinMerge /
+      GNU diff -B: after BuildScript, each change node is checked via
+      AnalyzeHunk — ONE node at a time (G34; one node is one hunk, the
+      triviality of a hunk never depends on later hunks). If trivial (all
+      deleted AND inserted lines in the hunk are blank), the change is
+      marked trivial=1 and ChangesToOpcodes suppresses it ENTIRELY (G35):
+      a single equal opcode covers both sides' regions — possibly with
+      unequal lengths, the same opcode shape the histogram engine emits
+      for suppressed blank hunks. Result: blank lines between similar
+      lines are ignored, blank lines mixed into a hunk with non-blank
+      changes are not ignored (identical semantics to
+      cudadiffhistogram's SuppressBlankLineHunks and to `diff -B`).
 
   14. UTF-8 byte-level (G4): Pascal string under objfpc{$H+} is AnsiString
       containing UTF-8 bytes. This matches diffutils' char* semantics 1:1.
@@ -2392,83 +2396,87 @@ end;
   Section 14: AnalyzeHunk (util.c:798-874)
   ==================================================================
 
-  Look at a hunk of edit script and report the range of lines in each file
-  that it applies to. HUNK is the start of the hunk, which is a chain of
-  `struct change'. The first and last line numbers of file 0 are stored in
-  *FIRST0 and *LAST0, and likewise for file 1 in *FIRST1 and *LAST1.
-  These are internal line numbers that count from 0.
+  Look at ONE hunk of the edit script and report the range of lines in
+  each file that it applies to. The first and last line numbers of file 0
+  are stored in FIRST0 and LAST0, and likewise for file 1 in FIRST1 and
+  LAST1. These are internal line numbers that count from 0.
 
   If no lines from file 0 are deleted, then FIRST0 is LAST0+1.
 
-  Also sets *DELETES nonzero if any lines of file 0 are deleted and sets
-  *INSERTS nonzero if any lines of file 1 are inserted. If only ignorable
+  Also sets DELETES nonzero if any lines of file 0 are deleted and sets
+  INSERTS nonzero if any lines of file 1 are inserted. If only ignorable
   lines are inserted or deleted, both are set to 0.
 
   Sets hunk^.trivial = 1 if the hunk is trivial (all blank-line changes
-  under ignore_blank_lines_flag). }
+  under ignore_blank_lines_flag).
+
+  G34 (hunk granularity): AnalyzeHunk analyzes EXACTLY the passed change
+  node — NOT the whole remaining chain. BuildScript emits one node per
+  maximal changed run, and consecutive nodes always have at least one
+  unchanged line pair between them, so ONE NODE IS ONE HUNK. The former
+  chain-walk (repeating over Next_.Link until nil) computed the trivial
+  flag of hunk K from hunks K..LAST, so an early all-blank hunk was shown
+  as a difference whenever ANY LATER hunk contained non-blank changes —
+  that diverges from GNU diff -B and from WinMerge, which suppress each
+  hunk independently (verified with GNU diffutils 3.x: `diff -B` on
+  "x\ny\nz\nw\n" vs "x\n\ny\nz\nQ\n" reports ONLY the w->Q change,
+  the inserted blank line stays suppressed), and it also diverged from
+  cudadiffhistogram, whose SuppressBlankLineHunks judges each opcode
+  group on its own lines only. }
 procedure AnalyzeHunk(var Ctx: TDiffContext; Hunk: PChange;
                      out First0, Last0, First1, Last1, Deletes, Inserts: Integer);
 var
   L0, L1, ShowFrom, ShowTo: Integer;
   I: Integer;
   Trivial: Integer;
-  Next_: PChange;
 begin
-  ShowFrom := 0;
-  ShowTo := 0;
-
   First0 := Hunk^.Line0;
   First1 := Hunk^.Line1;
 
   Trivial := Ctx.IgnoreBlankLinesFlag;
 
-  Next_ := Hunk;
-  repeat
-    L0 := Next_^.Line0 + Next_^.Deleted - 1;
-    L1 := Next_^.Line1 + Next_^.Inserted - 1;
-    Inc(ShowFrom, Next_^.Deleted);
-    Inc(ShowTo, Next_^.Inserted);
+  L0 := Hunk^.Line0 + Hunk^.Deleted - 1;
+  L1 := Hunk^.Line1 + Hunk^.Inserted - 1;
+  ShowFrom := Hunk^.Deleted;
+  ShowTo := Hunk^.Inserted;
 
-    { Check triviality for file 0 lines (util.c:822-837) }
-    I := Next_^.Line0;
-    while (I <= L0) and (Trivial <> 0) do
+  { Check triviality for file 0 lines (util.c:822-837) }
+  I := Hunk^.Line0;
+  while (I <= L0) and (Trivial <> 0) do
+  begin
+    if Ctx.IgnoreBlankLinesFlag = 0 then
+      Trivial := 0
+    else if (Ctx.IgnoreAllSpaceFlag <> 0) or (Ctx.IgnoreSpaceChangeFlag <> 0) then
     begin
-      if Ctx.IgnoreBlankLinesFlag = 0 then
-        Trivial := 0
-      else if (Ctx.IgnoreAllSpaceFlag <> 0) or (Ctx.IgnoreSpaceChangeFlag <> 0) then
-      begin
-        if not IsBlankLine(Ctx.Files[0].Linbuf[I], Ctx.Files[0].Linbuf[I + 1]) then
-          Trivial := 0;
-      end
-      else
-      begin
-        if (not IsEolCh(Ctx.Files[0].Linbuf[I][0])) and (Ctx.Files[0].Linbuf[I][0] <> 0) then
-          Trivial := 0;
-      end;
-      Inc(I);
-    end;
-
-    { Check triviality for file 1 lines (util.c:838-853) }
-    I := Next_^.Line1;
-    while (I <= L1) and (Trivial <> 0) do
+      if not IsBlankLine(Ctx.Files[0].Linbuf[I], Ctx.Files[0].Linbuf[I + 1]) then
+        Trivial := 0;
+    end
+    else
     begin
-      if Ctx.IgnoreBlankLinesFlag = 0 then
-        Trivial := 0
-      else if (Ctx.IgnoreAllSpaceFlag <> 0) or (Ctx.IgnoreSpaceChangeFlag <> 0) then
-      begin
-        if not IsBlankLine(Ctx.Files[1].Linbuf[I], Ctx.Files[1].Linbuf[I + 1]) then
-          Trivial := 0;
-      end
-      else
-      begin
-        if (not IsEolCh(Ctx.Files[1].Linbuf[I][0])) and (Ctx.Files[1].Linbuf[I][0] <> 0) then
-          Trivial := 0;
-      end;
-      Inc(I);
+      if (not IsEolCh(Ctx.Files[0].Linbuf[I][0])) and (Ctx.Files[0].Linbuf[I][0] <> 0) then
+        Trivial := 0;
     end;
+    Inc(I);
+  end;
 
-    Next_ := Next_^.Link;
-  until Next_ = nil;
+  { Check triviality for file 1 lines (util.c:838-853) }
+  I := Hunk^.Line1;
+  while (I <= L1) and (Trivial <> 0) do
+  begin
+    if Ctx.IgnoreBlankLinesFlag = 0 then
+      Trivial := 0
+    else if (Ctx.IgnoreAllSpaceFlag <> 0) or (Ctx.IgnoreSpaceChangeFlag <> 0) then
+    begin
+      if not IsBlankLine(Ctx.Files[1].Linbuf[I], Ctx.Files[1].Linbuf[I + 1]) then
+        Trivial := 0;
+    end
+    else
+    begin
+      if (not IsEolCh(Ctx.Files[1].Linbuf[I][0])) and (Ctx.Files[1].Linbuf[I][0] <> 0) then
+        Trivial := 0;
+    end;
+    Inc(I);
+  end;
 
   Last0 := L0;
   Last1 := L1;
@@ -2713,9 +2721,11 @@ end;
   an implicit equal region at the end.
 
   Trivial changes (marked by AnalyzeHunk when ignore_blank_lines_flag is on
-  and all deleted+inserted lines are blank) are suppressed — they are NOT
-  emitted as delete/insert/replace. The surrounding equal regions are merged
-  to maintain difflib invariants (G7, G17). }
+  and all deleted+inserted lines of the hunk are blank) are suppressed —
+  they are NOT emitted as delete/insert/replace; a single EQUAL covers both
+  sides' regions (possibly with unequal lengths, like the histogram engine
+  does — G35). The surrounding equal regions are merged to maintain
+  difflib invariants (G7, G17). }
 function ChangesToOpcodes(var Ctx: TDiffContext; Script: PChange; SizeA, SizeB: Integer): TDiffOpcodeArray;
 var
   Result_: TDiffOpcodeArray;
@@ -2803,92 +2813,31 @@ begin
     end
     else
     begin
-      { Trivial change (blank-line only): suppress — treat the deleted and
-        inserted lines as "equal". But difflib invariants require
-        i2-i1 == j2-j1 for equal opcodes. So if Deleted != Inserted, we
-        can't emit a single equal. Emit two pieces:
-        - An equal covering the min(Deleted, Inserted) lines.
-        - A delete or insert for the remainder.
+      { Trivial change: every deleted AND inserted line in this hunk is
+        blank (verified by AnalyzeHunk under IgnoreBlankLinesFlag).
+        Suppress the hunk ENTIRELY — no delete/insert/replace is emitted
+        — so blank-line-only changes between similar lines are not
+        marked as differences.
 
-        Wait — that defeats the purpose of suppression. The intent of
-        "suppress blank-line hunks" (GNU diff -B) is to show NO difference
-        for blank-line-only changes. But difflib format requires line
-        indices to align. If we have 3 deleted blank lines and 2 inserted
-        blank lines, showing "no difference" would mean the 3rd deleted
-        line matches some line in file 1 — but there's no matching line.
+        G35 (full suppression): this matches GNU diff -B (verified:
+        `diff -B` reports NO change for "x\ny\n" vs "x\n\ny\n" and for
+        insert-only/delete-only blank hunks alike) and the histogram
+        engine's SuppressBlankLineHunks (its coalesce pass merges the
+        surrounding EQUALs over the suppressed region). The equal opcode
+        emitted here may be UNEQUAL-LENGTH (Deleted <> Inserted): the
+        renderer draws both ranges as unchanged, exactly like it already
+        does for the histogram engine's suppressed blank hunks. The
+        preceding gap equal (PosA..FileLine0 x PosB..FileLine1) merges
+        with it via EmitEqual, producing the same opcode shape the
+        histogram produces.
 
-        GNU diff -B's behavior: it suppresses the hunk entirely in the
-        formatted output. But difflib requires complete coverage. So we
-        emit:
-        - An equal covering the matching portion (min(Deleted, Inserted)
-          lines from each side, aligned).
-        - A delete or insert for the remainder (the unmatched blank lines).
-
-        This is the best we can do while maintaining difflib invariants.
-        The Differ plugin's renderer will show the equal portion as
-        unchanged and the delete/insert as the actual difference. }
-      if (Walk^.Deleted > 0) and (Walk^.Inserted > 0) then
-      begin
-        { Both sides have blank lines — equalize the matching portion }
-        if Walk^.Deleted = Walk^.Inserted then
-        begin
-          { Perfect match — emit equal covering both regions }
-          if (PosA < FileLine0) or (PosB < FileLine1) then
-            EmitEqual(PosA, FileLine0, PosB, FileLine1);
-          EmitEqual(FileLine0, FileLine0 + Walk^.Deleted,
-                    FileLine1, FileLine1 + Walk^.Inserted);
-        end
-        else if Walk^.Deleted > Walk^.Inserted then
-        begin
-          { More deleted than inserted: equal for the inserted count, then
-            delete the rest }
-          if (PosA < FileLine0) or (PosB < FileLine1) then
-            EmitEqual(PosA, FileLine0, PosB, FileLine1);
-          EmitEqual(FileLine0, FileLine0 + Walk^.Inserted,
-                    FileLine1, FileLine1 + Walk^.Inserted);
-          Emit(cTagDelete, FileLine0 + Walk^.Inserted, FileLine0 + Walk^.Deleted,
-                          FileLine1 + Walk^.Inserted, FileLine1 + Walk^.Inserted);
-        end
-        else
-        begin
-          { More inserted than deleted: equal for the deleted count, then
-            insert the rest }
-          if (PosA < FileLine0) or (PosB < FileLine1) then
-            EmitEqual(PosA, FileLine0, PosB, FileLine1);
-          EmitEqual(FileLine0, FileLine0 + Walk^.Deleted,
-                    FileLine1, FileLine1 + Walk^.Deleted);
-          Emit(cTagInsert, FileLine0 + Walk^.Deleted, FileLine0 + Walk^.Deleted,
-                          FileLine1 + Walk^.Deleted, FileLine1 + Walk^.Inserted);
-        end;
-      end
-      else if Walk^.Deleted > 0 then
-      begin
-        { Only deletes (all blank): emit equal covering the gap.
-          But difflib requires i2-i1 == j2-j1, so we can't emit equal with
-          differing lengths. Emit a delete for the blank lines — they're
-          blank, but they're still deleted. This matches the JGit port's
-          behavior (the JGit port suppressed the hunk, but for non-zero
-          length mismatches it had to emit something). }
-        { Actually, for "only deletes (all blank)", the inserted count is 0,
-          so file 1 has nothing to align with. We can't suppress entirely.
-          Emit a delete — the user can see the blank lines were removed.
-          This matches the GNU diff -B behavior (which would suppress the
-          whole hunk only if BOTH sides are blank-only; here only one side
-          has lines). }
-        if (PosA < FileLine0) or (PosB < FileLine1) then
-          EmitEqual(PosA, FileLine0, PosB, FileLine1);
-        Emit(cTagDelete, FileLine0, FileLine0 + Walk^.Deleted,
-                        FileLine1, FileLine1);
-      end
-      else
-      begin
-        { Only inserts (all blank): similar — emit an insert. }
-        if (PosA < FileLine0) or (PosB < FileLine1) then
-          EmitEqual(PosA, FileLine0, PosB, FileLine1);
-        Emit(cTagInsert, FileLine0, FileLine0,
-                        FileLine1, FileLine1 + Walk^.Inserted);
-      end;
-
+        Blank lines inside a MIXED hunk (hunk also contains non-blank
+        changes) keep Trivial = 0 and stay visible — that is the WinMerge
+        behavior: blank lines between different lines are not ignored. }
+      if (PosA < FileLine0) or (PosB < FileLine1) then
+        EmitEqual(PosA, FileLine0, PosB, FileLine1);
+      EmitEqual(FileLine0, FileLine0 + Walk^.Deleted,
+                FileLine1, FileLine1 + Walk^.Inserted);
       PosA := FileLine0 + Walk^.Deleted;
       PosB := FileLine1 + Walk^.Inserted;
     end;
