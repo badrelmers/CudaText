@@ -78,11 +78,7 @@
   4. DIFF_IGN_EOL (G9): JGit has no equivalent. We trim trailing \r\n / \n / \r
      from the line before hashing/comparing.
 
-  5. DIFF_IGN_BLANK_LINES (G7): Implemented as a post-diff hunk-suppression
-     pass over the EditList, matching GNU `diff -B` semantics (NOT a
-     comparator tweak). See SuppressBlankLineHunks.
-
-  6. Structural divergence (G31): JGit's RawTextComparator exposes WS_IGNORE_*
+  5. Structural divergence (G31): JGit's RawTextComparator exposes WS_IGNORE_*
      as mutually-exclusive singletons (DEFAULT, WS_IGNORE_ALL, WS_IGNORE_LEADING,
      WS_IGNORE_TRAILING, WS_IGNORE_CHANGE). The Pascal port originally kept all
      five as subclasses, but after DIFF_IGN_WHITESPACE_CHANGE / _EOL / _BEGINNING
@@ -93,30 +89,38 @@
      this layering — it's documented as a divergence but produces the same
      result a Java-side ad-hoc comparator would produce.
 
-  7. Compiler mode (G10, G12): CudaText is compiled with -Cr -Co (range +
+  6. Compiler mode (G10, G12): CudaText is compiled with -Cr -Co (range +
      overflow checks). DJB2 and Knuth multiplicative hash intentionally wrap
      on overflow, so we wrap the affected code in $PUSH/$R-/$Q-...$POP.
 
-  8. JGit's RawTextComparator.reduceCommonStartEnd has a likely typo:
+  7. JGit's RawTextComparator.reduceCommonStartEnd has a likely typo:
      `int bPtr = a.lines.get(e.beginB + 1)` — reads from `a.lines` instead
      of `b.lines`. We port it correctly (use b.lines for bPtr). This only
      matters when a and b have different line layouts, which is rare but
      possible; the bug is harmless in 99% of real-world cases because
      aPtr/bPtr happen to coincide when sequences are similar.
 
-  9. Pascal strings under objfpc mode with $H+ are AnsiString (UTF-8 bytes
+  8. Pascal strings under objfpc mode with $H+ are AnsiString (UTF-8 bytes
      by CudaText convention). This matches JGit's byte[] semantics 1:1.
      We use RawByteString for content storage and access bytes via PByte —
      no UnicodeString/WideString/UnicodeLowerCase anywhere in this unit.
 
- 10. Whitespace = space + tab only (G30): IsWhitespaceByte returns true
+  9. Whitespace = space + tab only (G30): IsWhitespaceByte returns true
      for 0x20/0x09 only. JGit's RawCharUtil.isWhitespace() also counts
      \r and \n. Done for consistency with the other two engines
      (cudadiffmyers.IsWSpace / cudadiffchars.isSafeWhitespace) and with
      the wiki spec: line endings are the domain of DIFF_IGN_EOL only.
      With JGit's set, "a\r\n" compared EQUAL to "a\n" under
      DIFF_IGN_WHITESPACE alone in this engine but DIFFERENT in Myers —
-     an inconsistency; IsLineBlank keeps handling \r/\n explicitly.
+     an inconsistency.
+
+ 10. DIFF_IGN_BLANK_LINES was removed from diff_proc (G37): the
+     IsLineBlank / SuppressBlankLineHunks post-diff pass was deleted with
+     it. WinMerge renders suppressed blank-line hunks with a dedicated
+     "ignored difference" gap type and color so the panes stay aligned;
+     CudaText's diff UI has a single gap type, so a correct
+     DIFF_IGN_BLANK_LINES is not renderable there — the flag is gone
+     rather than shipped half-working.
 *)
 
 unit CudaDiffHistogram;
@@ -142,9 +146,8 @@ const
   { Ignore flags — must match proc_py_const.pas DIFF_IGN_* }
   cIgnCase        = 1;      // DIFF_IGN_CASE
   cIgnWhitespace  = 2;      // DIFF_IGN_WHITESPACE
-  cIgnBlankLines  = 4;      // DIFF_IGN_BLANK_LINES
-  cIgnEOL         = 8;      // DIFF_IGN_EOL
-  cIgnNumbers     = 16;     // DIFF_IGN_NUMBERS
+  cIgnEOL         = 4;      // DIFF_IGN_EOL
+  cIgnNumbers     = 8;      // DIFF_IGN_NUMBERS
 
   { Opcode tag values — must match proc_py_const.pas DIFF_TAG_* }
   cTagEqual   = 0;
@@ -606,8 +609,7 @@ end;
   the histogram engine but DIFFERENT in the Myers engine — an
   cross-engine inconsistency (the terminators also leaked into the row
   hash, making the EOL flag a no-op for the WS comparator). Line
-  terminators never count as whitespace; blank-line detection
-  (IsLineBlank) keeps handling \r/\n explicitly. }
+  terminators never count as whitespace. }
 function IsWhitespaceByte(c: Byte): Boolean; inline;
 begin
   Result := (c = $09) or (c = $20);
@@ -2980,7 +2982,7 @@ function CreateComparator(AFlags: Integer): TRawTextComparator;
 var
   nonWSFlags: Integer;
 begin
-  // CASE, NUMBERS, EOL, BLANK_LINES are orthogonal — pass them to the
+  // CASE, NUMBERS, EOL are orthogonal — pass them to the
   // comparator's FFlags so per-byte transforms apply uniformly.
   nonWSFlags := AFlags and (cIgnCase or cIgnNumbers or cIgnEOL);
 
@@ -3095,201 +3097,6 @@ begin
 end;
 
 { ------------------------------------------------------------------
-  DIFF_IGN_BLANK_LINES — post-diff hunk suppression pass (G7).
-  ------------------------------------------------------------------
-
-  Ported conceptually from GNU diff -B (diffutils/src/util.c:767-783,
-  util.c:798-874, analyze.c:989-1019).
-
-  A hunk (REPLACE block, or adjacent INSERT+DELETE forming a logical change)
-  is suppressed if EVERY deleted line AND every inserted line in that hunk
-  is blank. 'Blank' definition depends on other ignore flags:
-    - If DIFF_IGN_WHITESPACE is also on → "blank" = whitespace-only
-    - Otherwise → "blank" = truly empty (length 0 or first byte is \r/\n)
-
-  INSERT-only or DELETE-only hunks (pure additions/removals of blank lines)
-  are also suppressed. The result: blank-line-only changes don't appear in
-  the diff output, but non-blank changes are unaffected. }
-function IsLineBlank(rt: TRawText; lineIdx: Integer; AFlags: Integer): Boolean;
-var
-  p, end_: Integer;
-  raw: PByte;
-begin
-  if lineIdx >= rt.Size then
-    Exit(True);
-  p := rt.GetStart(lineIdx);
-  end_ := rt.GetEnd(lineIdx);
-  raw := rt.ContentPtr;
-
-  // Empty line (zero-length or starts with EOL byte).
-  if (p >= end_) or (raw[p] = $0A) or (raw[p] = $0D) then
-    Exit(True);
-
-  // If DIFF_IGN_WHITESPACE is set, "blank" = whitespace-only.
-  if (AFlags and cIgnWhitespace) = 0 then
-    Exit(False);  // truly-empty check already passed above
-
-  // Whitespace-only check.
-  while p < end_ do
-  begin
-    if (raw[p] <> $20) and (raw[p] <> $09) and (raw[p] <> $0D) and (raw[p] <> $0A) then
-      Exit(False);
-    Inc(p);
-  end;
-  Result := True;
-end;
-
-{ Suppress blank-line-only hunks from the opcode list.
-  Walks the list; groups adjacent INSERT and DELETE opcodes (a "change hunk");
-  if every line in the hunk is blank, removes all opcodes in the hunk. }
-function SuppressBlankLineHunks(const ops: TDiffOpcodeArray;
-  rtA, rtB: TRawText; AFlags: Integer): TDiffOpcodeArray;
-var
-  i, j, outCount: Integer;
-  groupStart: Integer;
-  allBlank: Boolean;
-  cur: TDiffOpcode;
-  out: TDiffOpcodeArray;
-  aStart, aEnd, bStart, bEnd: Integer;
-  k: Integer;
-begin
-  if Length(ops) = 0 then
-  begin
-    Result := nil;
-    SetLength(Result, 0);
-    Exit;
-  end;
-
-  SetLength(out, Length(ops));
-  outCount := 0;
-  i := 0;
-  while i < Length(ops) do
-  begin
-    cur := ops[i];
-
-    // INSERT, DELETE or REPLACE can start a blank-line hunk.
-    // G35: REPLACE is included — a hunk that REPLACES blank lines with
-    // blank lines (e.g. an LF-terminated empty line changed to a
-    // CRLF-terminated one, compared without DIFF_IGN_EOL) is an
-    // all-blank hunk too and must be suppressed, exactly like the
-    // myers engine's AnalyzeHunk does (it checks deleted AND inserted
-    // lines of any hunk shape). Without this the two line-level engines
-    // disagreed on "\n" vs "\r\n" under DIFF_IGN_BLANK_LINES alone.
-    if (cur.Tag = cTagInsert) or (cur.Tag = cTagDelete) or
-       (cur.Tag = cTagReplace) then
-    begin
-      // Collect adjacent INSERT/DELETE/REPLACE opcodes into a hunk.
-      groupStart := i;
-      aStart := cur.I1;
-      aEnd := cur.I2;
-      bStart := cur.J1;
-      bEnd := cur.J2;
-      j := i;
-      while (j < Length(ops)) and
-            ((ops[j].Tag = cTagInsert) or (ops[j].Tag = cTagDelete) or (ops[j].Tag = cTagReplace)) do
-      begin
-        aEnd := ops[j].I2;
-        bEnd := ops[j].J2;
-        Inc(j);
-      end;
-
-      // Check if all A-lines and B-lines in [aStart..aEnd) and [bStart..bEnd) are blank.
-      allBlank := True;
-      for k := aStart to aEnd - 1 do
-        if not IsLineBlank(rtA, k, AFlags) then
-        begin
-          allBlank := False;
-          Break;
-        end;
-      if allBlank then
-        for k := bStart to bEnd - 1 do
-          if not IsLineBlank(rtB, k, AFlags) then
-          begin
-            allBlank := False;
-            Break;
-          end;
-
-      if allBlank then
-      begin
-        // Suppress this hunk — skip without emitting.
-        i := j;
-        Continue;
-      end;
-
-      // Hunk has non-blank lines — emit unchanged.
-      // To keep difflib invariants valid (first opcode must start at (0,0)),
-      // we need to merge any gap left by suppression into the next EQUAL.
-      // For simplicity, emit each opcode in the group as-is.
-      for k := groupStart to j - 1 do
-      begin
-        out[outCount] := ops[k];
-        Inc(outCount);
-      end;
-      i := j;
-      Continue;
-    end;
-
-    // EQUAL — emit as-is.
-    out[outCount] := cur;
-    Inc(outCount);
-    Inc(i);
-  end;
-
-  // Now we need to fix up the boundaries: if the first opcode is now INSERT/DELETE
-  // (because the leading EQUAL was suppressed along with blank lines), we need to
-  // synthesize an empty EQUAL at (0,0). Similarly, adjacent EQUAL opcodes may have
-  // been left after suppression — they should be merged.
-  // Simplest correct approach: rebuild the list with proper boundary fixup.
-
-  SetLength(Result, outCount);
-  if outCount > 0 then
-    Move(out[0], Result[0], outCount * SizeOf(TDiffOpcode));
-
-  // Fix up: merge adjacent EQUAL opcodes and ensure first opcode starts at (0,0).
-  // Walk the list, coalescing.
-  if Length(Result) = 0 then
-    Exit;
-
-  // Coalesce adjacent EQUAL opcodes.
-  outCount := 0;
-  for i := 0 to High(Result) do
-  begin
-    if (outCount > 0) and (Result[outCount - 1].Tag = cTagEqual) and (Result[i].Tag = cTagEqual) then
-    begin
-      // Extend the previous EQUAL.
-      Result[outCount - 1].I2 := Result[i].I2;
-      Result[outCount - 1].J2 := Result[i].J2;
-    end
-    else
-    begin
-      Result[outCount] := Result[i];
-      Inc(outCount);
-    end;
-  end;
-  SetLength(Result, outCount);
-
-  // Ensure first opcode starts at (0, 0). If the first opcode's I1 or J1
-  // is > 0 (because a leading blank-line hunk was suppressed), synthesize
-  // an empty EQUAL at (0, 0) — difflib requires opcodes to start at (0, 0).
-  if (Length(Result) > 0) and ((Result[0].I1 > 0) or (Result[0].J1 > 0)) then
-  begin
-    SetLength(out, Length(Result) + 1);
-    out[0].Tag := cTagEqual;
-    out[0].I1 := 0;
-    out[0].I2 := Result[0].I1;
-    out[0].J1 := 0;
-    out[0].J2 := Result[0].J1;
-    Move(Result[0], out[1], Length(Result) * SizeOf(TDiffOpcode));
-    Result := out;
-  end;
-
-  // Also ensure boundaries match between adjacent opcodes (defensive).
-  // The suppression may have left gaps; fill them with EQUALs.
-  // Actually, this case shouldn't happen because we only suppress whole
-  // INSERT/DELETE/REPLACE groups, not partial ones. But let's be safe.
-end;
-
-{ ------------------------------------------------------------------
   Public entry point
   ------------------------------------------------------------------ }
 function DoDiffTexts(const ATextA, ATextB: string;
@@ -3334,10 +3141,6 @@ begin
     finally
       cmp.Free;
     end;
-
-    // G7: post-diff blank-line suppression.
-    if (AFlags and cIgnBlankLines) <> 0 then
-      ops := SuppressBlankLineHunks(ops, rtA, rtB, AFlags);
 
     Result := ops;
   finally

@@ -1063,9 +1063,8 @@ DIFF_ALGO_HISTOGRAM    = 1
 DIFF_IGN_NONE        = 0
 DIFF_IGN_CASE        = 1       # case-insensitive comparison
 DIFF_IGN_WHITESPACE  = 2       # all whitespace ignored
-DIFF_IGN_BLANK_LINES = 4       # blank lines ignored for matching
-DIFF_IGN_EOL         = 8       # CR/LF vs LF vs CR treated equal
-DIFF_IGN_NUMBERS     = 16      # digit runs treated as equal (for logs)
+DIFF_IGN_EOL         = 4       # CR/LF vs LF vs CR treated equal
+DIFF_IGN_NUMBERS     = 8       # digit runs treated as equal (for logs)
 
 HOWREP_CANCEL  = 0
 HOWREP_REPLACE = 1
