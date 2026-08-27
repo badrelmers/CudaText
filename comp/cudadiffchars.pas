@@ -138,25 +138,21 @@
       completeness but the code path is exercised only when an internal
       caller sets EOL_AS_SPACE — which never happens via DoDiffChars.
 
-  14. DIFF_IGN_BLANK_LINES (G7): Silently ignored at char-level. Blank
-      lines are a line-level concept. DoDiffChars accepts the bit but
-      doesn't use it.
-
-  15. Whitespace flags (G5): Only DIFF_IGN_WHITESPACE exists; it maps to
+  14. Whitespace flags (G5): Only DIFF_IGN_WHITESPACE exists; it maps to
       WHITESPACE_IGNORE_ALL at char-level (whitespace tokens are dropped).
       The former flags DIFF_IGN_WHITESPACE_CHANGE / _EOL / _BEGINNING were
       removed from diff_proc — their old mapping to
       WHITESPACE_IGNORE_CHANGE is gone with them.
 
-  16. BREAK_CHARS (G6): Fixed to the WinMerge default ",.;:" — the
+  15. BREAK_CHARS (G6): Fixed to the WinMerge default ",.;:" — the
       SetBreakChars API is not exposed via diff_proc.
 
-  17. Fix WinMerge Hash bug: WinMerge's Hash() does `h += HASH(h, ch)`
+  16. Fix WinMerge Hash bug: WinMerge's Hash() does `h += HASH(h, ch)`
       which is `h := h + (ch + ROL(h, 7))`. The first iteration with h=0
       gives `h := 0 + (ch + ROL(0, 7)) = ch`. Subsequent iterations
       accumulate. We replicate this exactly (see comment in Hash() impl).
 
-  18. Equal opcodes of unequal length (G18): WdiffsToOpcodes emits
+  17. Equal opcodes of unequal length (G18): WdiffsToOpcodes emits
       'equal' for regions the ignore options made equal even when the
       two sides have different lengths (digit runs of different length,
       whitespace runs, EOL bytes). WinMerge has no opcode format, so
@@ -165,23 +161,23 @@
       ("aaa 666666 tttttdd" vs "aaa 33333 ttttt" colored everything
       instead of just "dd").
 
-  19. DIFF_IGN_NUMBERS in the byte refinement (G19): ComputeByteDiff
+  18. DIFF_IGN_NUMBERS in the byte refinement (G19): ComputeByteDiff
       strips digit code points (with an index map back to original
       positions) before the two-pointer scans, so digits never anchor
       the refinement and never get highlighted. WinMerge has no
       ignore-numbers option.
 
-  20. EOL words under EOL_IGNORE in the edit-script walk (G20): deleted
+  19. EOL words under EOL_IGNORE in the edit-script walk (G20): deleted
       or inserted EOL-only words are skipped so a trailing-EOL-only
       difference inside a changed line is not painted. WinMerge has no
       ignore-EOL option.
 
-  21. Whitespace = space + tab only (G30): isSafeWhitespace returns true
+  20. Whitespace = space + tab only (G30): isSafeWhitespace returns true
       for 0x20/0x09 only. WinMerge uses iswspace() (locale/Unicode
       aware, includes VT/FF). Done for consistency with the two
       line-level engines.
 
-  22. Gap-merging wdiff emitter (G34): consecutive wdiffs separated only
+  21. Gap-merging wdiff emitter (G34): consecutive wdiffs separated only
       by ignored words (numbers under DIFF_IGN_NUMBERS, whitespace under
       DIFF_IGN_WHITESPACE, EOL words under EOL_IGNORE) are merged into a
       single region before the byte-level refinement, which then
@@ -218,9 +214,8 @@ const
     (does NOT `uses CudaDiff` or proc_py_const). }
   DIFF_IGN_CASE_Private        = 1;
   DIFF_IGN_WHITESPACE_Private  = 2;
-  DIFF_IGN_BLANK_LINES_Private = 4;
-  DIFF_IGN_EOL_Private         = 8;
-  DIFF_IGN_NUMBERS_Private     = 16;
+  DIFF_IGN_EOL_Private         = 4;
+  DIFF_IGN_NUMBERS_Private     = 8;
 
   { Word-class constants — ported from stringdiffsi.h:22-29.
     Note: WinMerge Pascal-cases these as enum values; we use lowercase
@@ -2028,7 +2023,8 @@ begin
   else
     Whitespace := WHITESPACE_COMPARE_ALL;
 
-  { DIFF_IGN_BLANK_LINES is silently ignored at char-level (G7). }
+  { Note: DIFF_IGN_BLANK_LINES was removed from diff_proc (G37) — blank
+    lines are a line-level concept and had no char-level meaning anyway. }
 
   BreakType := 1;    { always break on punctuation — matches Differ plugin expectations }
   ByteLevel := True; { always refine to char level — Differ plugin uses char-level highlights }
