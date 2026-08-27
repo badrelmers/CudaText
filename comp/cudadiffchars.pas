@@ -510,15 +510,15 @@ begin
   Result := False;
 end;
 
-(* Ported from stringdiffs.cpp:783-787 — isSafeWhitespace.
+{ Ported from stringdiffs.cpp:783-787 — isSafeWhitespace.
   Whitespace except CR/LF and lead bytes.
   DIVERGENCE: WinMerge uses iswspace (Unicode-aware). We use ASCII-only.
   DIVERGENCE (G30): whitespace = space (0x20) and tab (0x09) ONLY —
   tc_istspace()'s VT (\v) and FF (\f) are excluded on purpose so the
   char-level engine uses the SAME whitespace definition as the two
   line-level engines (cudadiffhistogram.IsWhitespaceByte /
-  cudadiffmyers.IsWSpace = {0x20, 0x09}). VT/FF are C0 control pictures
-  inside a line for CudaText, not ignorable whitespace. *)
+  cudadiffmyers.IsWSpace = 0x20/0x09). VT/FF are C0 control pictures
+  inside a line for CudaText, not ignorable whitespace. }
 function isSafeWhitespace(ch: TCodePoint): Boolean; inline;
 begin
   Result := (ch = $20) or (ch = $09);
