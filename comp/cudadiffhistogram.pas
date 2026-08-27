@@ -108,6 +108,15 @@
      by CudaText convention). This matches JGit's byte[] semantics 1:1.
      We use RawByteString for content storage and access bytes via PByte —
      no UnicodeString/WideString/UnicodeLowerCase anywhere in this unit.
+
+ 10. Whitespace = space + tab only (G30): IsWhitespaceByte returns true
+     for 0x20/0x09 only. JGit's RawCharUtil.isWhitespace() also counts
+     \r and \n. Done for consistency with the other two engines
+     (cudadiffmyers.IsWSpace / cudadiffchars.isSafeWhitespace) and with
+     the wiki spec: line endings are the domain of DIFF_IGN_EOL only.
+     With JGit's set, "a\r\n" compared EQUAL to "a\n" under
+     DIFF_IGN_WHITESPACE alone in this engine but DIFFERENT in Myers —
+     an inconsistency; IsLineBlank keeps handling \r/\n explicitly.
 *)
 
 unit CudaDiffHistogram;
@@ -585,17 +594,28 @@ begin
   Result := False;
 end;
 
-{ Returns True if c is one of the whitespace bytes JGit's RawCharUtil
-  recognizes: \r, \n, \t, space. Ported from RawCharUtil.isWhitespace()
-  (util/RawCharUtil.java:35-37). }
+{ Returns True if c is a whitespace byte for the DIFF_IGN_WHITESPACE
+  comparator: space (0x20) and tab (0x09) ONLY.
+
+  DIVERGENCE from JGit: RawCharUtil.isWhitespace() (util/RawCharUtil.java:
+  35-37) also counts \r and \n. We exclude them on purpose: in diff_proc,
+  "whitespace" means space+tab in ALL THREE engines (cudadiffchars /
+  cudadiffhistogram / cudadiffmyers — IsWSpace there is "0x20, 0x09" too),
+  and line terminators are the domain of DIFF_IGN_EOL. With \r/\n included
+  here, "a\r\n" vs "a\n" compared EQUAL under DIFF_IGN_WHITESPACE alone in
+  the histogram engine but DIFFERENT in the Myers engine — an
+  cross-engine inconsistency (the terminators also leaked into the row
+  hash, making the EOL flag a no-op for the WS comparator). Line
+  terminators never count as whitespace; blank-line detection
+  (IsLineBlank) keeps handling \r/\n explicitly. }
 function IsWhitespaceByte(c: Byte): Boolean; inline;
 begin
-  Result := (c = $0D) or (c = $0A) or (c = $09) or (c = $20);
+  Result := (c = $09) or (c = $20);
 end;
 
-{ Trims trailing whitespace bytes from [ptr, end_).
-  Ported from RawCharUtil.trimTrailingWhitespace() (util/RawCharUtil.java:52-58).
-  Returns the new end position. }
+{ Trims trailing whitespace bytes (space / tab — see IsWhitespaceByte)
+  from [ptr, end_). Ported from RawCharUtil.trimTrailingWhitespace()
+  (util/RawCharUtil.java:52-58). Returns the new end position. }
 function TrimTrailingWhitespace(raw: PByte; start, end_: Integer): Integer; inline;
 var
   p: Integer;
