@@ -155,6 +155,43 @@
       which is `h := h + (ch + ROL(h, 7))`. The first iteration with h=0
       gives `h := 0 + (ch + ROL(0, 7)) = ch`. Subsequent iterations
       accumulate. We replicate this exactly (see comment in Hash() impl).
+
+  18. Equal opcodes of unequal length (G18): WdiffsToOpcodes emits
+      'equal' for regions the ignore options made equal even when the
+      two sides have different lengths (digit runs of different length,
+      whitespace runs, EOL bytes). WinMerge has no opcode format, so
+      this has no upstream counterpart; the old behavior of degrading
+      such gaps to REPLACE painted whole matched regions as changed
+      ("aaa 666666 tttttdd" vs "aaa 33333 ttttt" colored everything
+      instead of just "dd").
+
+  19. DIFF_IGN_NUMBERS in the byte refinement (G19): ComputeByteDiff
+      strips digit code points (with an index map back to original
+      positions) before the two-pointer scans, so digits never anchor
+      the refinement and never get highlighted. WinMerge has no
+      ignore-numbers option.
+
+  20. EOL words under EOL_IGNORE in the edit-script walk (G20): deleted
+      or inserted EOL-only words are skipped so a trailing-EOL-only
+      difference inside a changed line is not painted. WinMerge has no
+      ignore-EOL option.
+
+  21. Whitespace = space + tab only (G30): isSafeWhitespace returns true
+      for 0x20/0x09 only. WinMerge uses iswspace() (locale/Unicode
+      aware, includes VT/FF). Done for consistency with the two
+      line-level engines.
+
+  22. Gap-merging wdiff emitter (G34): consecutive wdiffs separated only
+      by ignored words (numbers under DIFF_IGN_NUMBERS, whitespace under
+      DIFF_IGN_WHITESPACE, EOL words under EOL_IGNORE) are merged into a
+      single region before the byte-level refinement, which then
+      re-aligns the whole region. Without this, the word tokenizer's
+      boundaries leaked into the output: "v14b" vs "vb" painted 'v'
+      deleted+inserted, and "abc def" vs "abcdef" painted 'abc'. Wdiffs
+      separated by MATCHED ('=') words are never merged - matched words
+      are real anchors. WinMerge has no ignore-numbers option and its
+      whitespace handling does not skip tokens this way, so there is no
+      upstream counterpart.
 *)
 
 unit CudaDiffChars;
@@ -290,6 +327,9 @@ type
     FCaseSensitive: Boolean;
     FEolMode: TEolCompareMode;
     FIgnoreNumbers: Boolean;
+    { True when a '=' (matched word) step was seen since the last wdiff
+      emission - see EmitWdiff (G34). }
+    FSawMatchSinceDiff: Boolean;
     FMatchBlock: Boolean;
     FPDiffs: ^TwdiffArray;     // pointer to caller's array (we Append to it)
     FWords1: TWordArray;
@@ -341,6 +381,9 @@ type
       Refines a word-level diff down to character level using a two-pointer
       scan (forward + reverse). }
     procedure ComputeByteDiff(const str1, str2: TCodePointArray;
+      casitive: Boolean; xwhite: Integer; ignore_numbers: Boolean;
+      var begin0, begin1, end0, end1: Integer; equal: Boolean);
+    procedure ComputeByteDiffCore(const str1, str2: TCodePointArray;
       casitive: Boolean; xwhite: Integer;
       var begin0, begin1, end0, end1: Integer; equal: Boolean);
 
@@ -358,6 +401,7 @@ type
     { Ported from stringdiffs.cpp:390-415 — BuildWordDiffList.
       Top-level entry: build word arrays, run ONP, fall back to single
       wdiff on size guard or timeout. }
+    procedure EmitWdiff(s1, e1, s2, e2: Integer);
     procedure BuildWordDiffList;
 
     { Ported from stringdiffs.cpp:1083-1113 — wordLevelToByteLevel wrapper. }
@@ -466,13 +510,18 @@ begin
   Result := False;
 end;
 
-{ Ported from stringdiffs.cpp:783-787 — isSafeWhitespace.
+(* Ported from stringdiffs.cpp:783-787 — isSafeWhitespace.
   Whitespace except CR/LF and lead bytes.
-  DIVERGENCE: WinMerge uses iswspace (Unicode-aware). We use ASCII-only
-  tc_istspace. See G29/G30. }
+  DIVERGENCE: WinMerge uses iswspace (Unicode-aware). We use ASCII-only.
+  DIVERGENCE (G30): whitespace = space (0x20) and tab (0x09) ONLY —
+  tc_istspace()'s VT (\v) and FF (\f) are excluded on purpose so the
+  char-level engine uses the SAME whitespace definition as the two
+  line-level engines (cudadiffhistogram.IsWhitespaceByte /
+  cudadiffmyers.IsWSpace = {0x20, 0x09}). VT/FF are C0 control pictures
+  inside a line for CudaText, not ignorable whitespace. *)
 function isSafeWhitespace(ch: TCodePoint): Boolean; inline;
 begin
-  Result := tc_istspace(ch) and (not IsLeadByte(ch)) and (ch <> $0D) and (ch <> $0A);
+  Result := (ch = $20) or (ch = $09);
 end;
 
 { Ported from stringdiffs.cpp:792-826 — isWordBreak.
@@ -1078,6 +1127,42 @@ begin
   Result := D;
 end;
 
+{ EmitWdiff — wdiff emitter with gap-merging (G34).
+
+  When two consecutive wdiffs are separated ONLY by skipped words (number
+  words under DIFF_IGN_NUMBERS, whitespace words under
+  DIFF_IGN_WHITESPACE, EOL words under EOL_IGNORE — words the ignore
+  options made invisible), the separation is an ARTIFACT of word
+  tokenization, not a real anchor: e.g. "v14b" vs "vb" tokenizes to
+  [v][14][b] vs [vb], the word DP emits del(v), del(b), ins(vb) and the
+  refinement of del(v) paints 'v' even though the digit-stripped sides
+  are equal. Merging such wdiffs into one region and letting the
+  byte-level refinement re-align it produces the correct result (nothing
+  painted). Real anchors - words matched with '=' - are never merged
+  over (that would repaint matched words). The merge is
+  begin=min/begin, end=max/end per side, which also handles the
+  empty-side encoding (P, P-1) naturally. }
+procedure TStringDiff.EmitWdiff(s1, e1, s2, e2: Integer);
+var
+  n: Integer;
+  last: ^Twdiff;
+begin
+  if (not FSawMatchSinceDiff) and (Length(FWdiffs) > 0) then
+  begin
+    n := High(FWdiffs);
+    { Merge into the last emitted wdiff. }
+    if s1 < FWdiffs[n].begin_[0] then FWdiffs[n].begin_[0] := s1;
+    if e1 > FWdiffs[n].end_[0] then FWdiffs[n].end_[0] := e1;
+    if s2 < FWdiffs[n].begin_[1] then FWdiffs[n].begin_[1] := s2;
+    if e2 > FWdiffs[n].end_[1] then FWdiffs[n].end_[1] := e2;
+    last := nil; { silence hint }
+    Exit;
+  end;
+  SetLength(FWdiffs, Length(FWdiffs) + 1);
+  FWdiffs[High(FWdiffs)] := Twdiff.Create(s1, e1, s2, e2);
+  FSawMatchSinceDiff := False;
+end;
+
 { Ported from stringdiffs.cpp:292-385 — BuildWordDiffList_DP.
   Runs ONP and walks the edit script (stored in FEdscript) to build the wdiff list. }
 function TStringDiff.BuildWordDiffList_DP: Boolean;
@@ -1087,6 +1172,8 @@ var
   s1, e1, s2, e2: Integer;
 begin
   SetLength(FEdscript, 0);
+  SetLength(FWdiffs, 0);
+  FSawMatchSinceDiff := True;  { nothing to merge before the first wdiff }
   D := onp;
   if D < 0 then
     Exit(False);
@@ -1110,13 +1197,20 @@ begin
         Inc(i);
         Continue;
       end;
+      { G20: under eolIgnore a deleted EOL word is not a visible
+        difference — the line-level comparator trims trailing EOLs, so
+        the char-level detail must not paint them either. }
+      if (FEolMode = eolIgnore) and IsEOL(FWords1[i]) then
+      begin
+        Inc(i);
+        Continue;
+      end;
 
       s1 := FWords1[i].start;
       e1 := FWords1[i].end_;
       s2 := FWords2[j-1].end_ + 1;
       e2 := s2 - 1;
-      SetLength(FWdiffs, Length(FWdiffs) + 1);
-      FWdiffs[High(FWdiffs)] := Twdiff.Create(s1, e1, s2, e2);
+      EmitWdiff(s1, e1, s2, e2);
       Inc(i);
     end
     else if FEdscript[k] = '+' then
@@ -1134,13 +1228,18 @@ begin
         Inc(j);
         Continue;
       end;
+      { G20: see the '-' branch above. }
+      if (FEolMode = eolIgnore) and IsEOL(FWords2[j]) then
+      begin
+        Inc(j);
+        Continue;
+      end;
 
       s1 := FWords1[i-1].end_ + 1;
       e1 := s1 - 1;
       s2 := FWords2[j].start;
       e2 := FWords2[j].end_;
-      SetLength(FWdiffs, Length(FWdiffs) + 1);
-      FWdiffs[High(FWdiffs)] := Twdiff.Create(s1, e1, s2, e2);
+      EmitWdiff(s1, e1, s2, e2);
       Inc(j);
     end
     else if FEdscript[k] = '!' then
@@ -1158,17 +1257,24 @@ begin
         Inc(i); Inc(j);
         Continue;
       end;
+      { G20: see the '-' branch above. }
+      if (FEolMode = eolIgnore) and IsEOL(FWords1[i]) and IsEOL(FWords2[j]) then
+      begin
+        Inc(i); Inc(j);
+        Continue;
+      end;
 
       s1 := FWords1[i].start;
       e1 := FWords1[i].end_;
       s2 := FWords2[j].start;
       e2 := FWords2[j].end_;
-      SetLength(FWdiffs, Length(FWdiffs) + 1);
-      FWdiffs[High(FWdiffs)] := Twdiff.Create(s1, e1, s2, e2);
+      EmitWdiff(s1, e1, s2, e2);
       Inc(i); Inc(j);
     end
     else  // '='
     begin
+      { A matched word is a real anchor - never merge across it (G34). }
+      FSawMatchSinceDiff := True;
       Inc(i); Inc(j);
     end;
   end;
@@ -1277,7 +1383,104 @@ begin
   end;
 end;
 
-{ Ported from stringdiffs.cpp:853-1074 — ComputeByteDiff.
+{ ComputeByteDiff — public entry with DIFF_IGN_NUMBERS support (G19).
+
+  Digits are ignored ANYWHERE in the line (that is what DIFF_IGN_NUMBERS
+  means at line level: "v33" equals "v"), so the byte-level refinement
+  must not let digits anchor the forward/reverse scans either. Rather
+  than scattering digit skips through ComputeByteDiffCore's four cursor
+  loops (error-prone: every skip invalidates the loop guards), we strip
+  digit code points from both substrings, run the ORIGINAL algorithm on
+  the digit-free arrays, and map the resulting begin/end indices back to
+  original positions through per-side index maps. Effects:
+    - digit runs never get colorized ("a12b" vs "a99c" colors only
+      'b'/'c', "aaa 666666 tttttdd" vs "aaa 33333 ttttt" colors only
+      'dd');
+    - a region that differs ONLY in digits refines to "no visible diff"
+      (both stripped sides equal -> begin = -1) — consistent with the
+      line-level comparator, which already considers such lines equal.
+  Mapping rules (stripped index -> original index):
+    - begin = Length(stripped)  -> Length(original)   (empty-side tail)
+    - end   >= 0                -> map[end]            (always < Length)
+    - begin = -1                -> all four outputs stay -1 (no diff). }
+procedure TStringDiff.ComputeByteDiff(const str1, str2: TCodePointArray;
+  casitive: Boolean; xwhite: Integer; ignore_numbers: Boolean;
+  var begin0, begin1, end0, end1: Integer; equal: Boolean);
+var
+  s1, s2: TCodePointArray;
+  m1, m2: array of Integer;
+  n, i, j: Integer;
+begin
+  if not ignore_numbers then
+  begin
+    ComputeByteDiffCore(str1, str2, casitive, xwhite,
+      begin0, begin1, end0, end1, equal);
+    Exit;
+  end;
+
+  { Strip digit code points, keeping stripped->original index maps. }
+  SetLength(s1, Length(str1));
+  SetLength(m1, Length(str1));
+  n := 0;
+  for i := 0 to High(str1) do
+    if not tc_istdigit(str1[i]) then
+    begin
+      s1[n] := str1[i];
+      m1[n] := i;
+      Inc(n);
+    end;
+  SetLength(s1, n);
+  SetLength(m1, n);
+
+  SetLength(s2, Length(str2));
+  SetLength(m2, Length(str2));
+  n := 0;
+  for i := 0 to High(str2) do
+    if not tc_istdigit(str2[i]) then
+    begin
+      s2[n] := str2[i];
+      m2[n] := i;
+      Inc(n);
+    end;
+  SetLength(s2, n);
+  SetLength(m2, n);
+
+  ComputeByteDiffCore(s1, s2, casitive, xwhite,
+    begin0, begin1, end0, end1, equal);
+
+  { Map stripped indices back to original positions. }
+  if begin0 <> -1 then
+  begin
+    if begin0 < Length(s1) then
+      begin0 := m1[begin0]
+    else
+      begin0 := Length(str1);
+    if end0 >= 0 then
+      end0 := m1[end0];
+    { The core's "empty side" encoding is end = begin - 1. Mapping the two
+      indices independently can break that invariant when digits sit
+      between them (m[end_s] can be < m[begin_s] - 1), which would make
+      wordLevelToByteLevel produce a wdiff whose end is more than one
+      before its begin - and WdiffsToOpcodes then advances posB BACKWARD
+      (discontinuous opcodes). Clamp back to the canonical empty encoding. }
+    if end0 < begin0 - 1 then
+      end0 := begin0 - 1;
+  end;
+  if begin1 <> -1 then
+  begin
+    if begin1 < Length(s2) then
+      begin1 := m2[begin1]
+    else
+      begin1 := Length(str2);
+    if end1 >= 0 then
+      end1 := m2[end1];
+    { See the clamp above. }
+    if end1 < begin1 - 1 then
+      end1 := begin1 - 1;
+  end;
+end;
+
+{ Ported from stringdiffs.cpp:853-1074 — ComputeByteDiff (core).
   Refines a word-level diff down to character level using a two-pointer
   scan (forward + reverse) on the substring.
 
@@ -1289,7 +1492,7 @@ end;
   begin_/end_ arrays are [0]=side1, [1]=side2.
   Convention: begin[i] = -1 means "no visible diff on side i".
   end[i] is INCLUSIVE (matches WinMerge's encoding). }
-procedure TStringDiff.ComputeByteDiff(const str1, str2: TCodePointArray;
+procedure TStringDiff.ComputeByteDiffCore(const str1, str2: TCodePointArray;
   casitive: Boolean; xwhite: Integer;
   var begin0, begin1, end0, end1: Integer; equal: Boolean);
 var
@@ -1487,7 +1690,7 @@ begin
       Move(FStr2[diff.begin_[1]], str2_2[0], len2 * SizeOf(TCodePoint));
 
     ComputeByteDiff(str1_2, str2_2, FCaseSensitive, FWhitespace,
-      begin0, begin1, end0, end1, False);
+      FIgnoreNumbers, begin0, begin1, end0, end1, False);
 
     { Adjust diff.begin[0] and diff.end[0]. }
     if begin0 = -1 then
@@ -1682,37 +1885,24 @@ begin
   begin
     d := diffs[i];
 
-    { Synthesize EQUAL/REPLACE/INSERT/DELETE for the gap before this diff.
-      DIVERGENCE: When whitespace-ignore flags are active, the gap between
-      two wdiffs may have different lengths on side 1 and side 2 (because
-      whitespace tokens were skipped on one side but not the other).
-      difflib requires 'equal' opcodes to have i2-i1 == j2-j1. If the gap
-      lengths differ, we emit REPLACE (or INSERT/DELETE if one side is empty)
-      instead of EQUAL — this preserves the difflib contract while remaining
-      faithful to the WinMerge word-level diff (which considers these regions
-      "matched" under the ignore rules, but they're not byte-for-byte equal). }
+    { Synthesize EQUAL for the gap before this diff.
+      G18: The gap is "matched" under the ignore rules (the word-level
+      diff considered these regions equal), so it must be emitted as
+      EQUAL — even when the two sides have DIFFERENT lengths. Lengths
+      differ whenever an ignore flag collapses runs of different size
+      on the two sides: digit runs under DIFF_IGN_NUMBERS ("666666" vs
+      "33333" — 6 vs 5 bytes), whitespace runs under
+      DIFF_IGN_WHITESPACE, EOL bytes under DIFF_IGN_EOL. The old code
+      degraded such gaps to REPLACE (or INSERT/DELETE), which painted
+      the WHOLE matched region as changed — e.g. "aaa 666666 tttttdd"
+      vs "aaa 33333 ttttt" colored everything instead of just "dd".
+      difflib's i2-i1 == j2-j1 contract for 'equal' cannot hold under
+      ignore flags; DIF_CHARS consumers (the Differ plugin) skip equal
+      opcodes entirely, so unequal-length EQUAL is the faithful
+      representation: "nothing to colorize here". }
     if (posA < d.begin_[0]) or (posB < d.begin_[1]) then
     begin
-      if (d.begin_[0] - posA) = (d.begin_[1] - posB) then
-      begin
-        { Gap lengths match — emit EQUAL. }
-        op.Tag := cTagEqual;
-      end
-      else if (d.begin_[0] > posA) and (d.begin_[1] > posB) then
-      begin
-        { Both sides non-empty but different lengths — emit REPLACE. }
-        op.Tag := cTagReplace;
-      end
-      else if (d.begin_[0] > posA) then
-      begin
-        { Only side 1 has content — emit DELETE. }
-        op.Tag := cTagDelete;
-      end
-      else
-      begin
-        { Only side 2 has content — emit INSERT. }
-        op.Tag := cTagInsert;
-      end;
+      op.Tag := cTagEqual;
       op.I1 := posA;
       op.I2 := d.begin_[0];
       op.J1 := posB;
@@ -1754,7 +1944,14 @@ begin
     end
     else
     begin
-      { Both sides empty — skip (shouldn't happen after PopulateDiffs). }
+      { Both sides empty — the byte-level refinement collapsed this wdiff
+        entirely (e.g. a digit-only difference under DIFF_IGN_NUMBERS, or
+        a whitespace-only difference under DIFF_IGN_WHITESPACE). Emit
+        nothing, but STILL advance posA/posB past the collapsed region:
+        skipping the advance made the next gap / final gap re-cover the
+        previous gap's positions, breaking the opcode chain (G18). }
+      posA := d.end_[0] + 1;
+      posB := d.end_[1] + 1;
       Continue;
     end;
 
@@ -1765,19 +1962,12 @@ begin
     posB := d.end_[1] + 1;
   end;
 
-  { Final gap (trailing equal region).
-    DIVERGENCE: Same as above — if gap lengths differ due to whitespace
-    skipping, emit REPLACE/INSERT/DELETE instead of EQUAL. }
+  { Final gap (trailing equal region) — G18: always EQUAL, even when the
+    lengths differ (ignore flags may collapse different-size runs; see
+    the gap comment above). }
   if (posA < sizeA) or (posB < sizeB) then
   begin
-    if (sizeA - posA) = (sizeB - posB) then
-      op.Tag := cTagEqual
-    else if (sizeA > posA) and (sizeB > posB) then
-      op.Tag := cTagReplace
-    else if (sizeA > posA) then
-      op.Tag := cTagDelete
-    else
-      op.Tag := cTagInsert;
+    op.Tag := cTagEqual;
     op.I1 := posA;
     op.I2 := sizeA;
     op.J1 := posB;
