@@ -600,7 +600,7 @@ end;
   DIVERGENCE from JGit: RawCharUtil.isWhitespace() (util/RawCharUtil.java:
   35-37) also counts \r and \n. We exclude them on purpose: in diff_proc,
   "whitespace" means space+tab in ALL THREE engines (cudadiffchars /
-  cudadiffhistogram / cudadiffmyers — IsWSpace there is "0x20, 0x09" too),
+  cudadiffhistogram / cudadiffmyers — IsWSpace there is 0x20/0x09 too),
   and line terminators are the domain of DIFF_IGN_EOL. With \r/\n included
   here, "a\r\n" vs "a\n" compared EQUAL under DIFF_IGN_WHITESPACE alone in
   the histogram engine but DIFFERENT in the Myers engine — an
@@ -3167,8 +3167,16 @@ begin
   begin
     cur := ops[i];
 
-    // Only INSERT or DELETE can be part of a blank-line hunk.
-    if (cur.Tag = cTagInsert) or (cur.Tag = cTagDelete) then
+    // INSERT, DELETE or REPLACE can start a blank-line hunk.
+    // G35: REPLACE is included — a hunk that REPLACES blank lines with
+    // blank lines (e.g. an LF-terminated empty line changed to a
+    // CRLF-terminated one, compared without DIFF_IGN_EOL) is an
+    // all-blank hunk too and must be suppressed, exactly like the
+    // myers engine's AnalyzeHunk does (it checks deleted AND inserted
+    // lines of any hunk shape). Without this the two line-level engines
+    // disagreed on "\n" vs "\r\n" under DIFF_IGN_BLANK_LINES alone.
+    if (cur.Tag = cTagInsert) or (cur.Tag = cTagDelete) or
+       (cur.Tag = cTagReplace) then
     begin
       // Collect adjacent INSERT/DELETE/REPLACE opcodes into a hunk.
       groupStart := i;
