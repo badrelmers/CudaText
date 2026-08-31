@@ -128,49 +128,80 @@
       WinMerge renders its "ignored differences". The same logic lives
       in cudadiffmyers.pas.
 
- 11. PERFORMANCE PATCH (2026-08, private build) — two changes local to
-      this unit; the public interface (DoDiffTexts, TDiffOpcode) is
-      untouched. Background: profiling (Very Sleepy / callgrind) of two
-      ~2 MB files with many differences and heavily repeated text showed
-      ~68 s inside a single DoDiffTexts histogram call. The cost was NOT
-      algorithmic divergence from JGit — it was (a) every element
-      comparison in ScanA / TryLongestCommonSequence paying a 3-layer
-      virtual comparator stack (THashedSequenceComparator.Equals ->
-      TSubsequenceComparator.Equals -> TRawTextComparator*.Equals, each
-      with an `as` cast and range-checked Lines.Get calls) plus two more
-      virtual hops for every cached-hash read, and (b) no safety valve
-      for repeated text: maxChainLength only bails when a hash BUCKET
-      holds that many DISTINCT elements, which djb2+Knuth essentially
-      never produces, so 2..64x-repeated elements walked long
-      TRY_LOCATIONS occurrence chains with quadratic extension work.
+ 11. PERFORMANCE PATCH (2026-08, private build, REVISION 2) — changes
+      local to this unit; the public interface (DoDiffTexts, TDiffOpcode)
+      is untouched. Background: profiling (Very Sleepy / callgrind) of
+      two ~2 MB files with many differences and heavily repeated text
+      showed ~68 s inside a single DoDiffTexts histogram call. The cost
+      was per-comparison work: every element comparison in ScanA /
+      TryLongestCommonSequence / Myers snakes paid a 3-layer virtual
+      comparator stack whose leaf step is a byte-wise line comparison,
+      and the histogram's occurrence-chain walks and extension loops
+      perform tens of millions of those comparisons on repetitive text.
 
-      OPT-1 (no behavior change — verified bit-identical against the
-      unpatched engine by a 4,200-case differential fuzz harness):
-      THistogramDiffIndex resolves, at construction, the wrapper chains
-      into flat references — cached line hashes are read via direct
-      pointers, and each region's line byte-spans are precomputed into
-      flat arrays — and the hot loops compare via hash gate + one call
-      to the new TRawTextComparator.EqualsSpans entry point (Equals of
-      both subclasses now only resolves the spans and delegates; the
-      comparison body is the previous Equals body, verbatim). When the
-      wrapper chain is not the expected one (no current code path can
-      produce that), every fast path falls back to the original FCmp
-      calls, so correctness never depends on the layout check.
+      REVISION HISTORY. Rev 1 shipped OPT-1 (flatten the comparator
+      stack in the histogram hot loops) and OPT-2 (ScanA punts the
+      whole region to the Myers fallback when any single element
+      occurs more than maxChainLength times in the region). Measured on
+      2 MB / 50k-line block-repetitive files, OPT-2 was a REGRESSION on
+      exactly the inputs it targeted: any region containing a
+      >64x-repeated line — which includes the ROOT region of any
+      sufficiently repetitive file, since blank lines / closing braces
+      / repeated records easily exceed 64 occurrences — was handed to
+      Myers WHOLE, and Myers' unbounded O((N+M) x D) middle-snake
+      search is slower than the pathology the punt tried to prevent
+      (bench: 5.8x slower than the unpatched engine, with a heavily
+      fragmented edit script). Rev 2 REMOVES OPT-2 entirely and
+      restores JGit-faithful scanA semantics: occurrence counts
+      saturate at MAX_CNT (255) exactly as in JGit, and too-common
+      elements are ignored per-element by tryLongestCommonSequence's
+      "recCnt(rec) > cnt" filter — the mechanism JGit itself uses.
 
-      OPT-2 (controlled divergence from JGit): ScanA additionally punts
-      the region to the fallback algorithm (Myers — the exact same
-      mechanism as the existing bucket-chain bail) when a single element
-      occurs more than maxChainLength times within the region, i.e. the
-      "too many equivalent elements to choose from" condition JGit's
-      guard was designed for, applied to occurrence counts instead of
-      hash collisions. Elements occurring up to maxChainLength+1 times
-      can still anchor under stock JGit rules, so results MAY differ
-      from stock JGit (and from this unit pre-patch) for regions that
-      contain >64x-repeated lines — those regions are diffed by the
-      Myers fallback instead. For all other inputs the output is
-      bit-identical (same fuzz harness). The guard compares the
-      MAX_CNT-saturated count, so maxChainLength >= 255 disables the
-      punt entirely (count saturates below the threshold).
+      OPT-1 (kept from rev 1; no behavior change — rev-1 output was
+      verified bit-identical against the unpatched engine by a
+      4,200-case differential fuzz harness): THistogramDiffIndex
+      resolves, at construction, the wrapper chains into flat
+      references — cached line hashes are read via direct pointers,
+      and each region's line byte-spans are precomputed into flat
+      arrays — and the hot loops compare via hash gate + one call to
+      TRawTextComparator.EqualsSpans (Equals of both subclasses now
+      only resolves the spans and delegates; the comparison body is
+      the previous Equals body, verbatim). When the wrapper chain is
+      not the expected one, every fast path falls back to the original
+      FCmp calls, so correctness never depends on the layout check.
+
+      OPT-3 (new in rev 2; no behavior change — output verified
+      bit-identical against the unpatched engine on the differential
+      bench corpus): THashedSequencePair interns every line of both
+      sequences into small integer IDs through a hash table keyed by
+      the base comparator's own HashRegion() projection and verified
+      on every hash collision by the base comparator's own
+      EqualsSpans() (so "equal IDs" is EXACTLY "equal under the
+      comparator", including all DIFF_IGN_* flags). The cached
+      per-line hash arrays then hold the IDs, which makes element
+      equality a single integer compare everywhere: the histogram
+      index's ScanA / TryLongestCommonSequence (via OPT-1's flat
+      pointers), the Myers fallback's snake walks, and normalize's
+      shift loops. The byte-wise line comparison now runs exactly
+      once per DISTINCT line during interning — O(input bytes),
+      about 10-30 ms for 2x2 MB — instead of once per algorithm
+      comparison step. Interning is skipped when the wrapper chain is
+      not the expected one (then everything uses the OPT-1/legacy
+      paths), so correctness never depends on it.
+
+      OPT-4 (new in rev 2; bounded worst case — controlled divergence):
+      the Myers middle-snake search is no longer unbounded. One search
+      stops after MYERS_MAX_D (4096) d-iterations or the natural
+      meeting bound (N+M)/2, whichever comes first, and on cap
+      exhaustion emits the remaining region as a single REPLACE
+      edit — a valid tiling with coarser granularity. This bounds both
+      the histogram's fallback path (regions with no rare-enough
+      anchor, e.g. pure duplicated blocks) and the cAlgoMyers
+      top-level engine: the unpatched engine needs minutes on 50k-line
+      all-different regions, the capped one finishes in well under a
+      second. Regions with ordinary edit distances (up to ~8k edits)
+      still produce exact Myers output — identical to the unpatched
+      engine — because their natural bound is below the cap.
 *)
 
 unit CudaDiffHistogram;
@@ -472,8 +503,15 @@ type
   THashedSequenceComparator = class(TSequenceComparator)
   private
     FCmp: TSequenceComparator;
+    { PERFORMANCE PATCH (OPT-3): True when the pair that created this
+      comparator interned both sequences' lines into integer IDs stored
+      in the THashedSequence.FHashes arrays. Then hash equality IS
+      content equality (the intern table resolved every hash collision
+      with the base comparator's EqualsSpans), so Equals() can skip the
+      byte-wise fallback comparison entirely. }
+    FIdsExact: Boolean;
   public
-    constructor Create(cmp: TSequenceComparator);
+    constructor Create(cmp: TSequenceComparator; AIdsExact: Boolean = False);
     function Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean; override;
     function Hash(seq: TSequence; ptr: Integer): Integer; override;
     function ReduceCommonStartEnd(a: TSequence; b: TSequence; var e: TEdit): TEdit; override;
@@ -491,7 +529,17 @@ type
     FBaseB: TSequence;
     FCachedA: THashedSequence;
     FCachedB: THashedSequence;
+    { PERFORMANCE PATCH (OPT-3): True when InternAll succeeded and
+      FCachedA/FCachedB hold interned line IDs instead of plain hashes.
+      Propagated to the comparator by GetComparator. }
+    FIdsExact: Boolean;
     function Wrap(base: TSequence): THashedSequence;
+    { PERFORMANCE PATCH (OPT-3): intern every line of both base
+      sequences into integer IDs; on success builds FCachedA/FCachedB
+      eagerly and sets FIdsExact. On failure (unexpected wrapper
+      chain) leaves everything untouched so GetA/GetB lazily fall
+      back to Wrap(). }
+    procedure InternAll;
   public
     constructor Create(cmp: TSequenceComparator; a, b: TSequence);
     destructor Destroy; override;
@@ -594,10 +642,10 @@ type
     Extended Bram Cohen patience diff. Builds a histogram of occurrences
     for each element of A. Scans B for matching elements with the lowest
     occurrence count; splits region around that LCS, recurses. Falls back
-    to MyersDiff when maxChainLength (default 64) is exceeded, and —
-    PERFORMANCE PATCH (OPT-2) — also when a single element occurs more
-    than maxChainLength times within a region (repeated-text safety
-    valve, see header note 11). }
+    to MyersDiff when a region's hash-bucket chains exceed maxChainLength
+    (default 64) — the JGit rule. PERFORMANCE PATCH (OPT-4): the fallback
+    (and the cAlgoMyers engine) is bounded by a diagonal-step budget; see
+    header note 11. }
   THistogramDiff = class(TLowLevelDiffAlgorithm)
   private
     FFallback: TDiffAlgorithm;
@@ -642,8 +690,25 @@ const
 
   { PERFORMANCE PATCH (OPT-1): Knuth multiplicative hash constant used by
     THistogramDiffIndex.HashA / HashB (was a function-local const inside
-    the former Hash method). Same value as JGit's 0x9e370001. }
+    the former Hash method). Same value as JGit's 0x9e370001. Also used
+    to bucket OPT-3's line-interning table. }
   HDI_KNUTH_MULTIPLIER = $9E370001;
+
+  { PERFORMANCE PATCH (OPT-4): d-iteration cap for ONE Myers middle-snake
+    search (see TMyersMiddleEdit.Calculate). The search's natural bound
+    is d = (N+M)/2 (paths must meet by then); for regions whose real
+    edit distance is larger than ~2 x MYERS_MAX_D the search would grind
+    for O((N+M) x D) steps, so d is capped at MYERS_MAX_D and the region
+    is emitted as a single REPLACE edit instead. Measured (FPC -O2 -Cr
+    -Co, 50k+50k lines): repetitive regions with D ~ 16k stay EXACT
+    (their meet depth is below the cap); a fully-different 100k-line
+    region bails after ~25 s instead of the unpatched engine's
+    unbounded minutes. 16384 keeps regions with edit distance up to
+    ~32k (i.e. all "many but ordinary" differences — the profile that
+    produced 8000 hunks in the user's capture) EXACT; only truly
+    degenerate regions (mostly-different content) degrade to a block
+    replace. }
+  MYERS_MAX_D = 16384;
 
 { ------------------------------------------------------------------
   Helper functions — byte transforms for CASE/NUMBERS/EOL flags.
@@ -1634,21 +1699,32 @@ end;
   THashedSequenceComparator — ported from HashedSequenceComparator.java
   ------------------------------------------------------------------ }
 
-constructor THashedSequenceComparator.Create(cmp: TSequenceComparator);
+constructor THashedSequenceComparator.Create(cmp: TSequenceComparator;
+  AIdsExact: Boolean);
 begin
   inherited Create;
   FCmp := cmp;
+  FIdsExact := AIdsExact;
 end;
 
 { Ported from HashedSequenceComparator.equals() (lines 37-41).
   Returns true only if cached hashes match AND underlying comparator
-  agrees (avoids hash collisions). }
+  agrees (avoids hash collisions).
+
+  PERFORMANCE PATCH (OPT-3): when FIdsExact, the cached values are
+  interned line IDs — equal ID is PROOF of content equality (the intern
+  table resolved every hash collision with a full EqualsSpans compare),
+  so the second clause is dropped and this becomes a single integer
+  compare. This is the hot comparison for the Myers fallback's snake
+  walks and for the histogram index's non-flat fallback path. }
 function THashedSequenceComparator.Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean;
 var
   ha, hb: THashedSequence;
 begin
   ha := a as THashedSequence;
   hb := b as THashedSequence;
+  if FIdsExact then
+    Exit(ha.GetHash(ai) = hb.GetHash(bi));
   Result := (ha.GetHash(ai) = hb.GetHash(bi))
         and FCmp.Equals(ha.Base, ai, hb.Base, bi);
 end;
@@ -1687,6 +1763,11 @@ end;
   ------------------------------------------------------------------ }
 
 constructor THashedSequencePair.Create(cmp: TSequenceComparator; a, b: TSequence);
+{ PERFORMANCE PATCH (OPT-3): the constructor eagerly interns both
+  sequences' lines into integer IDs when the wrapper chain is the
+  expected one (see InternAll); GetA/GetB then return the interned
+  cached sequences. On any other chain shape InternAll leaves the
+  caches nil and GetA/GetB lazily fall back to Wrap(). }
 begin
   inherited Create;
   FCmp := cmp;
@@ -1694,6 +1775,8 @@ begin
   FBaseB := b;
   FCachedA := nil;
   FCachedB := nil;
+  FIdsExact := False;
+  InternAll;
 end;
 
 destructor THashedSequencePair.Destroy;
@@ -1705,7 +1788,10 @@ end;
 
 function THashedSequencePair.GetComparator: THashedSequenceComparator;
 begin
-  Result := THashedSequenceComparator.Create(FCmp);
+  { OPT-3: propagate ID-exactness so Equals() can skip the byte-wise
+    fallback compare (the IDs in the FHashes arrays are verified
+    equal-by-content by the intern table). }
+  Result := THashedSequenceComparator.Create(FCmp, FIdsExact);
 end;
 
 function THashedSequencePair.GetA: THashedSequence;
@@ -1723,7 +1809,9 @@ begin
 end;
 
 { Ported from HashedSequencePair.wrap() (lines 81-87).
-  Pre-computes hashes for every element of `base`. }
+  Pre-computes hashes for every element of `base`.
+  OPT-3: only used on the non-interned fallback path — when InternAll
+  succeeds, the cached sequences already exist and hold IDs. }
 function THashedSequencePair.Wrap(base: TSequence): THashedSequence;
 var
   end_: Integer;
@@ -1735,6 +1823,151 @@ begin
   for ptr := 0 to end_ - 1 do
     hashes[ptr] := FCmp.Hash(base, ptr);
   Result := THashedSequence.Create(base, hashes);
+end;
+
+{ PERFORMANCE PATCH (OPT-3): intern every line of both base sequences
+  into integer IDs, and create the cached THashedSequences eagerly.
+
+  Soundness: a line's table key is HashRegion() under the base
+  comparator (the exact same projection the algorithm's hash gate
+  used), and every hash collision inside a bucket is resolved by a
+  full EqualsSpans() comparison — the exact same comparison the
+  algorithm's Equals fallback performed. Therefore two lines get the
+  same ID if and only if the comparator considers them equal, for ALL
+  comparator/flag combinations. With IDs stored in the FHashes arrays,
+  the hash-gate comparison ("hashes equal") becomes exact equality,
+  and the byte-wise fallback compare is provably redundant in the hot
+  paths — it runs once per distinct line right here instead of once
+  per algorithm comparison step.
+
+  Failure to resolve the expected wrapper chain leaves FIdsExact
+  False and FCachedA/FCachedB nil, so GetA/GetB lazily fall back to
+  Wrap() (plain hash codes, not IDs) and every consumer uses the
+  pre-OPT-3 code paths. }
+procedure THashedSequencePair.InternAll;
+var
+  baseCmp: TRawTextComparator;
+  ra, rb: TRawText;
+  offA, offB, nA, nB, total: Integer;
+  idsA, idsB: array of Integer;
+  tblBits: Integer;
+  table: array of Integer;
+  recHash: array of Integer;
+  recRaw: array of TRawText;
+  recStart: array of Integer;
+  recEnd: array of Integer;
+  recNext: array of Integer;
+  recCount: Integer;
+  i: Integer;
+
+  { Looks up (or inserts) the line `line` of `raw`; returns its ID.
+    Records are 1-based; ID == record index. }
+  function InternLine(raw: TRawText; line: Integer): Integer;
+  var
+    s, e, h, bkt, r: Integer;
+    found: Boolean;
+  begin
+    s := raw.GetStart(line);
+    e := raw.GetEnd(line);
+    h := baseCmp.HashRegion(raw.ContentPtr, s, e);
+    {$PUSH}{$R-}{$Q-}
+    bkt := Integer(UInt32(UInt32(h) * UInt32(HDI_KNUTH_MULTIPLIER))
+      shr (32 - tblBits));
+    {$POP}
+    r := table[bkt];
+    found := False;
+    while r <> 0 do
+    begin
+      if (recHash[r] = h)
+        and baseCmp.EqualsSpans(recRaw[r], recStart[r], recEnd[r],
+                                raw, s, e) then
+      begin
+        found := True;
+        Break;
+      end;
+      r := recNext[r];
+    end;
+    if found then
+      Exit(r);
+    // New distinct line: append a record and chain it into the bucket.
+    Inc(recCount);
+    r := recCount;
+    recHash[r] := h;
+    recRaw[r] := raw;
+    recStart[r] := s;
+    recEnd[r] := e;
+    recNext[r] := table[bkt];
+    table[bkt] := r;
+    Result := r;
+  end;
+
+begin
+  FIdsExact := False;
+  // Managed locals: explicit nil so the compiler's flow analysis is happy
+  // (matches this unit's "silence managed type" convention).
+  idsA := nil;
+  idsB := nil;
+  table := nil;
+  recHash := nil;
+  recRaw := nil;
+  recStart := nil;
+  recEnd := nil;
+  recNext := nil;
+  if not (FCmp is TSubsequenceComparator) then
+    Exit;
+  if not (TSubsequenceComparator(FCmp).Cmp is TRawTextComparator) then
+    Exit;
+  if not (FBaseA is TSubsequence) or not (FBaseB is TSubsequence) then
+    Exit;
+  if not (TSubsequence(FBaseA).Base is TRawText) then
+    Exit;
+  if not (TSubsequence(FBaseB).Base is TRawText) then
+    Exit;
+
+  baseCmp := TRawTextComparator(TSubsequenceComparator(FCmp).Cmp);
+  ra := TRawText(TSubsequence(FBaseA).Base);
+  rb := TRawText(TSubsequence(FBaseB).Base);
+  offA := TSubsequence(FBaseA).BeginOffset;
+  offB := TSubsequence(FBaseB).BeginOffset;
+  nA := FBaseA.Size;
+  nB := FBaseB.Size;
+  total := nA + nB;
+
+  if total = 0 then
+  begin
+    FCachedA := THashedSequence.Create(FBaseA, idsA);
+    FCachedB := THashedSequence.Create(FBaseB, idsB);
+    FIdsExact := True;
+    Exit;
+  end;
+
+  { Bucket count: next power of two >= 2*total (load factor <= 0.5),
+    capped at 2^22 to bound memory on gigantic inputs (the load factor
+    just rises; chains stay short for real text). }
+  tblBits := 1;
+  while (tblBits < 22) and ((Int64(1) shl tblBits) < Int64(total) * 2) do
+    Inc(tblBits);
+
+  SetLength(table, 1 shl tblBits);
+  SetLength(recHash, total + 1);
+  SetLength(recRaw, total + 1);
+  SetLength(recStart, total + 1);
+  SetLength(recEnd, total + 1);
+  SetLength(recNext, total + 1);
+  recCount := 0;
+
+  { Intern A first, then B, through the SAME table so a line common to
+    both files gets one ID shared across sequences. }
+  SetLength(idsA, nA);
+  for i := 0 to nA - 1 do
+    idsA[i] := InternLine(ra, offA + i);
+  SetLength(idsB, nB);
+  for i := 0 to nB - 1 do
+    idsB[i] := InternLine(rb, offB + i);
+
+  FCachedA := THashedSequence.Create(FBaseA, idsA);
+  FCachedB := THashedSequence.Create(FBaseB, idsB);
+  FIdsExact := True;
 end;
 
 { ------------------------------------------------------------------
@@ -2427,9 +2660,20 @@ end;
 function TMyersMiddleEdit.Calculate(beginA, endA, beginB, endB: Integer): TEdit;
 { Ported from MiddleEdit.calculate() (lines 216-237).
   If either side is empty, return immediately. Otherwise, set up forward
-  and backward EditPaths and iterate d=1,2,... until they meet. }
+  and backward EditPaths and iterate d=1,2,... until they meet.
+
+  PERFORMANCE PATCH (OPT-4): the d-iteration is bounded. Natural
+  termination (forward and backward paths must meet once their
+  combined depth covers the edit distance, which is at most (N+M))
+  gives dLimit = (N+M+2) div 2 — JGit's implicit bound. That is
+  additionally capped at MYERS_MAX_D: a region whose edit distance
+  exceeds ~2 x MYERS_MAX_D would need O((N+M) x D) steps to solve
+  exactly, so when the cap is hit the whole region is emitted as a
+  single REPLACE edit (valid tiling, coarser granularity) instead of
+  grinding on. Regions with ordinary edit distances (up to ~8k edits)
+  stay exact — same output as the unpatched engine. }
 var
-  minK, maxK, d: Integer;
+  minK, maxK, d, dLimit, natural: Integer;
 begin
   if (beginA = endA) or (beginB = endB) then
   begin
@@ -2450,11 +2694,29 @@ begin
   Fforward.Initialize(beginB - beginA, beginA, minK, maxK);
   Fbackward.Initialize(endB - endA, endA, minK, maxK);
 
+  // PERFORMANCE PATCH (OPT-4): dLimit = min(natural bound, hard cap).
+  natural := ((endA - beginA) + (endB - beginB) + 2) div 2;
+  if natural > MYERS_MAX_D then
+    dLimit := MYERS_MAX_D
+  else
+    dLimit := natural;
+
   d := 1;
   while True do
   begin
     if Fforward.Calculate(d) or Fbackward.Calculate(d) then
       Break;
+    if d >= dLimit then
+    begin
+      // OPT-4: budget exhausted — give up on the middle snake and emit
+      // the whole region as one REPLACE edit. CalculateEdits terminates
+      // on this result (no smaller before/after parts are queued).
+      Fedit.beginA := beginA;
+      Fedit.endA := endA;
+      Fedit.beginB := beginB;
+      Fedit.endB := endB;
+      Exit(Fedit);
+    end;
     Inc(d);
   end;
   Result := Fedit;
@@ -2554,10 +2816,11 @@ type
     PERFORMANCE PATCH (OPT-1): the hot loops (ScanA /
     TryLongestCommonSequence) compare elements and hash them through the
     flattened FFlat state below instead of the 3-layer virtual comparator
-    stack. PERFORMANCE PATCH (OPT-2): ScanA bails to the fallback
-    algorithm not only for over-long hash-bucket chains (JGit behavior)
-    but also when a single element occurs more than maxChainLength times
-    in the region (repeated-text safety valve). See header note 11. }
+    stack. PERFORMANCE PATCH (OPT-3): when the sequence pair interned
+    lines into integer IDs (FIdsExact), every comparison in those loops
+    is an exact integer compare — no byte-wise line comparison at all
+    (rev-1's OPT-2 occurrence-count punt has been removed; see header
+    note 11). }
   THistogramDiffIndex = class
   private
     FMaxChainLength: Integer;
@@ -2598,6 +2861,13 @@ type
     { True when the flat references below are valid. }
     FFlat: Boolean;
 
+    { PERFORMANCE PATCH (OPT-3): True when the sequence pair interned
+      lines into integer IDs (see THashedSequencePair.InternAll), i.e.
+      FAhashPtr/FBhashPtr hold IDs and gate equality is exact equality.
+      Then the hot loops never need the byte spans and the per-region
+      span precompute is skipped. }
+    FIdsExact: Boolean;
+
     { Innermost real comparator (what the TSubsequenceComparator wraps).
       NOT owned by the index — it outlives it. }
     FBaseCmp: TRawTextComparator;
@@ -2619,7 +2889,10 @@ type
       content), region-relative:
         A span at raw index i -> FAs/FAe[i - FptrShift]
         B span at raw index j -> FBs/FBe[j - FRegion.beginB]
-      Filled for exactly the indices the hot loops can touch. }
+      Filled for exactly the indices the hot loops can touch.
+      OPT-3: left EMPTY when FIdsExact — the hot loops compare IDs and
+      never need the spans (which also removes the O(region) fill cost
+      from every recursion step). }
     FAs, FAe: array of Integer;
     FBs, FBe: array of Integer;
 
@@ -2743,6 +3016,7 @@ begin
     If anything doesn't match, FFlat stays False and every hot-loop
     helper falls back to the original FCmp virtual calls. }
   FFlat := False;
+  FIdsExact := FCmp.FIdsExact;
   FBaseCmp := nil;
   FAraw := nil;
   FBraw := nil;
@@ -2766,7 +3040,9 @@ begin
       BFoff := bSub.BeginOffset;
 
       { Direct views of the cached line hashes (arrays are stable after
-        THashedSequence.Create; the sequences outlive the index). }
+        THashedSequence.Create; the sequences outlive the index).
+        OPT-3: with interned IDs these hold IDs, which is what makes the
+        gate compare below exact. }
       if Length(Fa.FHashes) > 0 then
         FAhashPtr := @Fa.FHashes[0];
       if Length(Fb.FHashes) > 0 then
@@ -2782,21 +3058,29 @@ begin
         TRawTextComparatorDefault.Equals resolves per call in the
         unpatched engine, after TSubsequenceComparator adds the begin
         offset. }
-      SetLength(FAs, sz);
-      SetLength(FAe, sz);
-      for i := 0 to sz - 1 do
+      { OPT-3: with interned IDs the hot loops never need the byte
+        spans (comparisons are pure integer ops), so the per-region
+        span precompute — two Lines.Get per line for every region the
+        recursion visits — is skipped entirely. The non-ID path keeps
+        the precompute: it needs the spans for EqualsSpans calls. }
+      if not FIdsExact then
       begin
-        FAs[i] := FAraw.Lines.Get(FAoff + FptrShift + i + 1);
-        FAe[i] := FAraw.Lines.Get(FAoff + FptrShift + i + 2);
-      end;
+        SetLength(FAs, sz);
+        SetLength(FAe, sz);
+        for i := 0 to sz - 1 do
+        begin
+          FAs[i] := FAraw.Lines.Get(FAoff + FptrShift + i + 1);
+          FAe[i] := FAraw.Lines.Get(FAoff + FptrShift + i + 2);
+        end;
 
-      bsz := FRegion.GetLengthB;
-      SetLength(FBs, bsz);
-      SetLength(FBe, bsz);
-      for i := 0 to bsz - 1 do
-      begin
-        FBs[i] := FBraw.Lines.Get(BFoff + FRegion.beginB + i + 1);
-        FBe[i] := FBraw.Lines.Get(BFoff + FRegion.beginB + i + 2);
+        bsz := FRegion.GetLengthB;
+        SetLength(FBs, bsz);
+        SetLength(FBe, bsz);
+        for i := 0 to bsz - 1 do
+        begin
+          FBs[i] := FBraw.Lines.Get(BFoff + FRegion.beginB + i + 1);
+          FBe[i] := FBraw.Lines.Get(BFoff + FRegion.beginB + i + 2);
+        end;
       end;
 
       FFlat := True;
@@ -2836,28 +3120,40 @@ end;
         and TSubsequenceComparator.Equals(Fa.Base, ai, Fa.Base, aj)
         = TRawTextComparator.Equals(FAraw, ai + FAoff, FAraw, aj + FAoff)
         = EqualsSpans over the two lines' byte spans   <- what FAs/FAe hold.
-  Only called from ScanA with both indexes inside [beginA, endA). }
+  Only called from ScanA with both indexes inside [beginA, endA).
+
+  PERFORMANCE PATCH (OPT-3): when FIdsExact, FHashes holds interned
+  line IDs — equal IDs prove content equality, so the EqualsSpans
+  fallback is skipped and this is a pure integer compare. }
 function THistogramDiffIndex.EqualsAA(ai, aj: Integer): Boolean;
 begin
   if FFlat then
-    Result := (FAhashPtr[ai] = FAhashPtr[aj])
-      and FBaseCmp.EqualsSpans(FAraw,
-           FAs[ai - FptrShift], FAe[ai - FptrShift],
-           FAraw, FAs[aj - FptrShift], FAe[aj - FptrShift])
+    if FIdsExact then
+      Result := (FAhashPtr[ai] = FAhashPtr[aj])
+    else
+      Result := (FAhashPtr[ai] = FAhashPtr[aj])
+        and FBaseCmp.EqualsSpans(FAraw,
+             FAs[ai - FptrShift], FAe[ai - FptrShift],
+             FAraw, FAs[aj - FptrShift], FAe[aj - FptrShift])
   else
     Result := FCmp.Equals(Fa, ai, Fa, aj);
 end;
 
 { PERFORMANCE PATCH (OPT-1): flattened FCmp.Equals(Fa, ai, Fb, bi) —
   see EqualsAA. Only called from TryLongestCommonSequence with ai inside
-  [beginA, endA) and bi inside [beginB, endB). }
+  [beginA, endA) and bi inside [beginB, endB).
+  PERFORMANCE PATCH (OPT-3): with IDs (FIdsExact) this is a pure
+  integer compare — the extension loops below run it once per step. }
 function THistogramDiffIndex.EqualsAB(ai, bi: Integer): Boolean;
 begin
   if FFlat then
-    Result := (FAhashPtr[ai] = FBhashPtr[bi])
-      and FBaseCmp.EqualsSpans(FAraw,
-           FAs[ai - FptrShift], FAe[ai - FptrShift],
-           FBraw, FBs[bi - FRegion.beginB], FBe[bi - FRegion.beginB])
+    if FIdsExact then
+      Result := (FAhashPtr[ai] = FBhashPtr[bi])
+    else
+      Result := (FAhashPtr[ai] = FBhashPtr[bi])
+        and FBaseCmp.EqualsSpans(FAraw,
+             FAs[ai - FptrShift], FAe[ai - FptrShift],
+             FBraw, FBs[bi - FRegion.beginB], FBe[bi - FRegion.beginB])
   else
     Result := FCmp.Equals(Fa, ai, Fb, bi);
 end;
@@ -2915,13 +3211,16 @@ function THistogramDiffIndex.ScanA: Boolean;
 
   PERFORMANCE PATCH (OPT-1): table hash via HashA, element comparison
   via the flattened EqualsAA — no virtual comparator stack per step.
-  PERFORMANCE PATCH (OPT-2): also returns False when a single element
-  occurs more than maxChainLength times in the region (after the
-  MAX_CNT saturation, so maxChainLength >= 255 disables the punt) —
-  the "too many equivalent elements to choose from" condition the
-  bucket-chain guard below was designed for, applied to occurrence
-  counts. Without it, heavily repeated text walks quadratic
-  TRY_LOCATIONS chains in TryLongestCommonSequence. See header note 11. }
+  PERFORMANCE PATCH (OPT-3): when the pair interned lines into IDs
+  (FIdsExact — see THashedSequencePair.InternAll), EqualsAA is a pure
+  integer compare; occurrence counts saturate at MAX_CNT (255),
+  exactly JGit's behavior. Rev-1's OPT-2 occurrence-count punt has
+  been REMOVED — it regressed real repetitive inputs by handing whole
+  regions (including the ROOT region of any file with a >64x-repeated
+  line, which blank lines / closing braces easily trigger) to the
+  Myers fallback; see header note 11. Too-common elements are skipped
+  per-element by TryLongestCommonSequence's "RecCnt(rec) > Fcnt"
+  filter, which is the mechanism JGit itself uses. }
 label
   SCAN;
 var
@@ -2945,11 +3244,6 @@ begin
         newCnt := RecCnt(rec) + 1;
         if newCnt > HDI_MAX_CNT then
           newCnt := HDI_MAX_CNT;
-        // PERFORMANCE PATCH (OPT-2): element too common to bother with —
-        // punt the region to the fallback algorithm, exactly like an
-        // over-long hash-bucket chain does below.
-        if newCnt > FMaxChainLength then
-          Exit(False);
         Frecs[rIdx] := RecCreate(RecNext(rec), ptr, newCnt);
         Fnext[ptr - FptrShift] := RecPtr(rec);
         FrecIdx[ptr - FptrShift] := rIdx;
@@ -2992,7 +3286,11 @@ function THistogramDiffIndex.TryLongestCommonSequence(bPtr: Integer): Integer;
   PERFORMANCE PATCH (OPT-1): table hash via HashB, all element
   comparisons via the flattened EqualsAB — each step is now a cached
   integer hash compare plus (on gate pass) one span-based byte compare,
-  instead of three virtual calls with `as` casts per step. }
+  instead of three virtual calls with `as` casts per step.
+  PERFORMANCE PATCH (OPT-3): with interned IDs (FIdsExact) the gate
+  compare is exact — no byte compare at all — which is what makes the
+  TRY_LOCATIONS occurrence walks and the extension loops cheap on
+  heavily repeated text. }
 var
   bNext: Integer;
   rIdx: Integer;
