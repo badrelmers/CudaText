@@ -128,7 +128,7 @@
       WinMerge renders its "ignored differences". The same logic lives
       in cudadiffmyers.pas.
 
- 11. PERFORMANCE PATCH (2026-08, private build, REVISION 2) — changes
+ 11. PERFORMANCE PATCH (2026-08, private build, REVISION 3) — changes
       local to this unit; the public interface (DoDiffTexts, TDiffOpcode)
       is untouched. Background: profiling (Very Sleepy / callgrind) of
       two ~2 MB files with many differences and heavily repeated text
@@ -189,9 +189,10 @@
       not the expected one (then everything uses the OPT-1/legacy
       paths), so correctness never depends on it.
 
-      OPT-4 (new in rev 2; bounded worst case — controlled divergence):
+      OPT-4 (new in rev 2; bounded worst case — controlled divergence;
+      GATED behind the OPT4_ENABLE_MYERS_D_CAP switch since rev 3):
       the Myers middle-snake search is no longer unbounded. One search
-      stops after MYERS_MAX_D (4096) d-iterations or the natural
+      stops after MYERS_MAX_D (16384) d-iterations or the natural
       meeting bound (N+M)/2, whichever comes first, and on cap
       exhaustion emits the remaining region as a single REPLACE
       edit — a valid tiling with coarser granularity. This bounds both
@@ -202,6 +203,17 @@
       second. Regions with ordinary edit distances (up to ~8k edits)
       still produce exact Myers output — identical to the unpatched
       engine — because their natural bound is below the cap.
+
+      REVISION 3: OPT-4 is now the only opt-in/opt-out choice in this
+      unit, controlled by the single boolean constant
+      OPT4_ENABLE_MYERS_D_CAP, declared in the INTERFACE const block
+      right below the uses clause (top of the unit). True (default)
+      keeps rev-2 behavior. False restores the pre-patch UNBOUNDED
+      middle-snake search — algorithm behavior then is bit-identical
+      to the original unit (and to JGit) for every input, at the cost
+      of the old worst case. Flip the constant and rebuild to toggle.
+      OPT-1 and OPT-3 are behavior-neutral by construction and remain
+      always-on (not switchable).
 *)
 
 unit CudaDiffHistogram;
@@ -220,6 +232,29 @@ uses
   literals directly, with private aliases below for readability. }
 
 const
+  { *** OPT-4 MASTER SWITCH — the only behavior-affecting option in
+    this unit. Flip this value and rebuild to toggle. ***
+
+    True  (default): OPT-4 enabled (rev-2 behavior). The Myers
+          middle-snake search stops after MYERS_MAX_D d-iterations
+          and the leftover region is emitted as one REPLACE edit.
+          Exact output for every region with edit distance up to
+          ~2 x MYERS_MAX_D; only truly degenerate (mostly-different)
+          regions degrade to a coarser block replace. This is what
+          keeps 50k-line all-different regions under a second
+          instead of minutes.
+
+    False: OPT-4 fully disabled. The middle-snake search is
+          unbounded — EXACTLY the pre-patch unit's (and JGit's)
+          algorithm: identical results and opcodes for every input,
+          but degenerate regions can again take minutes.
+
+    The cap value is MYERS_MAX_D, declared in the implementation
+    section (below the HistogramDiffIndex constants); 16384 is a
+    good default, tune only if you know why.
+    OPT-1/OPT-3 are behavior-neutral and not switchable. }
+  OPT4_ENABLE_MYERS_D_CAP = True;
+
   { Algorithm selectors — must match proc_py_const.pas DIFF_ALGO_* }
   cAlgoMyers     = 0;
   cAlgoHistogram = 1;
@@ -643,9 +678,9 @@ type
     for each element of A. Scans B for matching elements with the lowest
     occurrence count; splits region around that LCS, recurses. Falls back
     to MyersDiff when a region's hash-bucket chains exceed maxChainLength
-    (default 64) — the JGit rule. PERFORMANCE PATCH (OPT-4): the fallback
-    (and the cAlgoMyers engine) is bounded by a diagonal-step budget; see
-    header note 11. }
+    (default 64) — the JGit rule. PERFORMANCE PATCH (OPT-4, only when
+    OPT4_ENABLE_MYERS_D_CAP = True): the fallback (and the cAlgoMyers
+    engine) is bounded by a diagonal-step budget; see header note 11. }
   THistogramDiff = class(TLowLevelDiffAlgorithm)
   private
     FFallback: TDiffAlgorithm;
@@ -695,7 +730,10 @@ const
   HDI_KNUTH_MULTIPLIER = $9E370001;
 
   { PERFORMANCE PATCH (OPT-4): d-iteration cap for ONE Myers middle-snake
-    search (see TMyersMiddleEdit.Calculate). The search's natural bound
+    search (see TMyersMiddleEdit.Calculate). ONLY CONSULTED WHEN
+    OPT4_ENABLE_MYERS_D_CAP = True (interface const, top of unit); with
+    the switch off the search is unbounded and this constant is unused.
+    The search's natural bound
     is d = (N+M)/2 (paths must meet by then); for regions whose real
     edit distance is larger than ~2 x MYERS_MAX_D the search would grind
     for O((N+M) x D) steps, so d is capped at MYERS_MAX_D and the region
@@ -2662,16 +2700,23 @@ function TMyersMiddleEdit.Calculate(beginA, endA, beginB, endB: Integer): TEdit;
   If either side is empty, return immediately. Otherwise, set up forward
   and backward EditPaths and iterate d=1,2,... until they meet.
 
-  PERFORMANCE PATCH (OPT-4): the d-iteration is bounded. Natural
-  termination (forward and backward paths must meet once their
-  combined depth covers the edit distance, which is at most (N+M))
-  gives dLimit = (N+M+2) div 2 — JGit's implicit bound. That is
-  additionally capped at MYERS_MAX_D: a region whose edit distance
-  exceeds ~2 x MYERS_MAX_D would need O((N+M) x D) steps to solve
-  exactly, so when the cap is hit the whole region is emitted as a
-  single REPLACE edit (valid tiling, coarser granularity) instead of
-  grinding on. Regions with ordinary edit distances (up to ~8k edits)
-  stay exact — same output as the unpatched engine. }
+  PERFORMANCE PATCH (OPT-4) — GATED by the OPT4_ENABLE_MYERS_D_CAP
+  boolean constant in the interface const block (top of the unit):
+  the d-iteration is bounded. Natural termination (forward and
+  backward paths must meet once their combined depth covers the edit
+  distance, which is at most (N+M)) gives dLimit = (N+M+2) div 2 —
+  JGit's implicit bound. With the switch True, that is additionally
+  capped at MYERS_MAX_D: a region whose edit distance exceeds
+  ~2 x MYERS_MAX_D would need O((N+M) x D) steps to solve exactly, so
+  when the cap is hit the whole region is emitted as a single REPLACE
+  edit (valid tiling, coarser granularity) instead of grinding on.
+  Regions with ordinary edit distances (up to ~8k edits) stay exact —
+  same output as the unpatched engine.
+
+  With the switch False, dLimit is set to High(Integer) and the bail
+  branch below is unreachable: the loop then runs until the paths
+  meet — EXACTLY the pre-patch unit's (and JGit's) unbounded search,
+  bit-identical results and opcodes for every input. }
 var
   minK, maxK, d, dLimit, natural: Integer;
 begin
@@ -2694,12 +2739,17 @@ begin
   Fforward.Initialize(beginB - beginA, beginA, minK, maxK);
   Fbackward.Initialize(endB - endA, endA, minK, maxK);
 
-  // PERFORMANCE PATCH (OPT-4): dLimit = min(natural bound, hard cap).
-  natural := ((endA - beginA) + (endB - beginB) + 2) div 2;
-  if natural > MYERS_MAX_D then
-    dLimit := MYERS_MAX_D
+  // PERFORMANCE PATCH (OPT-4, gated): dLimit = min(natural bound, cap).
+  if OPT4_ENABLE_MYERS_D_CAP then
+  begin
+    natural := ((endA - beginA) + (endB - beginB) + 2) div 2;
+    if natural > MYERS_MAX_D then
+      dLimit := MYERS_MAX_D
+    else
+      dLimit := natural;
+  end
   else
-    dLimit := natural;
+    dLimit := High(Integer); // OPT-4 off: unbounded, exactly the original loop
 
   d := 1;
   while True do
@@ -2711,6 +2761,8 @@ begin
       // OPT-4: budget exhausted — give up on the middle snake and emit
       // the whole region as one REPLACE edit. CalculateEdits terminates
       // on this result (no smaller before/after parts are queued).
+      // NOTE: unreachable when OPT4_ENABLE_MYERS_D_CAP = False, because
+      // dLimit is then High(Integer) and the paths always meet first.
       Fedit.beginA := beginA;
       Fedit.endA := endA;
       Fedit.beginB := beginB;
