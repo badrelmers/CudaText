@@ -127,6 +127,50 @@
       inter-line gap (Editor.gap supports per-gap color + tag), the way
       WinMerge renders its "ignored differences". The same logic lives
       in cudadiffmyers.pas.
+
+ 11. PERFORMANCE PATCH (2026-08, private build) — two changes local to
+      this unit; the public interface (DoDiffTexts, TDiffOpcode) is
+      untouched. Background: profiling (Very Sleepy / callgrind) of two
+      ~2 MB files with many differences and heavily repeated text showed
+      ~68 s inside a single DoDiffTexts histogram call. The cost was NOT
+      algorithmic divergence from JGit — it was (a) every element
+      comparison in ScanA / TryLongestCommonSequence paying a 3-layer
+      virtual comparator stack (THashedSequenceComparator.Equals ->
+      TSubsequenceComparator.Equals -> TRawTextComparator*.Equals, each
+      with an `as` cast and range-checked Lines.Get calls) plus two more
+      virtual hops for every cached-hash read, and (b) no safety valve
+      for repeated text: maxChainLength only bails when a hash BUCKET
+      holds that many DISTINCT elements, which djb2+Knuth essentially
+      never produces, so 2..64x-repeated elements walked long
+      TRY_LOCATIONS occurrence chains with quadratic extension work.
+
+      OPT-1 (no behavior change — verified bit-identical against the
+      unpatched engine by a 4,200-case differential fuzz harness):
+      THistogramDiffIndex resolves, at construction, the wrapper chains
+      into flat references — cached line hashes are read via direct
+      pointers, and each region's line byte-spans are precomputed into
+      flat arrays — and the hot loops compare via hash gate + one call
+      to the new TRawTextComparator.EqualsSpans entry point (Equals of
+      both subclasses now only resolves the spans and delegates; the
+      comparison body is the previous Equals body, verbatim). When the
+      wrapper chain is not the expected one (no current code path can
+      produce that), every fast path falls back to the original FCmp
+      calls, so correctness never depends on the layout check.
+
+      OPT-2 (controlled divergence from JGit): ScanA additionally punts
+      the region to the fallback algorithm (Myers — the exact same
+      mechanism as the existing bucket-chain bail) when a single element
+      occurs more than maxChainLength times within the region, i.e. the
+      "too many equivalent elements to choose from" condition JGit's
+      guard was designed for, applied to occurrence counts instead of
+      hash collisions. Elements occurring up to maxChainLength+1 times
+      can still anchor under stock JGit rules, so results MAY differ
+      from stock JGit (and from this unit pre-patch) for regions that
+      contain >64x-repeated lines — those regions are diffed by the
+      Myers fallback instead. For all other inputs the output is
+      bit-identical (same fuzz harness). The guard compares the
+      MAX_CNT-saturated count, so maxChainLength >= 255 disables the
+      punt entirely (count saturates below the threshold).
 *)
 
 unit CudaDiffHistogram;
@@ -363,6 +407,18 @@ type
       begin = lines[lno+1], end = lines[lno+2]. }
     function Hash(seq: TSequence; ptr: Integer): Integer; override;
 
+    { PERFORMANCE PATCH (OPT-1): span-based equality entry point.
+      Compares byte ranges [aStart, aEnd) of ra and [bStart, bEnd) of rb
+      under the subclass's rules — exactly what Equals does after
+      resolving both lines' spans via Lines.Get (ai+1 / ai+2). The
+      histogram hot loops call this directly with precomputed spans to
+      skip the virtual comparator stack; Equals of each subclass now
+      delegates here, so the two entry points can never disagree.
+      Abstract like HashRegion — every concrete subclass must provide
+      it (only Default and WSIgnoreAll exist, see G31). }
+    function EqualsSpans(ra: TRawText; aStart, aEnd: Integer;
+      rb: TRawText; bStart, bEnd: Integer): Boolean; virtual; abstract;
+
     { Ported from RawTextComparator.reduceCommonStartEnd() (lines 231-282).
       Fast byte-level prefix/suffix trim, then super.reduceCommonStartEnd
       for the remaining line-level trim. }
@@ -376,6 +432,8 @@ type
   TRawTextComparatorDefault = class(TRawTextComparator)
   public
     function Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean; override;
+    function EqualsSpans(ra: TRawText; aStart, aEnd: Integer;
+      rb: TRawText; bStart, bEnd: Integer): Boolean; override;
     function HashRegion(raw: PByte; ptr, end_: Integer): Integer; override;
   end;
 
@@ -384,6 +442,8 @@ type
   TRawTextComparatorWSIgnoreAll = class(TRawTextComparator)
   public
     function Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean; override;
+    function EqualsSpans(ra: TRawText; aStart, aEnd: Integer;
+      rb: TRawText; bStart, bEnd: Integer): Boolean; override;
     function HashRegion(raw: PByte; ptr, end_: Integer): Integer; override;
   end;
 
@@ -534,7 +594,10 @@ type
     Extended Bram Cohen patience diff. Builds a histogram of occurrences
     for each element of A. Scans B for matching elements with the lowest
     occurrence count; splits region around that LCS, recurses. Falls back
-    to MyersDiff when maxChainLength (default 64) is exceeded. }
+    to MyersDiff when maxChainLength (default 64) is exceeded, and —
+    PERFORMANCE PATCH (OPT-2) — also when a single element occurs more
+    than maxChainLength times within a region (repeated-text safety
+    valve, see header note 11). }
   THistogramDiff = class(TLowLevelDiffAlgorithm)
   private
     FFallback: TDiffAlgorithm;
@@ -576,6 +639,11 @@ const
   HDI_REC_CNT_MASK   = (1 shl 8) - 1;
   HDI_MAX_PTR        = HDI_REC_PTR_MASK;
   HDI_MAX_CNT        = (1 shl 8) - 1;
+
+  { PERFORMANCE PATCH (OPT-1): Knuth multiplicative hash constant used by
+    THistogramDiffIndex.HashA / HashB (was a function-local const inside
+    the former Hash method). Same value as JGit's 0x9e370001. }
+  HDI_KNUTH_MULTIPLIER = $9E370001;
 
 { ------------------------------------------------------------------
   Helper functions — byte transforms for CASE/NUMBERS/EOL flags.
@@ -1298,8 +1366,11 @@ end;
   ------------------------------------------------------------------ }
 
 { Ported from RawTextComparator.DEFAULT.equals() (lines 27-44).
-  Compares byte ranges [lines[ai+1], lines[ai+2]) and [lines[bi+1], lines[bi+2])
-  for exact byte equality.
+  PERFORMANCE PATCH (OPT-1): thin span resolver — reads both lines' byte
+  spans from the line map and delegates to EqualsSpans, whose body is the
+  previous Equals body verbatim. Behavior is identical: the spans passed
+  down are exactly the as_/ae_/bs_/be_ values the old code computed via
+  Lines.Get(ai+1) / Lines.Get(ai+2) after the Inc(ai)/Inc(bi).
 
   With DIFF_IGN_CASE: applies ASCII tolower per byte (NOT Unicode folding).
   With DIFF_IGN_NUMBERS: skips digit bytes entirely (compares as if they
@@ -1308,21 +1379,29 @@ end;
 function TRawTextComparatorDefault.Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean;
 var
   ra, rb: TRawText;
+begin
+  ra := a as TRawText;
+  rb := b as TRawText;
+  Result := EqualsSpans(ra,
+    ra.Lines.Get(ai + 1), ra.Lines.Get(ai + 2),
+    rb, rb.Lines.Get(bi + 1), rb.Lines.Get(bi + 2));
+end;
+
+{ PERFORMANCE PATCH (OPT-1): former body of Equals (lines 27-44),
+  operating on caller-resolved byte spans. }
+function TRawTextComparatorDefault.EqualsSpans(ra: TRawText; aStart, aEnd: Integer;
+  rb: TRawText; bStart, bEnd: Integer): Boolean;
+var
   as_, bs, ae, be: Integer;
   aRaw, bRaw: PByte;
   ac, bc: Byte;
 begin
-  Inc(ai);
-  Inc(bi);
-  ra := a as TRawText;
-  rb := b as TRawText;
-  as_ := ra.Lines.Get(ai);
-  bs := rb.Lines.Get(bi);
-  ae := ra.Lines.Get(ai + 1);
-  be := rb.Lines.Get(bi + 1);
+  as_ := aStart;
+  bs := bStart;
+  ae := aEnd;
+  be := bEnd;
 
   // DIFF_IGN_EOL: trim trailing EOL from each line before comparing.
-  as_ := as_;  // (no-op, kept for symmetry with HashRegion)
   ae := TrimTrailingEOL(ra.ContentPtr, as_, ae, FFlags);
   be := TrimTrailingEOL(rb.ContentPtr, bs, be, FFlags);
 
@@ -1398,23 +1477,36 @@ end;
   Ignores all whitespace bytes. Trims trailing WS, then walks both lines
   in lockstep, skipping any WS bytes encountered.
 
+  PERFORMANCE PATCH (OPT-1): thin span resolver — reads both lines' byte
+  spans from the line map and delegates to EqualsSpans, whose body is the
+  previous Equals body verbatim.
+
   With CASE/NUMBERS: applies XformByte/IsSkippedByte in addition to
   the WS skipping. With EOL: trims trailing EOL before the WS trim. }
 function TRawTextComparatorWSIgnoreAll.Equals(a: TSequence; ai: Integer; b: TSequence; bi: Integer): Boolean;
 var
   ra, rb: TRawText;
+begin
+  ra := a as TRawText;
+  rb := b as TRawText;
+  Result := EqualsSpans(ra,
+    ra.Lines.Get(ai + 1), ra.Lines.Get(ai + 2),
+    rb, rb.Lines.Get(bi + 1), rb.Lines.Get(bi + 2));
+end;
+
+{ PERFORMANCE PATCH (OPT-1): former body of Equals (lines 58-92),
+  operating on caller-resolved byte spans. }
+function TRawTextComparatorWSIgnoreAll.EqualsSpans(ra: TRawText; aStart, aEnd: Integer;
+  rb: TRawText; bStart, bEnd: Integer): Boolean;
+var
   as_, bs, ae, be: Integer;
   aRaw, bRaw: PByte;
   ac, bc: Byte;
 begin
-  Inc(ai);
-  Inc(bi);
-  ra := a as TRawText;
-  rb := b as TRawText;
-  as_ := ra.Lines.Get(ai);
-  bs := rb.Lines.Get(bi);
-  ae := ra.Lines.Get(ai + 1);
-  be := rb.Lines.Get(bi + 1);
+  as_ := aStart;
+  bs := bStart;
+  ae := aEnd;
+  be := bEnd;
 
   ae := TrimTrailingEOL(ra.ContentPtr, as_, ae, FFlags);
   be := TrimTrailingEOL(rb.ContentPtr, bs, be, FFlags);
@@ -2457,7 +2549,15 @@ type
     THistogramDiffIndex — ported from diff/HistogramDiffIndex.java
     ----------------------------------------------------------------
     Computes occurrence counts of elements in a region of A, then scans B
-    for the longest common subsequence with the lowest occurrence count. }
+    for the longest common subsequence with the lowest occurrence count.
+
+    PERFORMANCE PATCH (OPT-1): the hot loops (ScanA /
+    TryLongestCommonSequence) compare elements and hash them through the
+    flattened FFlat state below instead of the 3-layer virtual comparator
+    stack. PERFORMANCE PATCH (OPT-2): ScanA bails to the fallback
+    algorithm not only for over-long hash-bucket chains (JGit behavior)
+    but also when a single element occurs more than maxChainLength times
+    in the region (repeated-text safety valve). See header note 11. }
   THistogramDiffIndex = class
   private
     FMaxChainLength: Integer;
@@ -2486,10 +2586,58 @@ type
     Fcnt: Integer;
     FhasCommon: Boolean;
 
-    { Ported from HistogramDiffIndex.hash() (lines 276-278).
-      Knuth multiplicative hash: (cmp.hash(s, idx) * $9E370001) >>> keyShift.
-      Wraps on overflow intentionally (G10). }
-    function Hash(s: THashedSequence; idx: Integer): Integer;
+    { ---------- PERFORMANCE PATCH (OPT-1): flattened hot-path state -----
+      Resolved once in the constructor when the wrapper chains are the
+      expected ones (THashedSequence -> TSubsequence -> TRawText and
+      THashedSequenceComparator -> TSubsequenceComparator ->
+      TRawTextComparator — the only structure DoDiffTexts ever builds).
+      All hot-loop helpers below check FFlat and fall back to the
+      original FCmp calls when it is False, so correctness never
+      depends on the layout check. }
+
+    { True when the flat references below are valid. }
+    FFlat: Boolean;
+
+    { Innermost real comparator (what the TSubsequenceComparator wraps).
+      NOT owned by the index — it outlives it. }
+    FBaseCmp: TRawTextComparator;
+
+    { Underlying raw texts and their subsequence begin offsets: element i
+      of Fa/Fb is base line (FAoff + i) / (BFoff + i) of FAraw/FBraw. }
+    FAraw, FBraw: TRawText;
+    FAoff, BFoff: Integer;
+
+    { Direct views of Fa.FHashes / Fb.FHashes (cached line hashes).
+      Non-nil whenever the respective sequence is non-empty; the hot
+      loops only dereference the pointer of a sequence they have already
+      established to be non-empty (ScanA only runs for a non-empty A
+      region, TryLongestCommonSequence only for a non-empty B region,
+      and EqualsAB is only reached when records exist => A non-empty). }
+    FAhashPtr, FBhashPtr: PInteger;
+
+    { Per-region line byte spans (start/end offsets into FAraw/FBraw
+      content), region-relative:
+        A span at raw index i -> FAs/FAe[i - FptrShift]
+        B span at raw index j -> FBs/FBe[j - FRegion.beginB]
+      Filled for exactly the indices the hot loops can touch. }
+    FAs, FAe: array of Integer;
+    FBs, FBe: array of Integer;
+
+    { Table hash for element idx of A / B: Knuth multiplicative mix of
+      the cached line hash. Ported from HistogramDiffIndex.hash()
+      (lines 276-278): (cmp.hash(s, idx) * $9E370001) >>> keyShift,
+      wrapping on overflow intentionally (G10). }
+    function HashA(idx: Integer): Integer;
+    function HashB(idx: Integer): Integer;
+
+    { Flattened FCmp.Equals(Fa, ai, Fb/Fa, bi): cached-hash gate first
+      (exactly what THashedSequenceComparator.equals does), then a
+      single span-based comparison through FBaseCmp.EqualsSpans with the
+      offsets Equals would have resolved (exactly what the wrapped
+      TSubsequenceComparator -> TRawTextComparator.Equals chain does). }
+    function EqualsAA(ai, aj: Integer): Boolean;
+    function EqualsAB(ai, bi: Integer): Boolean;
+
     class function RecCreate(nextRec, ptr, cnt: Integer): Int64; static; inline;
     class function RecNext(rec: Int64): Integer; static; inline;
     class function RecPtr(rec: Int64): Integer; static; inline;
@@ -2556,9 +2704,13 @@ constructor THistogramDiffIndex.Create(maxChainLength: Integer;
   cmp: THashedSequenceComparator;
   a, b: THashedSequence;
   const r: TEdit);
-{ Ported from HistogramDiffIndex constructor (lines 114-135). }
+{ Ported from HistogramDiffIndex constructor (lines 114-135).
+  PERFORMANCE PATCH (OPT-1): also resolves the flattened hot-path
+  references (see the FFlat block in the class declaration). }
 var
   sz, tb: Integer;
+  i, bsz: Integer;
+  aSub, bSub: TSubsequence;
 begin
   inherited Create;
   FMaxChainLength := maxChainLength;
@@ -2582,16 +2734,133 @@ begin
     SetLength(Frecs, 4);
   SetLength(Fnext, sz);
   SetLength(FrecIdx, sz);
+
+  { ---- PERFORMANCE PATCH (OPT-1): resolve flattened hot-path state ----
+    Expected wrapper chains (the only ones DoDiffTexts builds):
+      Fa/Fb : THashedSequence -> TSubsequence -> TRawText
+      FCmp  : THashedSequenceComparator -> TSubsequenceComparator ->
+              TRawTextComparator
+    If anything doesn't match, FFlat stays False and every hot-loop
+    helper falls back to the original FCmp virtual calls. }
+  FFlat := False;
+  FBaseCmp := nil;
+  FAraw := nil;
+  FBraw := nil;
+  FAoff := 0;
+  BFoff := 0;
+  FAhashPtr := nil;
+  FBhashPtr := nil;
+  if (FCmp.Cmp is TSubsequenceComparator)
+    and (TSubsequenceComparator(FCmp.Cmp).Cmp is TRawTextComparator)
+    and (Fa.Base is TSubsequence)
+    and (Fb.Base is TSubsequence) then
+  begin
+    aSub := TSubsequence(Fa.Base);
+    bSub := TSubsequence(Fb.Base);
+    if (aSub.Base is TRawText) and (bSub.Base is TRawText) then
+    begin
+      FBaseCmp := TRawTextComparator(TSubsequenceComparator(FCmp.Cmp).Cmp);
+      FAraw := TRawText(aSub.Base);
+      FBraw := TRawText(bSub.Base);
+      FAoff := aSub.BeginOffset;
+      BFoff := bSub.BeginOffset;
+
+      { Direct views of the cached line hashes (arrays are stable after
+        THashedSequence.Create; the sequences outlive the index). }
+      if Length(Fa.FHashes) > 0 then
+        FAhashPtr := @Fa.FHashes[0];
+      if Length(Fb.FHashes) > 0 then
+        FBhashPtr := @Fb.FHashes[0];
+
+      { Precompute this region's line byte spans, stored REGION-RELATIVE:
+        raw element i of the subsequence is base line (FAoff + i) — note
+        the region begin is NOT part of FAoff, regions are in subsequence
+        coordinates — so its span is [Lines.Get(FAoff + i + 1),
+        Lines.Get(FAoff + i + 2)). We store it at index (i - beginA)
+        (= i - FptrShift), which is exactly how the hot loops address the
+        arrays (FAs[ai - FptrShift]). These are the same offsets
+        TRawTextComparatorDefault.Equals resolves per call in the
+        unpatched engine, after TSubsequenceComparator adds the begin
+        offset. }
+      SetLength(FAs, sz);
+      SetLength(FAe, sz);
+      for i := 0 to sz - 1 do
+      begin
+        FAs[i] := FAraw.Lines.Get(FAoff + FptrShift + i + 1);
+        FAe[i] := FAraw.Lines.Get(FAoff + FptrShift + i + 2);
+      end;
+
+      bsz := FRegion.GetLengthB;
+      SetLength(FBs, bsz);
+      SetLength(FBe, bsz);
+      for i := 0 to bsz - 1 do
+      begin
+        FBs[i] := FBraw.Lines.Get(BFoff + FRegion.beginB + i + 1);
+        FBe[i] := FBraw.Lines.Get(BFoff + FRegion.beginB + i + 2);
+      end;
+
+      FFlat := True;
+    end;
+  end;
 end;
 
-function THistogramDiffIndex.Hash(s: THashedSequence; idx: Integer): Integer;
+{ PERFORMANCE PATCH (OPT-1): table hash of element idx of A.
+  Flattened form of the former Hash(Fa, idx): reads the cached line hash
+  directly instead of FCmp.Hash(Fa, idx) ->
+  THashedSequenceComparator.Hash -> THashedSequence.GetHash. }
+function THistogramDiffIndex.HashA(idx: Integer): Integer;
 {$PUSH}{$R-}{$Q-}
-const
-  KNUTH_MULTIPLIER = $9E370001;
 begin
-  Result := Integer(UInt32((UInt32(FCmp.Hash(s, idx)) * UInt32(KNUTH_MULTIPLIER))) shr FkeyShift);
+  if FFlat then
+    Result := Integer(UInt32(UInt32(FAhashPtr[idx]) * UInt32(HDI_KNUTH_MULTIPLIER)) shr FkeyShift)
+  else
+    Result := Integer(UInt32(UInt32(FCmp.Hash(Fa, idx)) * UInt32(HDI_KNUTH_MULTIPLIER)) shr FkeyShift);
 end;
 {$POP}
+
+{ PERFORMANCE PATCH (OPT-1): table hash of element idx of B (see HashA). }
+function THistogramDiffIndex.HashB(idx: Integer): Integer;
+{$PUSH}{$R-}{$Q-}
+begin
+  if FFlat then
+    Result := Integer(UInt32(UInt32(FBhashPtr[idx]) * UInt32(HDI_KNUTH_MULTIPLIER)) shr FkeyShift)
+  else
+    Result := Integer(UInt32(UInt32(FCmp.Hash(Fb, idx)) * UInt32(HDI_KNUTH_MULTIPLIER)) shr FkeyShift);
+end;
+{$POP}
+
+{ PERFORMANCE PATCH (OPT-1): flattened FCmp.Equals(Fa, ai, Fa, aj).
+  Semantically identical to the virtual chain:
+    THashedSequenceComparator.Equals(Fa, ai, Fa, aj)
+      = (Fa.FHashes[ai] = Fa.FHashes[aj])              <- hash gate
+        and TSubsequenceComparator.Equals(Fa.Base, ai, Fa.Base, aj)
+        = TRawTextComparator.Equals(FAraw, ai + FAoff, FAraw, aj + FAoff)
+        = EqualsSpans over the two lines' byte spans   <- what FAs/FAe hold.
+  Only called from ScanA with both indexes inside [beginA, endA). }
+function THistogramDiffIndex.EqualsAA(ai, aj: Integer): Boolean;
+begin
+  if FFlat then
+    Result := (FAhashPtr[ai] = FAhashPtr[aj])
+      and FBaseCmp.EqualsSpans(FAraw,
+           FAs[ai - FptrShift], FAe[ai - FptrShift],
+           FAraw, FAs[aj - FptrShift], FAe[aj - FptrShift])
+  else
+    Result := FCmp.Equals(Fa, ai, Fa, aj);
+end;
+
+{ PERFORMANCE PATCH (OPT-1): flattened FCmp.Equals(Fa, ai, Fb, bi) —
+  see EqualsAA. Only called from TryLongestCommonSequence with ai inside
+  [beginA, endA) and bi inside [beginB, endB). }
+function THistogramDiffIndex.EqualsAB(ai, bi: Integer): Boolean;
+begin
+  if FFlat then
+    Result := (FAhashPtr[ai] = FBhashPtr[bi])
+      and FBaseCmp.EqualsSpans(FAraw,
+           FAs[ai - FptrShift], FAe[ai - FptrShift],
+           FBraw, FBs[bi - FRegion.beginB], FBe[bi - FRegion.beginB])
+  else
+    Result := FCmp.Equals(Fa, ai, Fb, bi);
+end;
 
 class function THistogramDiffIndex.RecCreate(nextRec, ptr, cnt: Integer): Int64;
 begin
@@ -2642,7 +2911,17 @@ end;
 function THistogramDiffIndex.ScanA: Boolean;
 { Ported from HistogramDiffIndex.scanA() (lines 150-198).
   Scans A backwards, building the hash table. Returns False if any
-  chain exceeds maxChainLength (region should fall back to Myers). }
+  chain exceeds maxChainLength (region should fall back to Myers).
+
+  PERFORMANCE PATCH (OPT-1): table hash via HashA, element comparison
+  via the flattened EqualsAA — no virtual comparator stack per step.
+  PERFORMANCE PATCH (OPT-2): also returns False when a single element
+  occurs more than maxChainLength times in the region (after the
+  MAX_CNT saturation, so maxChainLength >= 255 disables the punt) —
+  the "too many equivalent elements to choose from" condition the
+  bucket-chain guard below was designed for, applied to occurrence
+  counts. Without it, heavily repeated text walks quadratic
+  TRY_LOCATIONS chains in TryLongestCommonSequence. See header note 11. }
 label
   SCAN;
 var
@@ -2654,18 +2933,23 @@ begin
   ptr := FRegion.endA - 1;
   while ptr >= FRegion.beginA do
   begin
-    tIdx := Hash(Fa, ptr);
+    tIdx := HashA(ptr);
     chainLen := 0;
     rIdx := Ftable[tIdx];
     while rIdx <> 0 do
     begin
       rec := Frecs[rIdx];
-      if FCmp.Equals(Fa, RecPtr(rec), Fa, ptr) then
+      if EqualsAA(RecPtr(rec), ptr) then
       begin
         // ptr is identical to another element. Insert onto front of existing chain.
         newCnt := RecCnt(rec) + 1;
         if newCnt > HDI_MAX_CNT then
           newCnt := HDI_MAX_CNT;
+        // PERFORMANCE PATCH (OPT-2): element too common to bother with —
+        // punt the region to the fallback algorithm, exactly like an
+        // over-long hash-bucket chain does below.
+        if newCnt > FMaxChainLength then
+          Exit(False);
         Frecs[rIdx] := RecCreate(RecNext(rec), ptr, newCnt);
         Fnext[ptr - FptrShift] := RecPtr(rec);
         FrecIdx[ptr - FptrShift] := rIdx;
@@ -2703,7 +2987,12 @@ end;
 function THistogramDiffIndex.TryLongestCommonSequence(bPtr: Integer): Integer;
 { Ported from HistogramDiffIndex.tryLongestCommonSequence() (lines 200-274).
   For each element of B starting at bPtr, scans A's hash chain for matches.
-  Tracks the longest LCS with the lowest occurrence count. }
+  Tracks the longest LCS with the lowest occurrence count.
+
+  PERFORMANCE PATCH (OPT-1): table hash via HashB, all element
+  comparisons via the flattened EqualsAB — each step is now a cached
+  integer hash compare plus (on gate pass) one span-based byte compare,
+  instead of three virtual calls with `as` casts per step. }
 var
   bNext: Integer;
   rIdx: Integer;
@@ -2714,7 +3003,7 @@ label
   TRY_LOCATIONS, BREAK_TRY;
 begin
   bNext := bPtr + 1;
-  rIdx := Ftable[Hash(Fb, bPtr)];
+  rIdx := Ftable[HashB(bPtr)];
   while rIdx <> 0 do
   begin
     rec := Frecs[rIdx];
@@ -2723,13 +3012,13 @@ begin
     if RecCnt(rec) > Fcnt then
     begin
       if not FhasCommon then
-        FhasCommon := FCmp.Equals(Fa, RecPtr(rec), Fb, bPtr);
+        FhasCommon := EqualsAB(RecPtr(rec), bPtr);
       rIdx := RecNext(rec);
       Continue;
     end;
 
     as_ := RecPtr(rec);
-    if not FCmp.Equals(Fa, as_, Fb, bPtr) then
+    if not EqualsAB(as_, bPtr) then
     begin
       rIdx := RecNext(rec);
       Continue;
@@ -2747,7 +3036,7 @@ begin
 
       // Extend backwards.
       while (FRegion.beginA < as_) and (FRegion.beginB < bs)
-            and FCmp.Equals(Fa, as_ - 1, Fb, bs - 1) do
+            and EqualsAB(as_ - 1, bs - 1) do
       begin
         Dec(as_);
         Dec(bs);
@@ -2760,7 +3049,7 @@ begin
 
       // Extend forwards.
       while (ae < FRegion.endA) and (be < FRegion.endB)
-            and FCmp.Equals(Fa, ae, Fb, be) do
+            and EqualsAB(ae, be) do
       begin
         if rc > 1 then
         begin
