@@ -11103,7 +11103,7 @@ end;
 
 
 
-//diff_proc(id, param1, param2, algo=0, flags=0)
+//diff_proc(id, param1, param2, algo=0, flags=0, callback=None)
 //Compares two texts and returns difflib-compatible opcodes.
 //  id: DIF_TEXTS (1) -- param1, param2 are raw text strings. The native
 //      engine splits them internally on \r\n / \r / \n (CRLF/CR/LF).
@@ -11111,193 +11111,433 @@ end;
 //  algo: DIFF_ALGO_MYERS (0) or DIFF_ALGO_HISTOGRAM (1).
 //        Ignored for DIF_CHARS (char diff always uses word-Myers + byte-trim).
 //  flags: bitmask of DIFF_IGN_* values (case/whitespace/numbers/etc).
-//Returns: list of (tag, i1, i2, j1, j2) tuples where tag is a lowercase
-//  string 'equal'/'delete'/'insert'/'replace'/'ignore'. Format matches
+//  callback: optional, enables the asynchronous mode.
+//      Without it (None/empty) the call is SYNCHRONOUS: it blocks until the
+//      compare is done and returns the opcode list. Plugin Python code
+//      always runs on the main GUI thread, so a big-file compare blocks the
+//      LCL message loop for the whole compare time -- the entire CudaText
+//      UI freezes (that was the original hang bug).
+//      With callback, the call is ASYNCHRONOUS: it returns True at once, the
+//      compare runs in a background OS thread (the diff engines are pure
+//      functions without shared state, so this is safe), CudaText stays
+//      responsive, and when the compare finishes, the callback is invoked
+//      on the main thread with one argument: def on_diff(opcodes).
+//      'opcodes' is the same list the synchronous form returns, or None if
+//      the compare failed (same error contract as the synchronous form).
+//      Accepted callback values:
+//        - string 'module_name.function_name', classic CudaText style,
+//          same as timer_proc callbacks (param is passed by name
+//          'opcodes', so the function must be def f(opcodes): ...);
+//        - any Python callable: function, lambda, bound method (param is
+//          passed positionally).
+//Returns: synchronous form -- list of (tag, i1, i2, j1, j2) tuples;
+//  asynchronous form -- True. Tag is a lowercase string
+//  'equal'/'delete'/'insert'/'replace'/'ignore'. Format matches
 //  difflib.SequenceMatcher.get_opcodes() exactly. 'ignore' is a CudaText
 //  extension tag: a real difference that DIFF_IGN_BLANK_LINES suppressed
 //  (an all-blank hunk) — ranges behave like 'replace', and consumers
 //  should render the region with a distinct color and compensate the
 //  length mismatch with Editor.gap() so lines below stay aligned.
+
+type
+  TPyDiffOpcode = record
+    Tag: Integer;
+    I1, I2, J1, J2: Integer;
+  end;
+  TPyDiffOpcodeArray = array of TPyDiffOpcode;
+
+{ Copy opcodes from the 3 diff engine units into the neutral type above.
+  The units intentionally declare their own TDiffOpcode records (G13),
+  so the copy is field-by-field; all 3 layouts are 5 integers. }
+procedure DiffOpcodesFromMyers(var ADest: TPyDiffOpcodeArray;
+  const ASrc: CudaDiffMyers.TDiffOpcodeArray);
+var
+  i: integer;
+begin
+  SetLength(ADest, Length(ASrc));
+  for i:= 0 to High(ASrc) do
+  begin
+    ADest[i].Tag:= ASrc[i].Tag;
+    ADest[i].I1:= ASrc[i].I1;
+    ADest[i].I2:= ASrc[i].I2;
+    ADest[i].J1:= ASrc[i].J1;
+    ADest[i].J2:= ASrc[i].J2;
+  end;
+end;
+
+procedure DiffOpcodesFromHistogram(var ADest: TPyDiffOpcodeArray;
+  const ASrc: CudaDiffHistogram.TDiffOpcodeArray);
+var
+  i: integer;
+begin
+  SetLength(ADest, Length(ASrc));
+  for i:= 0 to High(ASrc) do
+  begin
+    ADest[i].Tag:= ASrc[i].Tag;
+    ADest[i].I1:= ASrc[i].I1;
+    ADest[i].I2:= ASrc[i].I2;
+    ADest[i].J1:= ASrc[i].J1;
+    ADest[i].J2:= ASrc[i].J2;
+  end;
+end;
+
+procedure DiffOpcodesFromChars(var ADest: TPyDiffOpcodeArray;
+  const ASrc: CudaDiffChars.TDiffOpcodeArray);
+var
+  i: integer;
+begin
+  SetLength(ADest, Length(ASrc));
+  for i:= 0 to High(ASrc) do
+  begin
+    ADest[i].Tag:= ASrc[i].Tag;
+    ADest[i].I1:= ASrc[i].I1;
+    ADest[i].I2:= ASrc[i].I2;
+    ADest[i].J1:= ASrc[i].J1;
+    ADest[i].J2:= ASrc[i].J2;
+  end;
+end;
+
+{ Build the Python list of (tag, i1, i2, j1, j2) tuples.
+  Must be called on the main thread: it creates Python objects, so the
+  calling thread must own the Python GIL. }
+function DiffOpcodesToPyList(const AOpcodes: TPyDiffOpcodeArray): PPyObject;
+var
+  J: integer;
+  TagStr: string;
+begin
+  Result:= nil;
+  with AppPython.Engine do
+  begin
+    Result:= PyList_New(Length(AOpcodes));
+    if not Assigned(Result) then
+      raise EPythonError.Create(msgPythonListError);
+    for J:= 0 to High(AOpcodes) do
+    begin
+      case AOpcodes[J].Tag of
+        DIFF_TAG_EQUAL:   TagStr:= 'equal';
+        DIFF_TAG_DELETE:  TagStr:= 'delete';
+        DIFF_TAG_INSERT:  TagStr:= 'insert';
+        DIFF_TAG_REPLACE: TagStr:= 'replace';
+        DIFF_TAG_IGNORE:  TagStr:= 'ignore';
+        else              TagStr:= 'equal';
+      end;
+      PyList_SetItem(Result, J,
+        Py_BuildValue('(siiii)', PChar(TagStr),
+          AOpcodes[J].I1, AOpcodes[J].I2,
+          AOpcodes[J].J1, AOpcodes[J].J2));
+    end;
+  end;
+end;
+
+{ TCudaDiffThread -- runs one text compare in a background OS thread.
+
+  Threading model (same as CudaText core uses for TAppNotifThread and for
+  the lexer-parse progress notifications):
+  - Execute() performs the pure Pascal diff computation only: no LCL calls,
+    no console log calls (AppConsoleQueue behind MsgLogConsole is not
+    thread-safe), no Python API calls. The 3 diff engines keep all state
+    in per-call records, so they are safe to run on this thread.
+  - When done, Synchronize() marshals DoCallback() to the main thread and
+    waits. All Python work (building the result list, invoking the
+    callback, reference counting of the callback object) happens on the
+    main thread, because CudaText's Python engine is never used from
+    secondary threads.
+  - FreeOnTerminate is on: the object frees itself after Execute returns,
+    and Synchronize guarantees DoCallback has finished by then, so
+    DoCallback can safely use the object fields. }
+type
+  TCudaDiffThread = class(TThread)
+  private
+    FIdAction: Integer;
+    FAlgo: Integer;
+    FFlags: Integer;
+    FStr1: string;
+    FStr2: string;
+    FCallbackStr: string;      //non-empty: 'module.func' string callback
+    FCallbackObj: PPyObject;   //non-nil: Python callable, we own a strong ref
+    FOpcodes: TPyDiffOpcodeArray;
+    FErrorMessage: string;
+    procedure ComputeDiff;
+    procedure DoCallback; //main thread, via Synchronize
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AIdAction, AAlgo, AFlags: Integer;
+      const AStr1, AStr2, ACallbackStr: string;
+      ACallbackObj: PPyObject);
+  end;
+
+constructor TCudaDiffThread.Create(AIdAction, AAlgo, AFlags: Integer;
+  const AStr1, AStr2, ACallbackStr: string; ACallbackObj: PPyObject);
+begin
+  inherited Create(true{CreateSuspended});
+  FreeOnTerminate:= true;
+  FIdAction:= AIdAction;
+  FAlgo:= AAlgo;
+  FFlags:= AFlags;
+  FStr1:= AStr1;
+  FStr2:= AStr2;
+  FCallbackStr:= ACallbackStr;
+  FCallbackObj:= ACallbackObj;
+  //strong reference to the Python callable; released in DoCallback.
+  //constructor always runs on the main thread (called from api_diff_proc),
+  //so touching Python refcounts here is safe
+  if FCallbackObj<>nil then
+    AppPython.Engine.Py_INCREF(FCallbackObj);
+  Start;
+end;
+
+procedure TCudaDiffThread.ComputeDiff;
+var
+  OpcodesMyers: CudaDiffMyers.TDiffOpcodeArray;
+  OpcodesHistogram: CudaDiffHistogram.TDiffOpcodeArray;
+  OpcodesChars: CudaDiffChars.TDiffOpcodeArray;
+begin
+  FErrorMessage:= '';
+  try
+    case FIdAction of
+      DIF_TEXTS:
+        begin
+          //dispatch on algo, like the synchronous code path;
+          //unknown algo values silently fall back to Myers.
+          //CudaDiffHistogram.DoDiffTexts internally dispatches on AAlgo too
+          //(0=JGit Myers, 1=JGit Histogram). We ALWAYS pass AAlgo=1 so it
+          //runs HistogramDiff — JGit's standalone MyersDiff is slow and not
+          //exposed directly (it's only used as HistogramDiff's internal
+          //fallback for sub-regions, which is correct behavior).
+          if FAlgo=DIFF_ALGO_HISTOGRAM then
+          begin
+            OpcodesHistogram:= CudaDiffHistogram.DoDiffTexts(
+              FStr1, FStr2, {AAlgo=}DIFF_ALGO_HISTOGRAM, FFlags);
+            DiffOpcodesFromHistogram(FOpcodes, OpcodesHistogram);
+          end
+          else
+          begin
+            OpcodesMyers:= CudaDiffMyers.DoDiffTexts(
+              FStr1, FStr2, {AAlgo=}DIFF_ALGO_MYERS, FFlags);
+            DiffOpcodesFromMyers(FOpcodes, OpcodesMyers);
+          end;
+        end;
+      DIF_CHARS:
+        begin
+          //char-level diff: FAlgo is ignored — char diff always uses
+          //WinMerge's stringdiffs (ONP algorithm) internally
+          OpcodesChars:= CudaDiffChars.DoDiffChars(FStr1, FStr2, FFlags);
+          DiffOpcodesFromChars(FOpcodes, OpcodesChars);
+        end;
+    else
+      FErrorMessage:= 'diff_proc gets unknown id: '+IntToStr(FIdAction);
+    end;
+  except
+    on E: Exception do
+      FErrorMessage:= E.Message;
+  end;
+end;
+
+procedure TCudaDiffThread.Execute;
+begin
+  ComputeDiff;
+
+  //release the big input texts before the callback runs: the callback
+  //handler in the plugin usually makes its own copies of the compared
+  //data, so keeping FStr1/FStr2 alive here only wastes memory
+  FStr1:= '';
+  FStr2:= '';
+
+  if Application.Terminated then
+    exit;
+
+  //marshal the result to the main thread and wait until it is delivered;
+  //the object is freed (FreeOnTerminate) only after Synchronize returns
+  Synchronize(@DoCallback);
+end;
+
+procedure TCudaDiffThread.DoCallback;
+var
+  Obj, Params, Res: PPyObject;
+  SModule, SFunc: string;
+begin
+  if Application.Terminated then exit;
+  if not AppPython.Inited then exit;
+
+  if FErrorMessage<>'' then
+    MsgLogConsole('ERROR: diff_proc exception: '+FErrorMessage);
+
+  try
+    //result object passed to the callback: the opcode list, or None on
+    //error (the same contract the synchronous form of diff_proc has)
+    if FErrorMessage='' then
+      Obj:= DiffOpcodesToPyList(FOpcodes)
+    else
+      Obj:= AppPython.Engine.ReturnNone();
+
+    if not Assigned(Obj) then exit;
+    try
+      if FCallbackObj<>nil then
+      begin
+        //a Python callable was passed: call it as callback(opcodes)
+        with AppPython.Engine do
+        begin
+          Params:= PyTuple_New(1);
+          if Assigned(Params) then
+          try
+            Py_INCREF(Obj);
+            if PyTuple_SetItem(Params, 0, Obj)<>0 then
+              Py_DECREF(Obj); //SetItem failed, so it didn't steal our ref
+
+            try
+              MaskFPUExceptions(true); //the same TAppPython.MaskFPU does
+              Res:= PyObject_CallObject(FCallbackObj, Params);
+              if Res<>nil then
+                Py_DECREF(Res)
+              else
+                if PyErr_Occurred<>nil then
+                  CheckError(False);
+            except
+              on E: Exception do
+                MsgLogConsole('ERROR: diff_proc callback: '+E.Message);
+            end;
+          finally
+            Py_DECREF(Params);
+          end;
+        end;
+
+        //release the strong ref taken in the constructor; must be done on
+        //the main thread, which owns the Python GIL. (If the callback is
+        //never reached because the app is closing, the ref leaks — that
+        //only happens at shutdown and is harmless.)
+        AppPython.Engine.Py_DECREF(FCallbackObj);
+        FCallbackObj:= nil;
+      end
+      else
+      if FCallbackStr<>'' then
+      begin
+        //'module.func' string callback, the same style as timer_proc
+        //callbacks. 'opcodes' is passed as a named param, so the plugin
+        //function must be defined as: def on_diff(opcodes): ...
+        SSplitByChar(FCallbackStr, '.', SModule, SFunc);
+        if (SModule<>'') and (SFunc<>'') then
+          AppPython.RunModuleFunction(SModule, SFunc, [Obj], ['opcodes'])
+        else
+          MsgLogConsole('ERROR: diff_proc bad callback: '+FCallbackStr);
+      end;
+    finally
+      AppPython.Engine.Py_DECREF(Obj);
+    end;
+  except
+    on E: Exception do
+      MsgLogConsole('ERROR: diff_proc callback: '+E.Message);
+  end;
+end;
+
+//diff_proc implementation: with the callback argument it spawns
+//TCudaDiffThread and returns True at once; without it, the old
+//synchronous behavior is kept (small texts only)
 function api_diff_proc(Self, Args: PPyObject): PPyObject; cdecl;
 var
   IdAction: Integer;
   Ptr1, Ptr2: PChar;
   Str1, Str2: string;
   NAlgo, NFlags: Integer;
+  PtrCallback: PPyObject;
+  StrCallback: string;
+  ObjCallback: PPyObject;
+  Opcodes: TPyDiffOpcodeArray;
   OpcodesMyers: CudaDiffMyers.TDiffOpcodeArray;
   OpcodesHistogram: CudaDiffHistogram.TDiffOpcodeArray;
   OpcodesChars: CudaDiffChars.TDiffOpcodeArray;
-  TagStr: string;
-  TagPtr: PChar;
-
-  procedure BuildOpcodeListMyers(const AOpcodes: CudaDiffMyers.TDiffOpcodeArray);
-  var
-    J: Integer;
-    LTagStr: string;
-    LTagPtr: PChar;
-  begin
-    with AppPython.Engine do
-    begin
-      Result := PyList_New(Length(AOpcodes));
-      if not Assigned(Result) then
-        raise EPythonError.Create(msgPythonListError);
-      for J := 0 to High(AOpcodes) do
-      begin
-        case AOpcodes[J].Tag of
-          DIFF_TAG_EQUAL:   LTagStr := 'equal';
-          DIFF_TAG_DELETE:  LTagStr := 'delete';
-          DIFF_TAG_INSERT:  LTagStr := 'insert';
-          DIFF_TAG_REPLACE: LTagStr := 'replace';
-          DIFF_TAG_IGNORE:  LTagStr := 'ignore';
-          else              LTagStr := 'equal';
-        end;
-        LTagPtr := PChar(LTagStr);
-        PyList_SetItem(Result, J,
-          Py_BuildValue('(siiii)', LTagPtr,
-            AOpcodes[J].I1, AOpcodes[J].I2,
-            AOpcodes[J].J1, AOpcodes[J].J2));
-      end;
-    end;
-  end;
-
-  procedure BuildOpcodeListHistogram(const AOpcodes: CudaDiffHistogram.TDiffOpcodeArray);
-  var
-    J: Integer;
-    LTagStr: string;
-    LTagPtr: PChar;
-  begin
-    with AppPython.Engine do
-    begin
-      Result := PyList_New(Length(AOpcodes));
-      if not Assigned(Result) then
-        raise EPythonError.Create(msgPythonListError);
-      for J := 0 to High(AOpcodes) do
-      begin
-        case AOpcodes[J].Tag of
-          DIFF_TAG_EQUAL:   LTagStr := 'equal';
-          DIFF_TAG_DELETE:  LTagStr := 'delete';
-          DIFF_TAG_INSERT:  LTagStr := 'insert';
-          DIFF_TAG_REPLACE: LTagStr := 'replace';
-          DIFF_TAG_IGNORE:  LTagStr := 'ignore';
-          else              LTagStr := 'equal';
-        end;
-        LTagPtr := PChar(LTagStr);
-        PyList_SetItem(Result, J,
-          Py_BuildValue('(siiii)', LTagPtr,
-            AOpcodes[J].I1, AOpcodes[J].I2,
-            AOpcodes[J].J1, AOpcodes[J].J2));
-      end;
-    end;
-  end;
-
-  procedure BuildOpcodeListChars(const AOpcodes: CudaDiffChars.TDiffOpcodeArray);
-  var
-    J: Integer;
-    LTagStr: string;
-    LTagPtr: PChar;
-  begin
-    with AppPython.Engine do
-    begin
-      Result := PyList_New(Length(AOpcodes));
-      if not Assigned(Result) then
-        raise EPythonError.Create(msgPythonListError);
-      for J := 0 to High(AOpcodes) do
-      begin
-        case AOpcodes[J].Tag of
-          DIFF_TAG_EQUAL:   LTagStr := 'equal';
-          DIFF_TAG_DELETE:  LTagStr := 'delete';
-          DIFF_TAG_INSERT:  LTagStr := 'insert';
-          DIFF_TAG_REPLACE: LTagStr := 'replace';
-          DIFF_TAG_IGNORE:  LTagStr := 'ignore';  // DIF_TEXTS only — chars never emits it
-          else              LTagStr := 'equal';
-        end;
-        LTagPtr := PChar(LTagStr);
-        PyList_SetItem(Result, J,
-          Py_BuildValue('(siiii)', LTagPtr,
-            AOpcodes[J].I1, AOpcodes[J].I2,
-            AOpcodes[J].J1, AOpcodes[J].J2));
-      end;
-    end;
-  end;
-
 begin
-  NAlgo := DIFF_ALGO_MYERS;
-  NFlags := 0;
+  NAlgo:= DIFF_ALGO_MYERS;
+  NFlags:= 0;
+  PtrCallback:= nil;
 
   with AppPython.Engine do
   begin
-    Result := ReturnNone;
+    Result:= ReturnNone;
 
-    if not Bool(PyArg_ParseTuple(Args, 'iss|ii:diff_proc',
-      @IdAction, @Ptr1, @Ptr2, @NAlgo, @NFlags)) then
+    if not Bool(PyArg_ParseTuple(Args, 'iss|iiO:diff_proc',
+      @IdAction, @Ptr1, @Ptr2, @NAlgo, @NFlags, @PtrCallback)) then
       Exit;
 
-    Str1 := string(Ptr1);
-    Str2 := string(Ptr2);
+    Str1:= string(Ptr1);
+    Str2:= string(Ptr2);
 
-    // Wrap the diff in try/except so that if the native code crashes
-    // (e.g. access violation from an edge case), CudaText doesn't crash.
-    // Instead, return None — the Python caller (Differ plugin) handles
-    // None by falling back to a single REPLACE covering everything.
+    //fail fast on unknown action id, both for sync and async forms
+    if (IdAction<>DIF_TEXTS) and (IdAction<>DIF_CHARS) then
+    begin
+      MsgLogConsole('ERROR: diff_proc gets unknown id: '+IntToStr(IdAction));
+      Exit(ReturnNone);
+    end;
+
+    //the optional 6th argument selects the async mode: either a string
+    //'module.func' or any Python callable
+    StrCallback:= '';
+    ObjCallback:= nil;
+    if Assigned(PtrCallback) and (Pointer(PtrCallback)<>Pointer(Py_None)) then
+    begin
+      if PtrCallback^.ob_type=PyUnicode_Type then
+        StrCallback:= string(PyUnicodeAsUTF8String(PtrCallback))
+      else
+      if PyCallable_Check(PtrCallback)<>0 then
+        ObjCallback:= PtrCallback
+      else
+      begin
+        MsgLogConsole('ERROR: diff_proc callback must be a str "module.func" or a callable');
+        Exit(ReturnNone);
+      end;
+    end;
+
+    //asynchronous mode: run the compare in a background OS thread and
+    //return True at once, so the app keeps processing UI messages
+    if (StrCallback<>'') or Assigned(ObjCallback) then
+    begin
+      TCudaDiffThread.Create(IdAction, NAlgo, NFlags, Str1, Str2,
+        StrCallback, ObjCallback);
+      Exit(ReturnTrue);
+    end;
+
+    //synchronous mode: blocks until the compare is done; use it for small
+    //texts only, big files must use the callback form to not freeze the UI
     try
       case IdAction of
         DIF_TEXTS:
           begin
-            // Dispatch on NAlgo to the correct engine.
-            // DIFF_ALGO_MYERS (0)    → CudaDiffMyers    (GNU diffutils Myers, fast)
-            // DIFF_ALGO_HISTOGRAM (1) → CudaDiffHistogram (JGit HistogramDiff)
-            //
-            // CudaDiffHistogram.DoDiffTexts internally dispatches on AAlgo too
-            // (0=JGit Myers, 1=JGit Histogram). We ALWAYS pass AAlgo=1 so it
-            // runs HistogramDiff — JGit's standalone MyersDiff is slow and not
-            // exposed directly (it's only used as HistogramDiff's internal
-            // fallback for sub-regions, which is correct behavior).
-            case NAlgo of
-              DIFF_ALGO_HISTOGRAM:
-                begin
-                  OpcodesHistogram := CudaDiffHistogram.DoDiffTexts(
-                    Str1, Str2, {AAlgo=}DIFF_ALGO_HISTOGRAM, NFlags);
-                  BuildOpcodeListHistogram(OpcodesHistogram);
-                end;
-              DIFF_ALGO_MYERS:
-                begin
-                  OpcodesMyers := CudaDiffMyers.DoDiffTexts(
-                    Str1, Str2, {AAlgo=}DIFF_ALGO_MYERS, NFlags);
-                  BuildOpcodeListMyers(OpcodesMyers);
-                end;
+            //dispatch on NAlgo to the correct engine.
+            //DIFF_ALGO_MYERS (0)    -> CudaDiffMyers    (GNU diffutils Myers, fast)
+            //DIFF_ALGO_HISTOGRAM (1) -> CudaDiffHistogram (JGit HistogramDiff)
+            if NAlgo=DIFF_ALGO_HISTOGRAM then
+            begin
+              OpcodesHistogram:= CudaDiffHistogram.DoDiffTexts(
+                Str1, Str2, {AAlgo=}DIFF_ALGO_HISTOGRAM, NFlags);
+              DiffOpcodesFromHistogram(Opcodes, OpcodesHistogram);
+            end
             else
-              begin
-                // Default to WinMerge Myers for any unrecognized NAlgo value.
-                // Log a warning: NAlgo was neither DIFF_ALGO_MYERS (0) nor
-                // DIFF_ALGO_HISTOGRAM (1).
-                MsgLogConsole('WARNING: diff_proc got unknown algo ' +
-                  IntToStr(NAlgo) + ', defaulting to Myers');
-                OpcodesMyers := CudaDiffMyers.DoDiffTexts(
-                  Str1, Str2, {AAlgo=}DIFF_ALGO_MYERS, NFlags);
-                BuildOpcodeListMyers(OpcodesMyers);
-              end;
+            begin
+              if NAlgo<>DIFF_ALGO_MYERS then
+                MsgLogConsole('WARNING: diff_proc got unknown algo '+
+                  IntToStr(NAlgo)+', defaulting to Myers');
+              OpcodesMyers:= CudaDiffMyers.DoDiffTexts(
+                Str1, Str2, {AAlgo=}DIFF_ALGO_MYERS, NFlags);
+              DiffOpcodesFromMyers(Opcodes, OpcodesMyers);
             end;
+            Result:= DiffOpcodesToPyList(Opcodes);
           end;
         DIF_CHARS:
-        begin
-          // Char-level diff. NAlgo is ignored — char diff always uses
-          // WinMerge's stringdiffs (ONP algorithm) internally.
-          OpcodesChars := CudaDiffChars.DoDiffChars(Str1, Str2, NFlags);
-          BuildOpcodeListChars(OpcodesChars);
-        end;
-      else
-        begin
-          MsgLogConsole('ERROR: diff_proc gets unknown id: ' + IntToStr(IdAction));
-          Exit(ReturnNone);
-        end;
-    end;
+          begin
+            //char-level diff. NAlgo is ignored — char diff always uses
+            //WinMerge's stringdiffs (ONP algorithm) internally.
+            OpcodesChars:= CudaDiffChars.DoDiffChars(Str1, Str2, NFlags);
+            DiffOpcodesFromChars(Opcodes, OpcodesChars);
+            Result:= DiffOpcodesToPyList(Opcodes);
+          end;
+      end;
     except
       on E: Exception do
       begin
-        // Log the error and return None. The Python caller handles None
-        // by falling back to a single REPLACE (marks the whole region as
-        // changed). This prevents CudaText from crashing on edge cases.
-        MsgLogConsole('ERROR: diff_proc exception: ' + E.Message);
+        //log the error and return None. The Python caller handles None
+        //by falling back to a single REPLACE (marks the whole region as
+        //changed). This prevents CudaText from crashing on edge cases.
+        MsgLogConsole('ERROR: diff_proc exception: '+E.Message);
         Exit(ReturnNone);
       end;
     end;

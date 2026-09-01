@@ -1407,8 +1407,32 @@ def dlg_proc(id_dialog, id_action, prop='', index=-1, index2=-1, name=''):
 def finder_proc(id_finder, id_action, value="", setcaret=True):
     return ct.finder_proc(id_finder, id_action, to_str(value), setcaret)
 
-def diff_proc(id, param1, param2, algo=0, flags=0):
-    return ct.diff_proc(id, param1, param2, algo, flags)
+def diff_proc(id, param1, param2, algo=0, flags=0, callback=None):
+    """
+    Compares two texts, returns difflib-compatible opcodes.
+
+    id: DIF_TEXTS -- param1/param2 are raw texts (split on CRLF/CR/LF inside
+    the native engine); DIF_CHARS -- param1/param2 are compared at char level.
+    algo: DIFF_ALGO_MYERS (default) or DIFF_ALGO_HISTOGRAM, DIF_TEXTS only.
+    flags: bitmask of DIFF_IGN_* constants.
+
+    Without `callback` (default) the call is synchronous: it blocks until
+    the compare finishes and returns a list of
+    (tag, i1, i2, j1, j2) tuples, tag being 'equal'/'delete'/'insert'/
+    'replace'/'ignore'; returns None on error. Warning: plugin Python code
+    runs on the main GUI thread, so a long compare freezes CudaText --
+    use this form for small texts only.
+
+    With `callback` the call is asynchronous: it returns True at once and
+    the compare runs in a background thread, so CudaText stays responsive.
+    When the compare finishes, `callback` runs on the main thread with a
+    single argument `opcodes`, holding the same list the synchronous form
+    returns (None on error):
+        def on_diff(opcodes): ...
+    `callback` can be a string 'module_name.function_name' or any Python
+    callable (function, lambda, bound method).
+    """
+    return ct.diff_proc(id, param1, param2, algo, flags, callback)
 
 
 def esc_z(s):

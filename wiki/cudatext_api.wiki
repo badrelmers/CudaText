@@ -2323,9 +2323,9 @@ Possible values of "id_action":
 
 ===diff_proc===
 
- diff_proc(id, param1, param2, algo=0, flags=0)
+ diff_proc(id, param1, param2, algo=0, flags=0, callback=None)
 
-Compares two texts using the built-in native diff engine. DIF_TEXTS offers two line-diff algorithms: DIFF_ALGO_MYERS uses a Free Pascal port of WinMerge's bundled GNU diffutils Myers O(ND) engine, with the Eggert TOO_EXPENSIVE heuristic always enabled. DIFF_ALGO_HISTOGRAM uses a Free Pascal port of JGit's Histogram Diff, which internally falls back to JGit's Myers O(ND) Diff for sub-regions. DIF_CHARS uses a Free Pascal port of WinMerge’s character-diff engine, combining Myers O(NP) with custom heuristics and optimizations. Returns difflib-compatible opcodes - the same format as Python's <code>difflib.SequenceMatcher.get_opcodes()</code>.
+Compares two texts using the built-in native diff engine. DIF_TEXTS offers two line-diff algorithms: DIFF_ALGO_MYERS uses a Free Pascal port of WinMerge's bundled GNU diffutils Myers O(ND) engine, with the Eggert TOO_EXPENSIVE heuristic always enabled. DIFF_ALGO_HISTOGRAM uses a Free Pascal port of JGit's Histogram Diff, which internally falls back to JGit's Myers O(ND) Diff for sub-regions. DIF_CHARS uses a Free Pascal port of WinMerge’s character-diff engine, combining Myers O(NP) with custom heuristics and optimizations. Returns difflib-compatible opcodes - the same format as Python's <code>difflib.SequenceMatcher.get_opcodes()</code>. The call comes in two forms: synchronous (callback omitted) and asynchronous (callback given) - the asynchronous form runs the compare on a background thread, so a plugin can diff big files without freezing the CudaText UI.
 
 Param "id" specifies the action:
 
@@ -2349,7 +2349,40 @@ Param "flags" is a bitmask of ignore options (combine with <code>|</code>). The 
 * DIFF_IGN_NUMBERS (8): Digit runs treated as equal (useful for comparing logs with timestamps). Only ASCII <code>0-9</code> count; non-ASCII digits are not affected. DIF_TEXTS: digit bytes are skipped entirely when lines are hashed and compared, so <code>12:34:56.789</code> matches <code>12:34:56.790</code>. Digit runs of different lengths also match in BOTH algorithms: <code>"v2"</code> equals <code>"v10"</code> and even <code>"v"</code>, and <code>"v12.45 11:13:45"</code> equals <code>"v22.4 12:23:4"</code> (this requires the equivalence-class machinery to accept different raw line lengths - both engines do). DIF_CHARS: digit runs are tokenized as number tokens, all number tokens compare equal regardless of value, pure number-token changes are dropped from the output, and the byte-level refinement skips digit code points - so digits are never highlighted inside changed lines (<code>"aaa 666666 tttttdd"</code> vs <code>"aaa 33333 ttttt"</code> highlights only <code>"dd"</code>). Digit-run word-boundary changes (<code>"a12x"</code> vs <code>"ax"</code>) are also merged and refined away - no highlights.
 * DIFF_IGN_BLANK_LINES (16): Changes whose lines are all blank are ignored - like GNU <code>diff -B</code> and WinMerge's "Ignore blank lines". DIF_TEXTS only (the flag has no effect on DIF_CHARS, which never emits <code>'ignore'</code>). A hunk (delete/insert/replace) is suppressed when EVERY line of BOTH of its ranges is blank. A line is blank when it is empty (after its line terminator), or - when DIFF_IGN_WHITESPACE is also set - consists only of spaces/tabs (space-only lines are NOT blank without DIFF_IGN_WHITESPACE, matching GNU <code>diff -B</code> vs <code>diff -B -b</code>). Suppressed hunks are returned as <code>'ignore'</code> opcodes instead of disappearing: <code>'equal'</code> opcodes always keep <code>i2-i1 == j2-j1</code>, so 1:1 pairing consumers stay correct, and the <code>'ignore'</code> ranges tell the UI exactly what was suppressed - render them with a distinct color and a compensating gap (<code>Editor.gap()</code> supports several gaps per line, each with its own color and tag) so lines below stay aligned, the way WinMerge paints its "ignored differences".
 
-Returns: list of 5-tuples <code>(tag, i1, i2, j1, j2)</code> where:
+Param "callback" selects the synchronous or the asynchronous form of the call:
+
+* None (default): synchronous. The call blocks until the compare is done and returns the opcode list. Plugin Python code always runs on the main GUI thread, so a big-file compare blocks the whole CudaText UI for the compare time - use this form for small texts only.
+* A callback value: asynchronous. The compare starts on a background OS thread and the call returns True at once, so CudaText keeps processing UI messages and stays fully responsive - the user can keep typing, scrolling and using menus while the compare runs. When the compare finishes, the callback is invoked on the main thread with a single argument: the opcode list - the same list the synchronous form returns, or None when the compare failed (the same error contract). Accepted callback values:
+** A string <code>"module_name.function_name"</code>, the classic CudaText style used by <code>timer_proc</code> callbacks. The opcode list is passed as the named parameter <code>opcodes</code>, so the function must be defined as: <code>def on_diff(opcodes): ...</code>.
+** Any Python callable: function, lambda, bound method, <code>functools.partial</code> object. The opcode list is passed positionally: <code>callback(opcodes)</code>.
+
+Notes on the asynchronous form:
+
+* Several compares can run at the same time: every call with a callback starts its own background thread. The diff engines are pure functions without shared state, so concurrent compares are safe; each thread works on its own copies of the input strings.
+* The engine holds a strong reference to a callable callback until it fires, so closures and bound methods stay alive even when nothing else references them.
+* The callback always runs on the main thread (the result is marshalled there before your function is called), so it can safely use any CudaText API, including Editor methods - the same guarantee <code>timer_proc</code> callbacks have.
+* When the application is closing at the moment the compare finishes, the callback may be skipped.
+* If the engine cannot start the background compare, the call returns None (not True) - treat that as a signal to retry with the synchronous form.
+* DIF_CHARS accepts the callback too, but a single char-level compare is fast (the engine bails out at 20480 tokens / 500ms), so the synchronous form is usually enough there; the background form matters for DIF_TEXTS on big files.
+
+Example - comparing two big texts in the background:
+
+{{{
+def on_diff(opcodes):
+    if opcodes is None:
+        cudatext.msg_status('Compare failed')
+        return
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag != 'equal':
+            print('diff:', tag, i1, i2, j1, j2)
+
+cudatext.diff_proc(cudatext.DIF_TEXTS, text1, text2,
+                   cudatext.DIFF_ALGO_HISTOGRAM,
+                   cudatext.DIFF_IGN_NONE,
+                   'my_plugin.on_diff')
+}}}
+
+Returns: in the synchronous form (callback is None), a list of 5-tuples <code>(tag, i1, i2, j1, j2)</code> where:
 
 * <code>tag</code> is a lowercase string: <code>'equal'</code>, <code>'delete'</code>, <code>'insert'</code>, <code>'replace'</code>, or <code>'ignore'</code> (CudaText extension, DIF_TEXTS + DIFF_IGN_BLANK_LINES only).
 * <code>i1, i2</code> is a half-open range into the first text (param1).
@@ -2357,6 +2390,8 @@ Returns: list of 5-tuples <code>(tag, i1, i2, j1, j2)</code> where:
 * Adjacent tuples share boundaries; the first starts at <code>(0, 0)</code>; the last ends at <code>(len(param1), len(param2))</code>.
 
 For DIF_TEXTS, offsets are line indices. For DIF_CHARS, offsets are character (code point) indices - equivalent to Python's <code>str</code> indexing, NOT byte indices.
+
+In the asynchronous form (callback given), the call returns True right after the background compare is started (or None when the background compare could not be started) - the opcode list itself is delivered to the callback, never returned.
 
 Empty-input behavior (both DIF_TEXTS and DIF_CHARS): both texts empty <code>""</code> vs <code>""</code> returns <code>[]</code> (zero opcodes). One empty returns a single <code>('insert', 0, 0, 0, N)</code> or <code>('delete', 0, N, 0, 0)</code>. Both non-empty and identical returns a single <code>('equal', 0, N, 0, N)</code>.
 
