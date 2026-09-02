@@ -375,7 +375,51 @@ type
 
 function DoDiffTexts(const ATextA, ATextB: string; AAlgo: Integer; AFlags: Integer): TDiffOpcodeArray;
 
+{ ------------------------------------------------------------------
+  Cooperative cancellation (diff_proc DIF_CANCEL)
+  ------------------------------------------------------------------
+  The background diff thread in formmain_py_api.inc (TCudaDiffThread)
+  points this threadvar at its cancel flag before calling DoDiffTexts,
+  and nils it afterwards. The engine's long-running loops poll the flag
+  at coarse granularity (per outer-loop step); when it is set they raise
+  EDiffCancelled.
+
+  The exception unwinds the Pascal stack: FPC runs every try/finally
+  block and finalizes every refcounted string / dynamic array on the
+  way out, so all intermediate state (buffers, linbuf, equivs hash,
+  fdiag/bdiag vectors) is released -- nothing leaks. This is why the
+  cancellation is cooperative instead of a forced thread kill: a killed
+  thread skips the unwinding, leaking its stack, its heap blocks and
+  any heap lock it held at kill time.
+
+  Each unit (CudaDiffMyers / CudaDiffHistogram / CudaDiffChars) declares
+  its own threadvar, so several background compares can run at once and
+  cancelling one job never touches the others. Synchronous calls run on
+  the main thread, whose threadvar stays nil -- they are never
+  cancelled. }
+type
+  EDiffCancelled = class(Exception);
+
+threadvar
+  { nil = no cancellation requested for the current thread's diff }
+  DiffCancelFlag: PBoolean;
+
 implementation
+
+{ ==================================================================
+  Section 0: Cooperative-cancellation poll (diff_proc DIF_CANCEL)
+  ================================================================== }
+
+{ Poll the cancellation flag of the calling thread's diff job; raises
+  EDiffCancelled when diff_proc(DIF_CANCEL) was called for that job.
+  Called from the engine's outer loops at coarse granularity, so the
+  cost is one nil-check per loop step. nil means "no diff thread / no
+  cancellation" -- synchronous callers never cancel. }
+procedure DiffCheckCancelled; inline;
+begin
+  if (DiffCancelFlag <> nil) and DiffCancelFlag^ then
+    raise EDiffCancelled.Create('diff cancelled');
+end;
 
 { ==================================================================
   Section 1: Byte-level helpers (io.c, util.c)
@@ -661,6 +705,9 @@ begin
     EndPtr := Buf + BufLen;
     while R < EndPtr do
     begin
+      { Cooperative-cancellation poll: O(bytes) EOL-normalization pass }
+      if ((R - Buf) and $FFFF) = 0 then
+        DiffCheckCancelled;
       if R^ = $0D then  { \r }
       begin
         W^ := $0A;     { write \n }
@@ -731,6 +778,9 @@ begin
   P1 := Buf1;
   while (P0 < Buf0 + N0) and (P1 < Buf1 + N1) and (P0^ = P1^) do
   begin
+    { Cooperative-cancellation poll: O(bytes) prefix scan }
+    if ((P0 - Buf0) and $FFFF) = 0 then
+      DiffCheckCancelled;
     Inc(P0);
     Inc(P1);
   end;
@@ -1228,6 +1278,10 @@ begin
     BufEnd + 1 and caused access violations past the buffer end). }
   while (P < SuffixBegin) and (P < BufEnd) do
   begin
+    { Cooperative-cancellation poll: this is the O(input bytes) hashing
+      pass; one poll per line keeps it interruptible at negligible cost. }
+    DiffCheckCancelled;
+
     Ip := P;
 
     { Compute the equivalence class (hash) for this line (io.c:295-398).
@@ -1585,6 +1639,9 @@ begin
 
     for I := 0 to End_ - 1 do
     begin
+      { Cooperative-cancellation poll: O(lines) pass }
+      if (I and $FFF) = 0 then
+        DiffCheckCancelled;
       if Equivs[I] = 0 then
         Continue;
       NMatch := Counts[Equivs[I]];
@@ -1604,6 +1661,9 @@ begin
     I := 0;
     while I < End_ do
     begin
+      { Cooperative-cancellation poll: O(lines) pass }
+      if (I and $FFF) = 0 then
+        DiffCheckCancelled;
       if Discarded[F * Ctx.Files[0].BufferedLines + I] = 2 then
       begin
         { Cancel provisional discards not in middle of run of discards }
@@ -1837,6 +1897,11 @@ begin
   begin
     Inc(C);
     BigSnake := 0;
+
+    { Cooperative-cancellation poll: the bidirectional middle-snake search
+      is the unbounded hot loop of this engine (O(ND) per call, and Diag
+      is called recursively from CompareSeq). }
+    DiffCheckCancelled;
 
     { Extend the top-down search by an edit step in each diagonal
       (analyze.c:135-160) }
@@ -2119,6 +2184,11 @@ var
   C: Integer;
   Part: TDiagPartition;
 begin
+  { Cooperative-cancellation poll: CompareSeq is recursive (each Diag call
+    splits the region in two and recurses), so a poll per call keeps the
+    unwinding prompt on deep recursions too. }
+  DiffCheckCancelled;
+
   Xv := Ctx.Xvec;
   Yv := Ctx.Yvec;
 
@@ -2284,6 +2354,9 @@ begin
 
     while True do
     begin
+      { Cooperative-cancellation poll: O(lines) pass }
+      DiffCheckCancelled;
+
       { Scan forwards to find beginning of another run of changes.
         Also keep track of the corresponding point in the other file. }
       while (I < IEnd) and (Changed[I] = 0) do
@@ -2749,6 +2822,10 @@ begin
   I := 0;
   while I < Length(Ops) do
   begin
+    { Cooperative-cancellation poll: O(D) post-pass; HunkAllBlank scans
+      each hunk's lines, so a poll per opcode keeps it interruptible. }
+    if (I and $FFF) = 0 then
+      DiffCheckCancelled;
     if (Ops[I].Tag <> cTagEqual) and HunkAllBlank(Ctx, Ops[I], WSAlso) then
     begin
       I2Max := Ops[I].I2;
