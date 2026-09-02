@@ -11108,6 +11108,8 @@ end;
 //  id: DIF_TEXTS (1) -- param1, param2 are raw text strings. The native
 //      engine splits them internally on \r\n / \r / \n (CRLF/CR/LF).
 //      DIF_CHARS (2) -- param1, param2 are two strings compared at char level.
+//      DIF_CANCEL (3) -- param1 is a job handle int returned by the
+//      asynchronous form; cancels that running background compare.
 //  algo: DIFF_ALGO_MYERS (0) or DIFF_ALGO_HISTOGRAM (1).
 //        Ignored for DIF_CHARS (char diff always uses word-Myers + byte-trim).
 //  flags: bitmask of DIFF_IGN_* values (case/whitespace/numbers/etc).
@@ -11117,21 +11119,37 @@ end;
 //      always runs on the main GUI thread, so a big-file compare blocks the
 //      LCL message loop for the whole compare time -- the entire CudaText
 //      UI freezes (that was the original hang bug).
-//      With callback, the call is ASYNCHRONOUS: it returns True at once, the
-//      compare runs in a background OS thread (the diff engines are pure
-//      functions without shared state, so this is safe), CudaText stays
-//      responsive, and when the compare finishes, the callback is invoked
-//      on the main thread with one argument: def on_diff(opcodes).
-//      'opcodes' is the same list the synchronous form returns, or None if
-//      the compare failed (same error contract as the synchronous form).
+//      With callback, the call is ASYNCHRONOUS: it returns a JOB HANDLE
+//      (positive int) at once, the compare runs in a background OS thread
+//      (the diff engines are pure functions without shared state, so this
+//      is safe), CudaText stays responsive, and when the compare finishes,
+//      the callback is invoked on the main thread with one argument:
+//      def on_diff(opcodes). 'opcodes' is the same list the synchronous
+//      form returns, or None if the compare failed (same error contract as
+//      the synchronous form). The job handle can be passed to
+//      diff_proc(DIF_CANCEL, handle) to stop the compare cooperatively.
 //      Accepted callback values:
 //        - string 'module_name.function_name', classic CudaText style,
 //          same as timer_proc callbacks (param is passed by name
 //          'opcodes', so the function must be def f(opcodes): ...);
 //        - any Python callable: function, lambda, bound method (param is
 //          passed positionally).
+//  DIF_CANCEL: cooperative cancellation of a background compare started
+//      by the asynchronous form. The engines' hot loops poll the job's
+//      cancel flag and unwind via an exception (all try/finally blocks
+//      run, all refcounted state is freed -- nothing leaks, which a
+//      forced thread kill cannot guarantee). Cancellation is lightweight
+//      but NOT instant: a compare in a long engine phase stops within a
+//      couple of seconds. Returns True when the job was found and
+//      cancellation was requested; False when no such job is running
+//      (it already finished, was cancelled before, or never existed).
+//      THE COMPLETION CALLBACK OF A CANCELLED COMPARE IS NEVER INVOKED,
+//      even when the cancellation request arrives while the compare is
+//      already finishing -- the result is dropped instead.
 //Returns: synchronous form -- list of (tag, i1, i2, j1, j2) tuples;
-//  asynchronous form -- True. Tag is a lowercase string
+//  asynchronous form -- job handle int (positive; None when the engine
+//  could not start the background compare); DIF_CANCEL -- True/False.
+//  Tag is a lowercase string
 //  'equal'/'delete'/'insert'/'replace'/'ignore'. Format matches
 //  difflib.SequenceMatcher.get_opcodes() exactly. 'ignore' is a CudaText
 //  extension tag: a real difference that DIFF_IGN_BLANK_LINES suppressed
@@ -11244,10 +11262,52 @@ end;
     secondary threads.
   - FreeOnTerminate is on: the object frees itself after Execute returns,
     and Synchronize guarantees DoCallback has finished by then, so
-    DoCallback can safely use the object fields. }
+    DoCallback can safely use the object fields.
+
+  Cooperative cancellation (diff_proc DIF_CANCEL):
+  - Every thread registers itself in the DiffJobList registry (under
+    DiffJobLock) BEFORE it starts running, and unregisters itself at the
+    end of Execute, BEFORE the callback phase. api_diff_proc's DIF_CANCEL
+    branch finds the job by its handle in the registry (under the same
+    lock) and sets the thread's FCancelFlag boolean.
+  - While the engine runs, its hot loops poll the flag through the
+    threadvars CudaDiffMyers/Histogram/Chars.DiffCancelFlag (set in
+    Execute, see there) and raise the engines' EDiffCancelled, which
+    unwinds the Pascal stack running every try/finally block and freeing
+    every refcounted string / dynamic array -- that is why cancellation
+    is cooperative: a forced thread kill would skip the unwinding and
+    leak stacks, heap blocks and heap locks.
+  - The thread reads the flag again after the engines return (in
+    DoCallback, on the main thread): a cancellation that arrived while
+    the compare was finishing also suppresses the callback. A cancelled
+    compare NEVER invokes its completion callback; the strong ref to the
+    callable is still released (on the main thread, which owns the GIL).
+  - The registry lock is a TCriticalSection created lazily on first use;
+    the first user is always the main thread (job creation in
+    api_diff_proc, before the thread starts), and thread creation is a
+    memory barrier, so the diff threads created afterwards always see
+    the initialized lock and list. }
+var
+  DiffJobList: TList = nil;             // of TCudaDiffThread; created on first job
+  DiffJobLock: TCriticalSection = nil;  // created on first use (lazily)
+  DiffJobLastId: Integer = 0;           // last issued job handle; touched only on the main thread
+
+procedure DiffJobsEnter;
+begin
+  if DiffJobLock = nil then
+    DiffJobLock := TCriticalSection.Create;
+  DiffJobLock.Enter;
+end;
+
+procedure DiffJobsLeave;
+begin
+  DiffJobLock.Leave;
+end;
+
 type
   TCudaDiffThread = class(TThread)
   private
+    FJobId: Integer;          // job handle returned to Python by api_diff_proc
     FIdAction: Integer;
     FAlgo: Integer;
     FFlags: Integer;
@@ -11257,21 +11317,25 @@ type
     FCallbackObj: PPyObject;   //non-nil: Python callable, we own a strong ref
     FOpcodes: TPyDiffOpcodeArray;
     FErrorMessage: string;
+    FCancelFlag: Boolean;      //set by DIF_CANCEL (main thread); polled by the engines and re-checked in DoCallback
     procedure ComputeDiff;
     procedure DoCallback; //main thread, via Synchronize
+    procedure ReleaseCallbackObj; //main thread: release the strong ref to the callable
+    procedure UnregisterSelf; //diff thread, at the end of Execute: remove self from the job registry
   protected
     procedure Execute; override;
   public
-    constructor Create(AIdAction, AAlgo, AFlags: Integer;
+    constructor Create(AJobId, AIdAction, AAlgo, AFlags: Integer;
       const AStr1, AStr2, ACallbackStr: string;
       ACallbackObj: PPyObject);
   end;
 
-constructor TCudaDiffThread.Create(AIdAction, AAlgo, AFlags: Integer;
+constructor TCudaDiffThread.Create(AJobId, AIdAction, AAlgo, AFlags: Integer;
   const AStr1, AStr2, ACallbackStr: string; ACallbackObj: PPyObject);
 begin
   inherited Create(true{CreateSuspended});
   FreeOnTerminate:= true;
+  FJobId:= AJobId;
   FIdAction:= AIdAction;
   FAlgo:= AAlgo;
   FFlags:= AFlags;
@@ -11279,12 +11343,35 @@ begin
   FStr2:= AStr2;
   FCallbackStr:= ACallbackStr;
   FCallbackObj:= ACallbackObj;
+  FCancelFlag:= false;
   //strong reference to the Python callable; released in DoCallback.
   //constructor always runs on the main thread (called from api_diff_proc),
   //so touching Python refcounts here is safe
   if FCallbackObj<>nil then
     AppPython.Engine.Py_INCREF(FCallbackObj);
+  //Register the job BEFORE Start: from this instant DIF_CANCEL can find it
+  //by the handle api_diff_proc is about to return. Runs on the main thread
+  //(also the lazy creator of DiffJobLock/DiffJobList).
+  DiffJobsEnter;
+  try
+    if DiffJobList=nil then
+      DiffJobList:= TList.Create;
+    DiffJobList.Add(Self);
+  finally
+    DiffJobsLeave;
+  end;
   Start;
+end;
+
+procedure TCudaDiffThread.UnregisterSelf;
+begin
+  DiffJobsEnter;
+  try
+    if DiffJobList<>nil then
+      DiffJobList.Remove(Self);
+  finally
+    DiffJobsLeave;
+  end;
 end;
 
 procedure TCudaDiffThread.ComputeDiff;
@@ -11329,6 +11416,13 @@ begin
       FErrorMessage:= 'diff_proc gets unknown id: '+IntToStr(FIdAction);
     end;
   except
+    //Let the engines' cooperative-cancellation exceptions escape to
+    //Execute, which marks the job cancelled (no callback, no result).
+    //Every other exception is captured into FErrorMessage here and is
+    //reported to the plugin through the callback(None) error contract.
+    on E: CudaDiffMyers.EDiffCancelled do raise;
+    on E: CudaDiffHistogram.EDiffCancelled do raise;
+    on E: CudaDiffChars.EDiffCancelled do raise;
     on E: Exception do
       FErrorMessage:= E.Message;
   end;
@@ -11336,7 +11430,27 @@ end;
 
 procedure TCudaDiffThread.Execute;
 begin
-  ComputeDiff;
+  //Point the three engines' cooperative-cancellation hooks at this job's
+  //flag. Each unit has its own threadvar, so several background compares
+  //can run at once and cancelling one job never touches the others.
+  //Cleared in the finally so the hook never outlives the thread's use.
+  CudaDiffMyers.DiffCancelFlag:= @FCancelFlag;
+  CudaDiffHistogram.DiffCancelFlag:= @FCancelFlag;
+  CudaDiffChars.DiffCancelFlag:= @FCancelFlag;
+  try
+    try
+      ComputeDiff;
+    except
+      //Only the engines' EDiffCancelled escapes ComputeDiff (every other
+      //exception is captured into FErrorMessage there): the engine
+      //aborted cooperatively -- mark the job cancelled.
+      FCancelFlag:= true;
+    end;
+  finally
+    CudaDiffMyers.DiffCancelFlag:= nil;
+    CudaDiffHistogram.DiffCancelFlag:= nil;
+    CudaDiffChars.DiffCancelFlag:= nil;
+  end;
 
   //release the big input texts before the callback runs: the callback
   //handler in the plugin usually makes its own copies of the compared
@@ -11344,12 +11458,34 @@ begin
   FStr1:= '';
   FStr2:= '';
 
+  //Unregister BEFORE the callback phase: after this, DIF_CANCEL can no
+  //longer find the job (returns False -- "not running"), so no
+  //main-thread code can touch the object again; the object itself is
+  //freed by FreeOnTerminate right after Execute returns.
+  UnregisterSelf;
+
   if Application.Terminated then
     exit;
 
   //marshal the result to the main thread and wait until it is delivered;
-  //the object is freed (FreeOnTerminate) only after Synchronize returns
+  //the object is freed (FreeOnTerminate) only after Synchronize returns.
+  //DoCallback itself re-checks FCancelFlag once more (a cancellation may
+  //have arrived while the compare was finishing) and then drops the
+  //result instead of invoking the plugin callback.
   Synchronize(@DoCallback);
+end;
+
+procedure TCudaDiffThread.ReleaseCallbackObj;
+begin
+  //release the strong ref to the Python callable taken in the constructor;
+  //must be done on the main thread, which owns the Python GIL. (If the
+  //callback is never reached because the app is closing, the ref leaks —
+  //that only happens at shutdown and is harmless.) Idempotent.
+  if FCallbackObj<>nil then
+  begin
+    AppPython.Engine.Py_DECREF(FCallbackObj);
+    FCallbackObj:= nil;
+  end;
 end;
 
 procedure TCudaDiffThread.DoCallback;
@@ -11359,6 +11495,16 @@ var
 begin
   if Application.Terminated then exit;
   if not AppPython.Inited then exit;
+
+  //A cancelled compare NEVER invokes its completion callback. This also
+  //covers a DIF_CANCEL that arrived while the finished result was being
+  //marshalled / was waiting for the main thread: the result is dropped
+  //here. The strong ref to the callable is still released below.
+  if FCancelFlag then
+  begin
+    ReleaseCallbackObj;
+    exit;
+  end;
 
   if FErrorMessage<>'' then
     MsgLogConsole('ERROR: diff_proc exception: '+FErrorMessage);
@@ -11401,13 +11547,6 @@ begin
             Py_DECREF(Params);
           end;
         end;
-
-        //release the strong ref taken in the constructor; must be done on
-        //the main thread, which owns the Python GIL. (If the callback is
-        //never reached because the app is closing, the ref leaks — that
-        //only happens at shutdown and is harmless.)
-        AppPython.Engine.Py_DECREF(FCallbackObj);
-        FCallbackObj:= nil;
       end
       else
       if FCallbackStr<>'' then
@@ -11428,20 +11567,33 @@ begin
     on E: Exception do
       MsgLogConsole('ERROR: diff_proc callback: '+E.Message);
   end;
+  //release the strong ref taken in the constructor (main thread, GIL)
+  ReleaseCallbackObj;
 end;
 
-//diff_proc implementation: with the callback argument it spawns
-//TCudaDiffThread and returns True at once; without it, the old
-//synchronous behavior is kept (small texts only)
+//diff_proc implementation. Three call shapes:
+//  diff_proc(DIF_TEXTS/DIF_CHARS, text1, text2, algo, flags, callback)
+//  -- callback present: ASYNCHRONOUS, spawns TCudaDiffThread and returns
+//     the job handle (positive int) at once, so the app keeps processing
+//     UI messages; the callback fires on the main thread when done.
+//     Callback absent: SYNCHRONOUS, blocks until done and returns the
+//     opcode list (use for small texts only -- it freezes the UI).
+//  diff_proc(DIF_CANCEL, job_handle)
+//  -- cooperative cancellation of a running background compare; returns
+//     True when the job was found and cancellation was requested, False
+//     when no such job is running.
 function api_diff_proc(Self, Args: PPyObject): PPyObject; cdecl;
 var
   IdAction: Integer;
-  Ptr1, Ptr2: PChar;
+  ObjParam1, ObjParam2: PPyObject;
   Str1, Str2: string;
   NAlgo, NFlags: Integer;
   PtrCallback: PPyObject;
   StrCallback: string;
   ObjCallback: PPyObject;
+  NJob: Integer;
+  I: Integer;
+  DiffThread: TCudaDiffThread;
   Opcodes: TPyDiffOpcodeArray;
   OpcodesMyers: CudaDiffMyers.TDiffOpcodeArray;
   OpcodesHistogram: CudaDiffHistogram.TDiffOpcodeArray;
@@ -11450,17 +11602,54 @@ begin
   NAlgo:= DIFF_ALGO_MYERS;
   NFlags:= 0;
   PtrCallback:= nil;
+  ObjParam1:= nil;
+  ObjParam2:= nil;
 
   with AppPython.Engine do
   begin
     Result:= ReturnNone;
 
-    if not Bool(PyArg_ParseTuple(Args, 'iss|iiO:diff_proc',
-      @IdAction, @Ptr1, @Ptr2, @NAlgo, @NFlags, @PtrCallback)) then
+    //'iO|OiiO': required (id, param1-object); optional (param2-object,
+    //algo, flags, callback). param1/param2 are converted per action below
+    //(strings for DIF_TEXTS/DIF_CHARS, an int job handle for DIF_CANCEL),
+    //which lets the DIF_CANCEL form pass a plain int as param1.
+    if not Bool(PyArg_ParseTuple(Args, 'iO|OiiO:diff_proc',
+      @IdAction, @ObjParam1, @ObjParam2, @NAlgo, @NFlags, @PtrCallback)) then
       Exit;
 
-    Str1:= string(Ptr1);
-    Str2:= string(Ptr2);
+    //DIF_CANCEL: find the job in the registry and request cooperative
+    //cancellation. Runs entirely under DiffJobLock: a job found in the
+    //list is guaranteed alive (a thread removes itself from the list
+    //under the same lock BEFORE it frees itself), so setting its
+    //FCancelFlag here can never touch a freed object.
+    if IdAction = DIF_CANCEL then
+    begin
+      if (ObjParam1 = nil) or (not PyLong_Check(ObjParam1)) then
+      begin
+        MsgLogConsole('ERROR: diff_proc DIF_CANCEL needs a job handle int '+
+          'as param1 (the value the asynchronous form returned)');
+        Exit(ReturnFalse);
+      end;
+      NJob:= PyLong_AsLong(ObjParam1);
+      Result:= ReturnFalse;
+      DiffJobsEnter;
+      try
+        if DiffJobList<>nil then
+          for I:= 0 to DiffJobList.Count-1 do
+          begin
+            DiffThread:= TCudaDiffThread(DiffJobList[I]);
+            if DiffThread.FJobId = NJob then
+            begin
+              DiffThread.FCancelFlag:= true;
+              Result:= ReturnTrue;
+              Break;
+            end;
+          end;
+      finally
+        DiffJobsLeave;
+      end;
+      Exit;
+    end;
 
     //fail fast on unknown action id, both for sync and async forms
     if (IdAction<>DIF_TEXTS) and (IdAction<>DIF_CHARS) then
@@ -11468,6 +11657,16 @@ begin
       MsgLogConsole('ERROR: diff_proc gets unknown id: '+IntToStr(IdAction));
       Exit(ReturnNone);
     end;
+
+    //DIF_TEXTS / DIF_CHARS: both params must be text strings
+    if (ObjParam1 = nil) or (ObjParam1^.ob_type<>PyUnicode_Type) or
+       (ObjParam2 = nil) or (ObjParam2^.ob_type<>PyUnicode_Type) then
+    begin
+      MsgLogConsole('ERROR: diff_proc params must be two strings for DIF_TEXTS/DIF_CHARS');
+      Exit(ReturnNone);
+    end;
+    Str1:= string(PyUnicodeAsUTF8String(ObjParam1));
+    Str2:= string(PyUnicodeAsUTF8String(ObjParam2));
 
     //the optional 6th argument selects the async mode: either a string
     //'module.func' or any Python callable
@@ -11488,12 +11687,21 @@ begin
     end;
 
     //asynchronous mode: run the compare in a background OS thread and
-    //return True at once, so the app keeps processing UI messages
+    //return its job handle (positive int) at once, so the app keeps
+    //processing UI messages. The handle is what DIF_CANCEL takes; the
+    //job registers itself in DiffJobList before it starts running.
     if (StrCallback<>'') or Assigned(ObjCallback) then
     begin
-      TCudaDiffThread.Create(IdAction, NAlgo, NFlags, Str1, Str2,
-        StrCallback, ObjCallback);
-      Exit(ReturnTrue);
+      //job handles are issued only here (main thread), so the counter
+      //needs no lock; the guard wraps at High(Integer) to stay safe
+      //under the -Co overflow checks
+      if DiffJobLastId < High(Integer) then
+        Inc(DiffJobLastId)
+      else
+        DiffJobLastId:= 1;
+      TCudaDiffThread.Create(DiffJobLastId, IdAction, NAlgo, NFlags,
+        Str1, Str2, StrCallback, ObjCallback);
+      Exit(PyLong_FromLong(DiffJobLastId));
     end;
 
     //synchronous mode: blocks until the compare is done; use it for small

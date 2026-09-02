@@ -916,6 +916,7 @@ const
   { diff_proc: action IDs for the id parameter }
   DIF_TEXTS              = 1;  // param1, param2 are LF-separated strings
   DIF_CHARS              = 2;  // param1, param2 are two strings compared at char level
+  DIF_CANCEL             = 3;  // param1 is the job handle int; cancels a running background compare
 
   { diff_proc: algorithm selectors for the algo parameter }
   DIFF_ALGO_MYERS        = 0;

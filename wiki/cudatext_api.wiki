@@ -2323,14 +2323,15 @@ Possible values of "id_action":
 
 ===diff_proc===
 
- diff_proc(id, param1, param2, algo=0, flags=0, callback=None)
+ diff_proc(id, param1, param2=None, algo=0, flags=0, callback=None)
 
-Compares two texts using the built-in native diff engine. DIF_TEXTS offers two line-diff algorithms: DIFF_ALGO_MYERS uses a Free Pascal port of WinMerge's bundled GNU diffutils Myers O(ND) engine, with the Eggert TOO_EXPENSIVE heuristic always enabled. DIFF_ALGO_HISTOGRAM uses a Free Pascal port of JGit's Histogram Diff, which internally falls back to JGit's Myers O(ND) Diff for sub-regions. DIF_CHARS uses a Free Pascal port of WinMerge’s character-diff engine, combining Myers O(NP) with custom heuristics and optimizations. Returns difflib-compatible opcodes - the same format as Python's <code>difflib.SequenceMatcher.get_opcodes()</code>. The call comes in two forms: synchronous (callback omitted) and asynchronous (callback given) - the asynchronous form runs the compare on a background thread, so a plugin can diff big files without freezing the CudaText UI.
+Compares two texts using the built-in native diff engine. DIF_TEXTS offers two line-diff algorithms: DIFF_ALGO_MYERS uses a Free Pascal port of WinMerge's bundled GNU diffutils Myers O(ND) engine, with the Eggert TOO_EXPENSIVE heuristic always enabled. DIFF_ALGO_HISTOGRAM uses a Free Pascal port of JGit's Histogram Diff, which internally falls back to JGit's Myers O(ND) Diff for sub-regions. DIF_CHARS uses a Free Pascal port of WinMerge’s character-diff engine, combining Myers O(NP) with custom heuristics and optimizations. Returns difflib-compatible opcodes - the same format as Python's <code>difflib.SequenceMatcher.get_opcodes()</code>. The call comes in two forms: synchronous (callback omitted) and asynchronous (callback given) - the asynchronous form runs the compare on a background thread, so a plugin can diff big files without freezing the CudaText UI; a running background compare can be stopped cooperatively with the DIF_CANCEL action.
 
 Param "id" specifies the action:
 
 * DIF_TEXTS: Line-level diff. Param "param1" and "param2" are raw text strings (text of file A and file B). The engine splits them into lines internally on <code>\r\n</code> (CRLF, treated as one boundary), <code>\r</code> (lone CR), and <code>\n</code> (lone LF) - NOT on VT/FF/NEL/LS/PS or other Unicode line boundaries. This matches CudaText's editor behavior (only CR/LF/CRLF are line breaks). The line-terminator is preserved at the end of each line (keepends semantics).
 * DIF_CHARS: Char-level diff. Param "param1" and "param2" are two strings compared at character granularity (typically single lines, but works on any strings). Internally converts both inputs to UTF-32 code point arrays and operates on code point indices (NOT byte indices - so <code>len(line_a)</code> in Python equals the index range returned by DIF_CHARS, even for non-ASCII strings). The algorithm is WinMerge's ONP (O(NP) Sequence Comparison, Wu-Manber-Myers-Miller) with word-level tokenization followed by byte-level (character-level) refinement. Tokenization splits on whitespace, punctuation (default break chars <code>,.;:</code>), and digits (when <code>DIFF_IGN_NUMBERS</code> is set). The engine has a built-in size guard (bails out to a single REPLACE if either side has ≥ 20480 tokens) and a 500ms timeout (bails out to a single REPLACE if exceeded).
+* DIF_CANCEL: Cooperative cancellation of a running background compare. Param "param1" is the job handle (the positive int the asynchronous form returned); all other parameters are unused. Returns True when the job was found and cancellation was requested, False when no such job is running (it already finished, was cancelled before, or never existed). See "Cancelling a background compare" below.
 
 Param "algo" selects the diff algorithm (only used for DIF_TEXTS, ignored for DIF_CHARS - char-diff always uses WinMerge's Myers ONP):
 
@@ -2352,20 +2353,28 @@ Param "flags" is a bitmask of ignore options (combine with <code>|</code>). The 
 Param "callback" selects the synchronous or the asynchronous form of the call:
 
 * None (default): synchronous. The call blocks until the compare is done and returns the opcode list. Plugin Python code always runs on the main GUI thread, so a big-file compare blocks the whole CudaText UI for the compare time - use this form for small texts only.
-* A callback value: asynchronous. The compare starts on a background OS thread and the call returns True at once, so CudaText keeps processing UI messages and stays fully responsive - the user can keep typing, scrolling and using menus while the compare runs. When the compare finishes, the callback is invoked on the main thread with a single argument: the opcode list - the same list the synchronous form returns, or None when the compare failed (the same error contract). Accepted callback values:
+* A callback value: asynchronous. The compare starts on a background OS thread and the call returns the job handle (a positive int) at once, so CudaText keeps processing UI messages and stays fully responsive - the user can keep typing, scrolling and using menus while the compare runs. When the compare finishes, the callback is invoked on the main thread with a single argument: the opcode list - the same list the synchronous form returns, or None when the compare failed (the same error contract). Accepted callback values:
 ** A string <code>"module_name.function_name"</code>, the classic CudaText style used by <code>timer_proc</code> callbacks. The opcode list is passed as the named parameter <code>opcodes</code>, so the function must be defined as: <code>def on_diff(opcodes): ...</code>.
 ** Any Python callable: function, lambda, bound method, <code>functools.partial</code> object. The opcode list is passed positionally: <code>callback(opcodes)</code>.
 
 Notes on the asynchronous form:
 
 * Several compares can run at the same time: every call with a callback starts its own background thread. The diff engines are pure functions without shared state, so concurrent compares are safe; each thread works on its own copies of the input strings.
-* The engine holds a strong reference to a callable callback until it fires, so closures and bound methods stay alive even when nothing else references them.
+* The job handle returned by the asynchronous form is accepted by <code>diff_proc(DIF_CANCEL, job_handle)</code>, so a compare whose result will never be needed (tab closed, dialog destroyed, plugin exiting) can be stopped instead of burning CPU to the end. Each call gets a fresh unique handle; 0 and negative values are never returned.
+* The engine holds a strong reference to a callable callback until it fires (or the job is cancelled), so closures and bound methods stay alive even when nothing else references them.
 * The callback always runs on the main thread (the result is marshalled there before your function is called), so it can safely use any CudaText API, including Editor methods - the same guarantee <code>timer_proc</code> callbacks have.
 * When the application is closing at the moment the compare finishes, the callback may be skipped.
-* If the engine cannot start the background compare, the call returns None (not True) - treat that as a signal to retry with the synchronous form.
+* If the engine cannot start the background compare, the call returns None - treat that as a signal to retry later or fall back to the synchronous form.
 * DIF_CHARS accepts the callback too, but a single char-level compare is fast (the engine bails out at 20480 tokens / 500ms), so the synchronous form is usually enough there; the background form matters for DIF_TEXTS on big files.
 
-Example - comparing two big texts in the background:
+Cancelling a background compare (DIF_CANCEL):
+
+* <code>cudatext.diff_proc(cudatext.DIF_CANCEL, job_handle)</code> requests cooperative cancellation of the compare started with that handle. It returns True when the job was found and the request was delivered, False when no such job is running anymore (nothing to cancel).
+* Cancellation is cooperative, not a forced thread kill: a killed thread would leak its stack and heap blocks, while the cooperative stop makes the engines' hot loops raise an internal exception that unwinds the Pascal stack - every try/finally block runs, every buffer is released, nothing leaks. The engine's loops poll the cancel flag at coarse granularity, so cancellation is lightweight but not instant: a compare inside a long engine phase stops within a couple of seconds (the compare's result is undefined at that point - it is simply dropped).
+* The completion callback of a cancelled compare is NEVER invoked - not even when the cancellation request arrives while the compare is already finishing; the result is dropped instead. A plugin therefore does not need to guard its callback against jobs it cancelled, but keeping a "stale job" check is still good practice for the finishing race (a compare that completed right before its cancellation arrived delivers its callback normally).
+* Cancelling an already-finished job is not an error: DIF_CANCEL returns False and has no effect. The callback of a finished job is never re-called.
+
+Example - comparing two big texts in the background, with cancellation when the result is no longer needed:
 
 {{{
 def on_diff(opcodes):
@@ -2376,10 +2385,13 @@ def on_diff(opcodes):
         if tag != 'equal':
             print('diff:', tag, i1, i2, j1, j2)
 
-cudatext.diff_proc(cudatext.DIF_TEXTS, text1, text2,
-                   cudatext.DIFF_ALGO_HISTOGRAM,
-                   cudatext.DIFF_IGN_NONE,
-                   'my_plugin.on_diff')
+job = cudatext.diff_proc(cudatext.DIF_TEXTS, text1, text2,
+                         cudatext.DIFF_ALGO_HISTOGRAM,
+                         cudatext.DIFF_IGN_NONE,
+                         'my_plugin.on_diff')
+# job is a positive int handle; when the compare's result is no
+# longer needed (tab closed, plugin exiting), stop the engine:
+# cudatext.diff_proc(cudatext.DIF_CANCEL, job)
 }}}
 
 Returns: in the synchronous form (callback is None), a list of 5-tuples <code>(tag, i1, i2, j1, j2)</code> where:
@@ -2391,7 +2403,7 @@ Returns: in the synchronous form (callback is None), a list of 5-tuples <code>(t
 
 For DIF_TEXTS, offsets are line indices. For DIF_CHARS, offsets are character (code point) indices - equivalent to Python's <code>str</code> indexing, NOT byte indices.
 
-In the asynchronous form (callback given), the call returns True right after the background compare is started (or None when the background compare could not be started) - the opcode list itself is delivered to the callback, never returned.
+In the asynchronous form (callback given), the call returns the job handle (a positive int) right after the background compare is started (or None when the background compare could not be started) - the opcode list itself is delivered to the callback, never returned. For the DIF_CANCEL action, the call returns True (job found and cancellation requested) or False (no such job running).
 
 Empty-input behavior (both DIF_TEXTS and DIF_CHARS): both texts empty <code>""</code> vs <code>""</code> returns <code>[]</code> (zero opcodes). One empty returns a single <code>('insert', 0, 0, 0, N)</code> or <code>('delete', 0, N, 0, 0)</code>. Both non-empty and identical returns a single <code>('equal', 0, N, 0, N)</code>.
 
@@ -5632,5 +5644,9 @@ It provides:
 * add: Editor.replace_lines can override line-breaks for added lines
 * change: Editor.set_text_line don't allow line with CR LF
 * change: Editor.replace_lines don't allow lines with CR LF, except at the very line-end
+
+1.0.485
+* add: diff_proc: action DIF_CANCEL -- cooperative cancellation of a running background compare: diff_proc(DIF_CANCEL, job_handle) returns True when the job was found and cancellation was requested, False when no such job is running. Cancellation is cooperative (the engine's hot loops unwind through the Pascal exception machinery, so all try/finally blocks run and nothing leaks) and takes at most a couple of seconds; the completion callback of a cancelled compare is never invoked
+* change: diff_proc: the asynchronous form (callback given) now returns a job handle (positive int) instead of True; the handle is the value DIF_CANCEL takes. None is still returned when the background compare could not be started
 
 [[Category:CudaText]]
