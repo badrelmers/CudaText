@@ -704,7 +704,50 @@ function DoDiffTexts(const ATextA, ATextB: string;
                      AAlgo: Integer;
                      AFlags: Integer): TDiffOpcodeArray;
 
+{ ------------------------------------------------------------------
+  Cooperative cancellation (diff_proc DIF_CANCEL)
+  ------------------------------------------------------------------
+  The background diff thread in formmain_py_api.inc (TCudaDiffThread)
+  points this threadvar at its cancel flag before calling DoDiffTexts,
+  and nils it afterwards. The engine's long-running loops poll the flag
+  at coarse granularity (per outer-loop step); when it is set they raise
+  EDiffCancelled.
+
+  The exception unwinds the Pascal stack: FPC runs every try/finally
+  block and finalizes every refcounted string / dynamic array on the
+  way out, so all intermediate state (RawTexts, hashed sequences, the
+  histogram index's tables, the edit-script queues) is released --
+  nothing leaks. This is why the cancellation is cooperative instead of
+  a forced thread kill: a killed thread skips the unwinding, leaking
+  its stack, its heap blocks and any heap lock it held at kill time.
+
+  Each unit (CudaDiffMyers / CudaDiffHistogram / CudaDiffChars) declares
+  its own threadvar, so several background compares can run at once and
+  cancelling one job never touches the others. Synchronous calls run on
+  the main thread, whose threadvar stays nil -- they are never
+  cancelled. }
+type
+  EDiffCancelled = class(Exception);
+
+threadvar
+  { nil = no cancellation requested for the current thread's diff }
+  DiffCancelFlag: PBoolean;
+
 implementation
+
+{ ------------------------------------------------------------------
+  Cooperative-cancellation poll (diff_proc DIF_CANCEL)
+  ------------------------------------------------------------------
+  Poll the cancellation flag of the calling thread's diff job; raises
+  EDiffCancelled when diff_proc(DIF_CANCEL) was called for that job.
+  Called from the engine's outer loops at coarse granularity, so the
+  cost is one nil-check per loop step. nil means "no diff thread / no
+  cancellation" -- synchronous callers never cancel. }
+procedure DiffCheckCancelled; inline;
+begin
+  if (DiffCancelFlag <> nil) and DiffCancelFlag^ then
+    raise EDiffCancelled.Create('diff cancelled');
+end;
 
 { ------------------------------------------------------------------
   HistogramDiffIndex constants — ported from diff/HistogramDiffIndex.java
@@ -1189,6 +1232,10 @@ begin
   while (e.beginA < e.endA) and (e.beginB < e.endB)
         and Equals(a, e.beginA, b, e.beginB) do
   begin
+    { Cooperative-cancellation poll: O(N) line-trim loop (the RawText
+      comparator's byte fast path delegates here for its slow path). }
+    if ((e.beginA + e.beginB) and $FFF) = 0 then
+      DiffCheckCancelled;
     Inc(e.beginA);
     Inc(e.beginB);
   end;
@@ -1197,6 +1244,8 @@ begin
   while (e.beginA < e.endA) and (e.beginB < e.endB)
         and Equals(a, e.endA - 1, b, e.endB - 1) do
   begin
+    if ((e.beginA + e.beginB) and $FFF) = 0 then
+      DiffCheckCancelled;
     Dec(e.endA);
     Dec(e.endB);
   end;
@@ -1275,6 +1324,8 @@ begin
   p := 0;
   while p < n do
   begin
+    { Cooperative-cancellation poll: O(bytes) line-map pass, one per line }
+    DiffCheckCancelled;
     map.Add(p);
     // Find next line boundary: \r\n (one boundary), \r (one boundary), \n (one boundary).
     // Match RawParseUtils.nextLF() semantics: returns position *after* the LF.
@@ -1998,10 +2049,19 @@ begin
     both files gets one ID shared across sequences. }
   SetLength(idsA, nA);
   for i := 0 to nA - 1 do
+  begin
+    { Cooperative-cancellation poll: O(N) interning pass }
+    if (i and $FFF) = 0 then
+      DiffCheckCancelled;
     idsA[i] := InternLine(ra, offA + i);
+  end;
   SetLength(idsB, nB);
   for i := 0 to nB - 1 do
+  begin
+    if (i and $FFF) = 0 then
+      DiffCheckCancelled;
     idsB[i] := InternLine(rb, offB + i);
+  end;
 
   FCachedA := THashedSequence.Create(FBaseA, idsA);
   FCachedB := THashedSequence.Create(FBaseB, idsB);
@@ -2172,6 +2232,9 @@ begin
   prev := Default(TEdit);  // silence "not initialized" warning
   for i := e.Size - 1 downto 0 do
   begin
+    { Cooperative-cancellation poll: O(D) post-pass; the shift loops
+      below can walk far on moved blocks. }
+    DiffCheckCancelled;
     cur := e.Get(i);
     curType := cur.GetType;
 
@@ -2754,6 +2817,10 @@ begin
   d := 1;
   while True do
   begin
+    { Cooperative-cancellation poll: the Myers fallback's middle-snake
+      search is the unbounded hot loop for regions without a rare-enough
+      anchor (pure duplicated blocks). }
+    DiffCheckCancelled;
     if Fforward.Calculate(d) or Fbackward.Calculate(d) then
       Break;
     if d >= dLimit then
@@ -2783,6 +2850,11 @@ var
   edit: TEdit;
   k, x: Integer;
 begin
+  { Cooperative-cancellation poll: CalculateEdits is recursive -- the
+    d-loop poll inside Calculate covers each middle-snake search, this
+    keeps the recursion itself interruptible too. }
+  DiffCheckCancelled;
+
   edit := Calculate(beginA, endA, beginB, endB);
 
   if (beginA < edit.beginA) or (beginB < edit.beginB) then
@@ -3284,6 +3356,9 @@ begin
   ptr := FRegion.endA - 1;
   while ptr >= FRegion.beginA do
   begin
+    { Cooperative-cancellation poll: ScanA's outer loop is one of the two
+      histogram hot loops; one poll per A element of the region. }
+    DiffCheckCancelled;
     tIdx := HashA(ptr);
     chainLen := 0;
     rIdx := Ftable[tIdx];
@@ -3466,7 +3541,14 @@ begin
 
   bPtr := FRegion.beginB;
   while bPtr < FRegion.endB do
+  begin
+    { Cooperative-cancellation poll: the other histogram hot loop --
+      TryLongestCommonSequence is called once per B element of the
+      region, and its occurrence-chain walks are bounded by
+      maxChainLength. }
+    DiffCheckCancelled;
     bPtr := TryLongestCommonSequence(bPtr);
+  end;
 
   if FhasCommon and (FMaxChainLength < Fcnt) then
   begin
@@ -3511,6 +3593,9 @@ begin
   DiffReplace(r);
   while FQueue.Size > 0 do
   begin
+    { Cooperative-cancellation poll: the region recursion -- every queued
+      before/after part re-enters Diff/ScanA/TryLongestCommonSequence. }
+    DiffCheckCancelled;
     e := FQueue.RemoveLast;
     Diff(e);
   end;
@@ -3675,6 +3760,9 @@ begin
   curB := 0;
   for i := 0 to edits.Size - 1 do
   begin
+    { Cooperative-cancellation poll: O(D) post-pass }
+    if (i and $FFF) = 0 then
+      DiffCheckCancelled;
     e := edits.Get(i);
     eType := e.GetType;
 
@@ -3819,6 +3907,10 @@ begin
   I := 0;
   while I < Length(Ops) do
   begin
+    { Cooperative-cancellation poll: O(D) post-pass; HunkAllBlank scans
+      each hunk's lines, so a poll per opcode keeps it interruptible. }
+    if (I and $FFF) = 0 then
+      DiffCheckCancelled;
     if (Ops[I].Tag <> cTagEqual) and
        HunkAllBlank(rtA, rtB, Ops[I], AWhitespaceAlso) then
     begin
