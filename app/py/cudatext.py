@@ -1052,6 +1052,7 @@ FINDER_REP_ALL_EX       = 39
 # diff_proc: action IDs for the id parameter
 DIF_TEXTS              = 1
 DIF_CHARS              = 2
+DIF_CANCEL             = 3  # param1 is the job handle int; cancels a running background compare
 
 # diff_proc: algorithm selectors for the algo parameter
 DIFF_ALGO_MYERS        = 0
@@ -1407,7 +1408,7 @@ def dlg_proc(id_dialog, id_action, prop='', index=-1, index2=-1, name=''):
 def finder_proc(id_finder, id_action, value="", setcaret=True):
     return ct.finder_proc(id_finder, id_action, to_str(value), setcaret)
 
-def diff_proc(id, param1, param2, algo=0, flags=0, callback=None):
+def diff_proc(id, param1, param2=None, algo=0, flags=0, callback=None):
     """
     Compares two texts, returns difflib-compatible opcodes.
 
@@ -1423,15 +1424,29 @@ def diff_proc(id, param1, param2, algo=0, flags=0, callback=None):
     runs on the main GUI thread, so a long compare freezes CudaText --
     use this form for small texts only.
 
-    With `callback` the call is asynchronous: it returns True at once and
-    the compare runs in a background thread, so CudaText stays responsive.
-    When the compare finishes, `callback` runs on the main thread with a
-    single argument `opcodes`, holding the same list the synchronous form
-    returns (None on error):
+    With `callback` the call is asynchronous: it returns a job handle
+    (positive int) at once and the compare runs in a background thread,
+    so CudaText stays responsive. When the compare finishes, `callback`
+    runs on the main thread with a single argument `opcodes`, holding
+    the same list the synchronous form returns (None on error):
         def on_diff(opcodes): ...
     `callback` can be a string 'module_name.function_name' or any Python
     callable (function, lambda, bound method).
+
+    id: DIF_CANCEL -- cancels the background compare identified by the job
+    handle in param1 (the positive int the asynchronous form returned):
+        cudatext.diff_proc(cudatext.DIF_CANCEL, job)
+    Returns True when the job was found and cancellation was requested,
+    False when no such job is running (it already finished or never
+    existed). Cancellation is cooperative: the engine's diff loops notice
+    the request within a couple of seconds and unwind, releasing
+    everything the compare allocated. The completion callback of a
+    cancelled compare is NEVER invoked.
     """
+    if id == DIF_CANCEL:
+        # param1 is the job handle returned by the asynchronous form;
+        # the other parameters are not used for cancellation.
+        return ct.diff_proc(id, param1)
     return ct.diff_proc(id, param1, param2, algo, flags, callback)
 
 
