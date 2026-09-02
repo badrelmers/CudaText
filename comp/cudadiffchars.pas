@@ -422,7 +422,50 @@ function UTF8ToUTF32(const S: string): TCodePointArray;
   Replaces the phase 1 stub body with the real WinMerge port. }
 function DoDiffChars(const ATextA, ATextB: string; AFlags: Integer): TDiffOpcodeArray;
 
+{ ------------------------------------------------------------------
+  Cooperative cancellation (diff_proc DIF_CANCEL)
+  ------------------------------------------------------------------
+  The background diff thread in formmain_py_api.inc (TCudaDiffThread)
+  points this threadvar at its cancel flag before calling DoDiffChars,
+  and nils it afterwards. The engine's long-running loops poll the flag
+  at coarse granularity (per outer-loop step); when it is set they raise
+  EDiffCancelled.
+
+  The exception unwinds the Pascal stack: FPC runs every try/finally
+  block and finalizes every refcounted string / dynamic array on the
+  way out, so all intermediate state (the code point arrays, word
+  arrays, edit-script matrices) is released -- nothing leaks. This is
+  why the cancellation is cooperative instead of a forced thread kill:
+  a killed thread skips the unwinding, leaking its stack, its heap
+  blocks and any heap lock it held at kill time.
+
+  Each unit (CudaDiffMyers / CudaDiffHistogram / CudaDiffChars) declares
+  its own threadvar, so several background compares can run at once and
+  cancelling one job never touches the others. Synchronous calls run on
+  the main thread, whose threadvar stays nil -- they are never
+  cancelled. }
+type
+  EDiffCancelled = class(Exception);
+
+threadvar
+  { nil = no cancellation requested for the current thread's diff }
+  DiffCancelFlag: PBoolean;
+
 implementation
+
+{ ------------------------------------------------------------------
+  Cooperative-cancellation poll (diff_proc DIF_CANCEL)
+  ------------------------------------------------------------------
+  Poll the cancellation flag of the calling thread's diff job; raises
+  EDiffCancelled when diff_proc(DIF_CANCEL) was called for that job.
+  Called from the engine's outer loops at coarse granularity, so the
+  cost is one nil-check per loop step. nil means "no diff thread / no
+  cancellation" -- synchronous callers never cancel. }
+procedure DiffCheckCancelled; inline;
+begin
+  if (DiffCancelFlag <> nil) and DiffCancelFlag^ then
+    raise EDiffCancelled.Create('diff cancelled');
+end;
 
 const
   { Default break chars — ported from stringdiffs.cpp:24.
@@ -823,6 +866,9 @@ begin
 
   while i < iLen do
   begin
+    { Cooperative-cancellation poll: O(N) tokenization pass }
+    if (i and $FFF) = 0 then
+      DiffCheckCancelled;
     break_type := dlword;
     ch := S[i];
 
@@ -1033,6 +1079,11 @@ begin
         Exit;
       end;
     end;
+
+    { Cooperative-cancellation poll: the ONP p-loop is the hot loop of the
+      char engine (its natural bound is O(NP) -- the 500ms timeout above
+      already caps the worst case, this makes it interruptible too). }
+    DiffCheckCancelled;
   until fp[fpBase + k] = N;
 
   { Build the edit script by walking back from es[DELTA][last]. }
@@ -1780,6 +1831,9 @@ begin
   i := 0;
   while i < n do
   begin
+    { Cooperative-cancellation poll: O(bytes) UTF-8 decode pass }
+    if (i and $FFFF) = 0 then
+      DiffCheckCancelled;
     b1 := raw[i];
     Inc(i);
 
