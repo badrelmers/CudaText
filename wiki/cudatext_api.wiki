@@ -2327,13 +2327,13 @@ Possible values of "id_action":
 
  diff_proc(id, param1, param2=None, algo=0, flags=0, callback=None)
 
-Compares two texts using the built-in native diff engine. DIF_TEXTS offers two line-diff algorithms: DIFF_ALGO_MYERS uses a Free Pascal port of WinMerge's bundled GNU diffutils Myers O(ND) engine, with the Eggert TOO_EXPENSIVE heuristic always enabled. DIFF_ALGO_HISTOGRAM uses a Free Pascal port of JGit's Histogram Diff, which internally falls back to JGit's Myers O(ND) Diff for sub-regions. DIF_CHARS uses a Free Pascal port of WinMerge’s character-diff engine, combining Myers O(NP) with custom heuristics and optimizations. Returns difflib-compatible opcodes - the same format as Python's <code>difflib.SequenceMatcher.get_opcodes()</code>. The call comes in two forms: synchronous (callback omitted) and asynchronous (callback given) - the asynchronous form runs the compare on a background thread, so a plugin can diff big files without freezing the CudaText UI; a running background compare can be stopped cooperatively with the DIF_CANCEL action.
+Compares texts using the built-in native diff engine. DIF_TEXTS offers two line-diff algorithms: DIFF_ALGO_MYERS uses a Free Pascal port of WinMerge's bundled GNU diffutils Myers O(ND) engine, with the Eggert TOO_EXPENSIVE heuristic always enabled. DIFF_ALGO_HISTOGRAM uses a Free Pascal port of JGit's Histogram Diff, which internally falls back to JGit's Myers O(ND) Diff for sub-regions. DIF_CHARS is a BATCHED char-level compare: it takes a whole list of string pairs and diffs them all at character granularity in ONE engine call - it uses a Free Pascal port of WinMerge’s character-diff engine, combining Myers O(NP) with custom heuristics and optimizations. Returns difflib-compatible opcodes - the same format as Python's <code>difflib.SequenceMatcher.get_opcodes()</code>. The call comes in two forms: synchronous (callback omitted) and asynchronous (callback given) - the asynchronous form runs the compare on a background thread, so a plugin can diff big files without freezing the CudaText UI; a running background compare (DIF_TEXTS or DIF_CHARS) can be stopped cooperatively with the DIF_CANCEL action.
 
 Param "id" specifies the action:
 
 * DIF_TEXTS: Line-level diff. Param "param1" and "param2" are raw text strings (text of file A and file B). The engine splits them into lines internally on <code>\r\n</code> (CRLF, treated as one boundary), <code>\r</code> (lone CR), and <code>\n</code> (lone LF) - NOT on VT/FF/NEL/LS/PS or other Unicode line boundaries. This matches CudaText's editor behavior (only CR/LF/CRLF are line breaks). The line-terminator is preserved at the end of each line (keepends semantics).
-* DIF_CHARS: Char-level diff. Param "param1" and "param2" are two strings compared at character granularity (typically single lines, but works on any strings). Internally converts both inputs to UTF-32 code point arrays and operates on code point indices (NOT byte indices - so <code>len(line_a)</code> in Python equals the index range returned by DIF_CHARS, even for non-ASCII strings). The algorithm is WinMerge's ONP (O(NP) Sequence Comparison, Wu-Manber-Myers-Miller) with word-level tokenization followed by byte-level (character-level) refinement. Tokenization splits on whitespace, punctuation (default break chars <code>,.;:</code>), and digits (when <code>DIFF_IGN_NUMBERS</code> is set). The engine has a built-in size guard (bails out to a single REPLACE if either side has ≥ 20480 tokens) and a 500ms timeout (bails out to a single REPLACE if exceeded).
-* DIF_CANCEL: Cooperative cancellation of a running background compare. Param "param1" is the job handle (the positive int the asynchronous form returned); all other parameters are unused. Returns True when the job was found and cancellation was requested, False when no such job is running (it already finished, was cancelled before, or never existed). See "Cancelling a background compare" below.
+* DIF_CHARS: BATCHED char-level diff. Param "param1" is a list of <code>(text1, text2)</code> string pairs - each element is a tuple (or 2-item list) of two str values; param "param2" is unused (pass None). ALL pairs are compared at character granularity (typically single lines, but works on any strings) in ONE engine call: a batch of e.g. 100'000 pairs is one diff_proc call instead of 100'000 calls, eliminating the per-call API overhead (argument parsing, string conversion, result building), which dominates the runtime when char-diffing the changed lines of big files. Each pair is compared independently of the others. Internally each pair's strings are converted to UTF-32 code point arrays and compared on code point indices (NOT byte indices - so <code>len(line_a)</code> in Python equals the index range returned for that pair, even for non-ASCII strings). The algorithm is WinMerge's ONP (O(NP) Sequence Comparison, Wu-Manber-Myers-Miller) with word-level tokenization followed by byte-level (character-level) refinement. Tokenization splits on whitespace, punctuation (default break chars <code>,.;:</code>), and digits (when <code>DIFF_IGN_NUMBERS</code> is set). Each pair's engine run has a built-in size guard (bails out to a single REPLACE if either side has ≥ 20480 tokens) and a 500ms timeout (bails out to a single REPLACE if exceeded). An empty batch <code>[]</code> returns an empty list.
+* DIF_CANCEL: Cooperative cancellation of a running background compare. Param "param1" is the job handle (the positive int the asynchronous form returned); all other parameters are unused. Works identically for DIF_TEXTS and DIF_CHARS jobs. Returns True when the job was found and cancellation was requested, False when no such job is running (it already finished, was cancelled before, or never existed). See "Cancelling a background compare" below.
 
 Param "algo" selects the diff algorithm (only used for DIF_TEXTS, ignored for DIF_CHARS - char-diff always uses WinMerge's Myers ONP):
 
@@ -2367,7 +2367,7 @@ Notes on the asynchronous form:
 * The callback always runs on the main thread (the result is marshalled there before your function is called), so it can safely use any CudaText API, including Editor methods - the same guarantee <code>timer_proc</code> callbacks have.
 * When the application is closing at the moment the compare finishes, the callback may be skipped.
 * If the engine cannot start the background compare, the call returns None - treat that as a signal to retry later or fall back to the synchronous form.
-* DIF_CHARS accepts the callback too, but a single char-level compare is fast (the engine bails out at 20480 tokens / 500ms), so the synchronous form is usually enough there; the background form matters for DIF_TEXTS on big files.
+* DIF_CHARS IS the batched form and the asynchronous callback is the intended way to use it on big batches: the plugin collects all pairs first, then starts ONE background job for the whole batch (the Differ plugin does exactly this). A synchronous batch of many pairs blocks the UI for the whole batch time. The asynchronous batch is also cancelable mid-batch - DIF_CANCEL is re-checked between pairs, so a batch of hundreds of thousands of small pairs stops promptly too (not only inside one long single-pair engine run).
 
 Cancelling a background compare (DIF_CANCEL):
 
@@ -2396,7 +2396,29 @@ job = cudatext.diff_proc(cudatext.DIF_TEXTS, text1, text2,
 # cudatext.diff_proc(cudatext.DIF_CANCEL, job)
 }}}
 
-Returns: in the synchronous form (callback is None), a list of 5-tuples <code>(tag, i1, i2, j1, j2)</code> where:
+Example - char-diffing MANY line pairs in ONE background batch (e.g. the changed-line pairs of a side-by-side compare), with cancellation:
+
+{{{
+pairs = [(line_a_1, line_b_1), (line_a_2, line_b_2), ...]
+
+def on_char_diffs(results):
+    if results is None:
+        cudatext.msg_status('Char diff failed')
+        return
+    # results[k] is the opcode list for pairs[k], same order
+    for k, opcodes in enumerate(results):
+        for tag, i1, i2, j1, j2 in opcodes:
+            if tag != 'equal':
+                print('pair', k, 'diff:', tag, i1, i2, j1, j2)
+
+job = cudatext.diff_proc(cudatext.DIF_CHARS, pairs, None, 0,
+                         cudatext.DIFF_IGN_NONE,
+                         on_char_diffs)
+# one background job computes the whole batch; cancel it the same way:
+# cudatext.diff_proc(cudatext.DIF_CANCEL, job)
+}}}
+
+Returns: in the synchronous form (callback is None), DIF_TEXTS returns a list of 5-tuples <code>(tag, i1, i2, j1, j2)</code> where:
 
 * <code>tag</code> is a lowercase string: <code>'equal'</code>, <code>'delete'</code>, <code>'insert'</code>, <code>'replace'</code>, or <code>'ignore'</code> (CudaText extension, DIF_TEXTS + DIFF_IGN_BLANK_LINES only).
 * <code>i1, i2</code> is a half-open range into the first text (param1).
@@ -2405,9 +2427,11 @@ Returns: in the synchronous form (callback is None), a list of 5-tuples <code>(t
 
 For DIF_TEXTS, offsets are line indices. For DIF_CHARS, offsets are character (code point) indices - equivalent to Python's <code>str</code> indexing, NOT byte indices.
 
-In the asynchronous form (callback given), the call returns the job handle (a positive int) right after the background compare is started (or None when the background compare could not be started) - the opcode list itself is delivered to the callback, never returned. For the DIF_CANCEL action, the call returns True (job found and cancellation requested) or False (no such job running).
+The synchronous DIF_CHARS form returns a list with ONE opcode list per input pair, in the same order as the <code>pairs</code> list: element <code>k</code> is the list of <code>(tag, i1, i2, j1, j2)</code> tuples describing <code>pairs[k][0]</code> vs <code>pairs[k][1]</code> (i.e. exactly what DIF_TEXTS would return if the two strings of that pair were whole texts). The tiling rules above hold per pair. An empty input list returns <code>[]</code>.
 
-Empty-input behavior (both DIF_TEXTS and DIF_CHARS): both texts empty <code>""</code> vs <code>""</code> returns <code>[]</code> (zero opcodes). One empty returns a single <code>('insert', 0, 0, 0, N)</code> or <code>('delete', 0, N, 0, 0)</code>. Both non-empty and identical returns a single <code>('equal', 0, N, 0, N)</code>.
+In the asynchronous form (callback given), the call returns the job handle (a positive int) right after the background compare is started (or None when the background compare could not be started) - the opcode list (DIF_TEXTS) or the list of per-pair opcode lists (DIF_CHARS) itself is delivered to the callback, never returned. For the DIF_CANCEL action, the call returns True (job found and cancellation requested) or False (no such job running).
+
+Empty-input behavior (DIF_TEXTS, and each pair of DIF_CHARS): both texts empty <code>""</code> vs <code>""</code> returns <code>[]</code> (zero opcodes). One empty returns a single <code>('insert', 0, 0, 0, N)</code> or <code>('delete', 0, N, 0, 0)</code>. Both non-empty and identical returns a single <code>('equal', 0, N, 0, N)</code>.
 
 Opcode semantics:
 
@@ -5651,5 +5675,9 @@ It provides:
 1.0.485
 * add: diff_proc: action DIF_CANCEL -- cooperative cancellation of a running background compare: diff_proc(DIF_CANCEL, job_handle) returns True when the job was found and cancellation was requested, False when no such job is running. Cancellation is cooperative (the engine's hot loops unwind through the Pascal exception machinery, so all try/finally blocks run and nothing leaks) and takes at most a couple of seconds; the completion callback of a cancelled compare is never invoked
 * change: diff_proc: the asynchronous form (callback given) now returns a job handle (positive int) instead of True; the handle is the value DIF_CANCEL takes. None is still returned when the background compare could not be started
+
+1.0.486
+* change: diff_proc: DIF_CHARS is now a BATCHED char-level compare -- param1 is a LIST of (text1, text2) string pairs (was: two single strings in param1/param2), param2 is unused. All pairs are compared in ONE engine call: a batch of hundreds of thousands of pairs is one call instead of one call per pair, eliminating the per-call API overhead that dominated char-diffing the changed lines of big files. The synchronous form returns a list with one opcode list per input pair (same order); the asynchronous callback receives the same nested list. This is a breaking change: callers must pass a list of pairs and consume the nested result
+* add: diff_proc: DIF_CHARS supports the asynchronous form (callback) with the same semantics as DIF_TEXTS: one background job computes the whole batch, the job handle is returned at once, the callback fires on the main thread with the batch result (None on error), and diff_proc(DIF_CANCEL, handle) stops the batch cooperatively -- the cancel flag is re-checked between pairs, so a long batch of small pairs stops promptly too. The completion callback of a cancelled batch is never invoked
 
 [[Category:CudaText]]

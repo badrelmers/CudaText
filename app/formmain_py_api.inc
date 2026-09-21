@@ -11248,19 +11248,27 @@ end;
 
 
 
-//diff_proc(id, param1, param2, algo=0, flags=0, callback=None)
-//Compares two texts and returns difflib-compatible opcodes.
+//diff_proc(id, param1, param2=None, algo=0, flags=0, callback=None)
+//Compares texts and returns difflib-compatible opcodes.
 //  id: DIF_TEXTS (1) -- param1, param2 are raw text strings. The native
 //      engine splits them internally on \r\n / \r / \n (CRLF/CR/LF).
-//      DIF_CHARS (2) -- param1, param2 are two strings compared at char level.
+//      DIF_CHARS (2) -- BATCHED char-level compare: param1 is a LIST of
+//      (text1, text2) string pairs (tuples or 2-item lists); param2 is
+//      unused. ALL pairs are compared at char level in ONE engine call --
+//      instead of one diff_proc call per pair (hundreds of thousands of
+//      API round-trips on big files), the whole batch is computed in a
+//      single pass. Each pair is independent: a pair's opcodes only
+//      describe that pair's two strings.
 //      DIF_CANCEL (3) -- param1 is a job handle int returned by the
 //      asynchronous form; cancels that running background compare.
 //  algo: DIFF_ALGO_MYERS (0) or DIFF_ALGO_HISTOGRAM (1).
 //        Ignored for DIF_CHARS (char diff always uses word-Myers + byte-trim).
 //  flags: bitmask of DIFF_IGN_* values (case/whitespace/numbers/etc).
-//  callback: optional, enables the asynchronous mode.
+//        Applied to every pair of a DIF_CHARS batch identically.
+//  callback: optional, enables the asynchronous mode. Works for BOTH
+//      DIF_TEXTS and DIF_CHARS.
 //      Without it (None/empty) the call is SYNCHRONOUS: it blocks until the
-//      compare is done and returns the opcode list. Plugin Python code
+//      compare is done and returns the result. Plugin Python code
 //      always runs on the main GUI thread, so a big-file compare blocks the
 //      LCL message loop for the whole compare time -- the entire CudaText
 //      UI freezes (that was the original hang bug).
@@ -11280,18 +11288,24 @@ end;
 //        - any Python callable: function, lambda, bound method (param is
 //          passed positionally).
 //  DIF_CANCEL: cooperative cancellation of a background compare started
-//      by the asynchronous form. The engines' hot loops poll the job's
-//      cancel flag and unwind via an exception (all try/finally blocks
-//      run, all refcounted state is freed -- nothing leaks, which a
-//      forced thread kill cannot guarantee). Cancellation is lightweight
-//      but NOT instant: a compare in a long engine phase stops within a
+//      by the asynchronous form (DIF_TEXTS or DIF_CHARS -- a DIF_CHARS
+//      batch job is cancelled exactly the same way). The engines' hot
+//      loops poll the job's cancel flag and unwind via an exception (all
+//      try/finally blocks run, all refcounted state is freed -- nothing
+//      leaks, which a forced thread kill cannot guarantee); a DIF_CHARS
+//      batch also re-checks the flag between pairs, so a batch of many
+//      small pairs stops promptly too. Cancellation is lightweight
+//      but NOT instant: a compare inside a long engine phase stops within a
 //      couple of seconds. Returns True when the job was found and
 //      cancellation was requested; False when no such job is running
 //      (it already finished, was cancelled before, or never existed).
 //      THE COMPLETION CALLBACK OF A CANCELLED COMPARE IS NEVER INVOKED,
 //      even when the cancellation request arrives while the compare is
 //      already finishing -- the result is dropped instead.
-//Returns: synchronous form -- list of (tag, i1, i2, j1, j2) tuples;
+//Returns: synchronous DIF_TEXTS -- list of (tag, i1, i2, j1, j2) tuples;
+//  synchronous DIF_CHARS -- list with ONE opcode list per input pair, in
+//  the same order (each element is the (tag, i1, i2, j1, j2) list for that
+//  pair, the same format DIF_TEXTS returns for two whole texts);
 //  asynchronous form -- job handle int (positive; None when the engine
 //  could not start the background compare); DIF_CANCEL -- True/False.
 //  Tag is a lowercase string
@@ -11308,6 +11322,17 @@ type
     I1, I2, J1, J2: Integer;
   end;
   TPyDiffOpcodeArray = array of TPyDiffOpcode;
+  TPyDiffOpcodeMatrix = array of TPyDiffOpcodeArray;
+
+  { One char-level compare pair of a BATCHED DIF_CHARS call: S1/S2 are the
+    two strings of the pair, compared at char level independently of the
+    other pairs. Parsed from the Python list param1 by
+    DiffParseCharPairs. }
+  TPyDiffCharPair = record
+    S1: string;
+    S2: string;
+  end;
+  TPyDiffCharPairArray = array of TPyDiffCharPair;
 
 { Copy opcodes from the 3 diff engine units into the neutral type above.
   The units intentionally declare their own TDiffOpcode records (G13),
@@ -11360,15 +11385,50 @@ begin
   end;
 end;
 
+var
+  { Cached Python str objects for the 5 opcode tag names ('equal', 'delete',
+    'insert', 'replace', 'ignore'). Built once on first use (main thread,
+    Python engine alive) and kept alive for the whole app session -- 5 tiny
+    strings, freed by the process at shutdown. A batched DIF_CHARS call
+    builds millions of opcode tuples on big files; creating a fresh Python
+    str per opcode (Py_BuildValue('s') does) would allocate and free a
+    string object for every single opcode. Here the cached str is only
+    INCREF'd before PyTuple_SetItem (SetItem steals the reference). }
+  DiffTagPyStr: array[0..4] of PPyObject;
+
+{ Create the cached opcode tag strings on first use. Must run on the main
+  thread (owns the GIL); all callers of DiffOpcodesToPyList /
+  DiffCharOpcodesToPyList are main-thread by construction. }
+procedure DiffTagPyStrInit;
+var
+  i: integer;
+begin
+  if DiffTagPyStr[DIFF_TAG_EQUAL]<>nil then exit;
+  with AppPython.Engine do
+  begin
+    DiffTagPyStr[DIFF_TAG_EQUAL]:= PyUnicodeFromString('equal');
+    DiffTagPyStr[DIFF_TAG_DELETE]:= PyUnicodeFromString('delete');
+    DiffTagPyStr[DIFF_TAG_INSERT]:= PyUnicodeFromString('insert');
+    DiffTagPyStr[DIFF_TAG_REPLACE]:= PyUnicodeFromString('replace');
+    DiffTagPyStr[DIFF_TAG_IGNORE]:= PyUnicodeFromString('ignore');
+    for i:= 0 to 4 do
+      if DiffTagPyStr[i]=nil then
+        raise EPythonError.Create(msgPythonListError);
+  end;
+end;
+
 { Build the Python list of (tag, i1, i2, j1, j2) tuples.
   Must be called on the main thread: it creates Python objects, so the
-  calling thread must own the Python GIL. }
+  calling thread must own the Python GIL. Uses the cached tag strings
+  (DiffTagPyStrInit) instead of per-opcode string allocation. }
 function DiffOpcodesToPyList(const AOpcodes: TPyDiffOpcodeArray): PPyObject;
 var
   J: integer;
-  TagStr: string;
+  NTag: integer;
+  ObjTuple, ObjInt: PPyObject;
 begin
   Result:= nil;
+  DiffTagPyStrInit;
   with AppPython.Engine do
   begin
     Result:= PyList_New(Length(AOpcodes));
@@ -11376,20 +11436,133 @@ begin
       raise EPythonError.Create(msgPythonListError);
     for J:= 0 to High(AOpcodes) do
     begin
-      case AOpcodes[J].Tag of
-        DIFF_TAG_EQUAL:   TagStr:= 'equal';
-        DIFF_TAG_DELETE:  TagStr:= 'delete';
-        DIFF_TAG_INSERT:  TagStr:= 'insert';
-        DIFF_TAG_REPLACE: TagStr:= 'replace';
-        DIFF_TAG_IGNORE:  TagStr:= 'ignore';
-        else              TagStr:= 'equal';
-      end;
-      PyList_SetItem(Result, J,
-        Py_BuildValue('(siiii)', PChar(TagStr),
-          AOpcodes[J].I1, AOpcodes[J].I2,
-          AOpcodes[J].J1, AOpcodes[J].J2));
+      NTag:= AOpcodes[J].Tag;
+      if (NTag<0) or (NTag>4) then
+        NTag:= DIFF_TAG_EQUAL;
+      ObjTuple:= PyTuple_New(5);
+      if ObjTuple=nil then
+        raise EPythonError.Create(msgPythonListError);
+      Py_INCREF(DiffTagPyStr[NTag]);
+      PyTuple_SetItem(ObjTuple, 0, DiffTagPyStr[NTag]);
+      ObjInt:= PyLong_FromLong(AOpcodes[J].I1);
+      if ObjInt<>nil then PyTuple_SetItem(ObjTuple, 1, ObjInt);
+      ObjInt:= PyLong_FromLong(AOpcodes[J].I2);
+      if ObjInt<>nil then PyTuple_SetItem(ObjTuple, 2, ObjInt);
+      ObjInt:= PyLong_FromLong(AOpcodes[J].J1);
+      if ObjInt<>nil then PyTuple_SetItem(ObjTuple, 3, ObjInt);
+      ObjInt:= PyLong_FromLong(AOpcodes[J].J2);
+      if ObjInt<>nil then PyTuple_SetItem(ObjTuple, 4, ObjInt);
+      //SetItem steals the tuple reference on success
+      PyList_SetItem(Result, J, ObjTuple);
     end;
   end;
+end;
+
+{ Build the Python result of a BATCHED DIF_CHARS call: a list with ONE
+  opcode list per input pair, in input order. Must be called on the main
+  thread (GIL), like DiffOpcodesToPyList. }
+function DiffCharOpcodesToPyList(const APairs: TPyDiffOpcodeMatrix): PPyObject;
+var
+  i: integer;
+  ObjList: PPyObject;
+begin
+  Result:= nil;
+  DiffTagPyStrInit;
+  with AppPython.Engine do
+  begin
+    Result:= PyList_New(Length(APairs));
+    if not Assigned(Result) then
+      raise EPythonError.Create(msgPythonListError);
+    for i:= 0 to High(APairs) do
+    begin
+      ObjList:= DiffOpcodesToPyList(APairs[i]);
+      if ObjList=nil then
+        raise EPythonError.Create(msgPythonListError);
+      //SetItem steals the list reference on success
+      PyList_SetItem(Result, i, ObjList);
+    end;
+  end;
+end;
+
+{ Parse the DIF_CHARS batch input: a Python list [(s1, s2), ...] where each
+  element is a tuple or list of EXACTLY 2 str values. Must run on the main
+  thread (GIL). Returns True and fills APairs on success; on bad input logs
+  an error to the console and returns False with APairs=Nil. The elements'
+  strings are converted to UTF-8 Pascal strings immediately (the Python
+  list is not kept alive by the engine). }
+function DiffParseCharPairs(ObjPairs: PPyObject;
+  var APairs: TPyDiffCharPairArray): Boolean;
+var
+  N, i: integer;
+  ObjItem, ObjS1, ObjS2: PPyObject;
+begin
+  Result:= false;
+  APairs:= nil;
+  if ObjPairs=nil then
+  begin
+    MsgLogConsole('ERROR: diff_proc DIF_CHARS needs a list of (text1, text2) pairs as param1');
+    exit;
+  end;
+  with AppPython.Engine do
+  begin
+    if PyList_Check(ObjPairs)=false then
+    begin
+      MsgLogConsole('ERROR: diff_proc DIF_CHARS param1 must be a list of (text1, text2) pairs');
+      exit;
+    end;
+    N:= PyList_Size(ObjPairs);
+    SetLength(APairs, N);
+    for i:= 0 to N-1 do
+    begin
+      //borrowed reference, valid while the parent list is alive
+      ObjItem:= PyList_GetItem(ObjPairs, i);
+      if ObjItem=nil then
+      begin
+        MsgLogConsole('ERROR: diff_proc DIF_CHARS cannot read pair #'+IntToStr(i));
+        SetLength(APairs, 0);
+        exit;
+      end;
+      if PyObject_TypeCheck(ObjItem, PyTuple_Type) then
+      begin
+        if PyTuple_Size(ObjItem)<>2 then
+        begin
+          MsgLogConsole('ERROR: diff_proc DIF_CHARS pair #'+IntToStr(i)+' must have exactly 2 strings');
+          SetLength(APairs, 0);
+          exit;
+        end;
+        ObjS1:= PyTuple_GetItem(ObjItem, 0);
+        ObjS2:= PyTuple_GetItem(ObjItem, 1);
+      end
+      else
+      if PyObject_TypeCheck(ObjItem, PyList_Type) then
+      begin
+        if PyList_Size(ObjItem)<>2 then
+        begin
+          MsgLogConsole('ERROR: diff_proc DIF_CHARS pair #'+IntToStr(i)+' must have exactly 2 strings');
+          SetLength(APairs, 0);
+          exit;
+        end;
+        ObjS1:= PyList_GetItem(ObjItem, 0);
+        ObjS2:= PyList_GetItem(ObjItem, 1);
+      end
+      else
+      begin
+        MsgLogConsole('ERROR: diff_proc DIF_CHARS pair #'+IntToStr(i)+' must be a tuple/list of 2 strings');
+        SetLength(APairs, 0);
+        exit;
+      end;
+      if (ObjS1=nil) or (ObjS1^.ob_type<>PyUnicode_Type) or
+         (ObjS2=nil) or (ObjS2^.ob_type<>PyUnicode_Type) then
+      begin
+        MsgLogConsole('ERROR: diff_proc DIF_CHARS pair #'+IntToStr(i)+' must contain two str values');
+        SetLength(APairs, 0);
+        exit;
+      end;
+      APairs[i].S1:= string(PyUnicodeAsUTF8String(ObjS1));
+      APairs[i].S2:= string(PyUnicodeAsUTF8String(ObjS2));
+    end;
+  end;
+  Result:= true;
 end;
 
 { TCudaDiffThread -- runs one text compare in a background OS thread.
@@ -11458,11 +11631,13 @@ type
     FFlags: Integer;
     FStr1: string;
     FStr2: string;
+    FCharPairs: TPyDiffCharPairArray;   //batched DIF_CHARS input (DIF_CHARS only)
     FCallbackStr: string;      //non-empty: 'module.func' string callback
     FCallbackObj: PPyObject;   //non-nil: Python callable, we own a strong ref
-    FOpcodes: TPyDiffOpcodeArray;
+    FOpcodes: TPyDiffOpcodeArray;       //DIF_TEXTS result
+    FCharOpcodes: TPyDiffOpcodeMatrix;  //batched DIF_CHARS result: one list per pair
     FErrorMessage: string;
-    FCancelFlag: Boolean;      //set by DIF_CANCEL (main thread); polled by the engines and re-checked in DoCallback
+    FCancelFlag: Boolean;      //set by DIF_CANCEL (main thread); polled by the engines, between batched pairs, and re-checked in DoCallback
     procedure ComputeDiff;
     procedure DoCallback; //main thread, via Synchronize
     procedure ReleaseCallbackObj; //main thread: release the strong ref to the callable
@@ -11472,11 +11647,13 @@ type
   public
     constructor Create(AJobId, AIdAction, AAlgo, AFlags: Integer;
       const AStr1, AStr2, ACallbackStr: string;
-      ACallbackObj: PPyObject);
+      ACallbackObj: PPyObject;
+      const ACharPairs: TPyDiffCharPairArray);
   end;
 
 constructor TCudaDiffThread.Create(AJobId, AIdAction, AAlgo, AFlags: Integer;
-  const AStr1, AStr2, ACallbackStr: string; ACallbackObj: PPyObject);
+  const AStr1, AStr2, ACallbackStr: string; ACallbackObj: PPyObject;
+  const ACharPairs: TPyDiffCharPairArray);
 begin
   inherited Create(true{CreateSuspended});
   FreeOnTerminate:= true;
@@ -11486,6 +11663,7 @@ begin
   FFlags:= AFlags;
   FStr1:= AStr1;
   FStr2:= AStr2;
+  FCharPairs:= ACharPairs;
   FCallbackStr:= ACallbackStr;
   FCallbackObj:= ACallbackObj;
   FCancelFlag:= false;
@@ -11524,6 +11702,7 @@ var
   OpcodesMyers: CudaDiffMyers.TDiffOpcodeArray;
   OpcodesHistogram: CudaDiffHistogram.TDiffOpcodeArray;
   OpcodesChars: CudaDiffChars.TDiffOpcodeArray;
+  i: integer;
 begin
   FErrorMessage:= '';
   try
@@ -11552,10 +11731,23 @@ begin
         end;
       DIF_CHARS:
         begin
-          //char-level diff: FAlgo is ignored — char diff always uses
-          //WinMerge's stringdiffs (ONP algorithm) internally
-          OpcodesChars:= CudaDiffChars.DoDiffChars(FStr1, FStr2, FFlags);
-          DiffOpcodesFromChars(FOpcodes, OpcodesChars);
+          //BATCHED char-level diff: every pair of FCharPairs is compared
+          //independently (char diff always uses WinMerge's stringdiffs /
+          //ONP internally; FAlgo is ignored). The flag is re-checked
+          //BETWEEN pairs: a batch of hundreds of thousands of small pairs
+          //must stop promptly on DIF_CANCEL too, not only inside one long
+          //engine run (each pair's engine call is short). The plain
+          //boolean load needs no lock — same pattern as the engines'
+          //threadvar polls.
+          SetLength(FCharOpcodes, Length(FCharPairs));
+          for i:= 0 to High(FCharPairs) do
+          begin
+            if FCancelFlag then
+              raise CudaDiffChars.EDiffCancelled.Create('diff cancelled');
+            OpcodesChars:= CudaDiffChars.DoDiffChars(
+              FCharPairs[i].S1, FCharPairs[i].S2, FFlags);
+            DiffOpcodesFromChars(FCharOpcodes[i], OpcodesChars);
+          end;
         end;
     else
       FErrorMessage:= 'diff_proc gets unknown id: '+IntToStr(FIdAction);
@@ -11599,9 +11791,12 @@ begin
 
   //release the big input texts before the callback runs: the callback
   //handler in the plugin usually makes its own copies of the compared
-  //data, so keeping FStr1/FStr2 alive here only wastes memory
+  //data, so keeping FStr1/FStr2 alive here only wastes memory. The same
+  //holds for the batched DIF_CHARS input strings (FCharPairs can hold
+  //hundreds of thousands of line copies on big files).
   FStr1:= '';
   FStr2:= '';
+  SetLength(FCharPairs, 0);
 
   //Unregister BEFORE the callback phase: after this, DIF_CANCEL can no
   //longer find the job (returns False -- "not running"), so no
@@ -11655,10 +11850,16 @@ begin
     MsgLogConsole('ERROR: diff_proc exception: '+FErrorMessage);
 
   try
-    //result object passed to the callback: the opcode list, or None on
-    //error (the same contract the synchronous form of diff_proc has)
+    //result object passed to the callback: the opcode list (DIF_TEXTS)
+    //or the list of per-pair opcode lists (batched DIF_CHARS), or None
+    //on error (the same contract the synchronous form of diff_proc has)
     if FErrorMessage='' then
-      Obj:= DiffOpcodesToPyList(FOpcodes)
+    begin
+      if FIdAction=DIF_CHARS then
+        Obj:= DiffCharOpcodesToPyList(FCharOpcodes)
+      else
+        Obj:= DiffOpcodesToPyList(FOpcodes);
+    end
     else
       Obj:= AppPython.Engine.ReturnNone();
 
@@ -11717,12 +11918,16 @@ begin
 end;
 
 //diff_proc implementation. Three call shapes:
-//  diff_proc(DIF_TEXTS/DIF_CHARS, text1, text2, algo, flags, callback)
+//  diff_proc(DIF_TEXTS, text1, text2, algo, flags, callback)
+//  diff_proc(DIF_CHARS, pairs, param2, algo, flags, callback)
 //  -- callback present: ASYNCHRONOUS, spawns TCudaDiffThread and returns
 //     the job handle (positive int) at once, so the app keeps processing
 //     UI messages; the callback fires on the main thread when done.
 //     Callback absent: SYNCHRONOUS, blocks until done and returns the
-//     opcode list (use for small texts only -- it freezes the UI).
+//     result (DIF_TEXTS: opcode list; DIF_CHARS: list of per-pair opcode
+//     lists) -- use for small inputs only, it freezes the UI.
+//     DIF_CHARS takes the WHOLE batch of pairs in param1 (a list of
+//     (text1, text2) tuples); param2 is unused for DIF_CHARS.
 //  diff_proc(DIF_CANCEL, job_handle)
 //  -- cooperative cancellation of a running background compare; returns
 //     True when the job was found and cancellation was requested, False
@@ -11732,6 +11937,8 @@ var
   IdAction: Integer;
   ObjParam1, ObjParam2: PPyObject;
   Str1, Str2: string;
+  CharPairs: TPyDiffCharPairArray;
+  CharOpcodes: TPyDiffOpcodeMatrix;
   NAlgo, NFlags: Integer;
   PtrCallback: PPyObject;
   StrCallback: string;
@@ -11749,6 +11956,7 @@ begin
   PtrCallback:= nil;
   ObjParam1:= nil;
   ObjParam2:= nil;
+  CharPairs:= nil;
 
   with AppPython.Engine do
   begin
@@ -11756,8 +11964,9 @@ begin
 
     //'iO|OiiO': required (id, param1-object); optional (param2-object,
     //algo, flags, callback). param1/param2 are converted per action below
-    //(strings for DIF_TEXTS/DIF_CHARS, an int job handle for DIF_CANCEL),
-    //which lets the DIF_CANCEL form pass a plain int as param1.
+    //(two strings for DIF_TEXTS, a list of string pairs for DIF_CHARS,
+    //an int job handle for DIF_CANCEL), which lets the DIF_CANCEL form
+    //pass a plain int as param1 and DIF_CHARS ignore param2 entirely.
     if not Bool(PyArg_ParseTuple(Args, 'iO|OiiO:diff_proc',
       @IdAction, @ObjParam1, @ObjParam2, @NAlgo, @NFlags, @PtrCallback)) then
       Exit;
@@ -11803,15 +12012,25 @@ begin
       Exit(ReturnNone);
     end;
 
-    //DIF_TEXTS / DIF_CHARS: both params must be text strings
-    if (ObjParam1 = nil) or (ObjParam1^.ob_type<>PyUnicode_Type) or
-       (ObjParam2 = nil) or (ObjParam2^.ob_type<>PyUnicode_Type) then
+    //DIF_TEXTS: param1 and param2 are two text strings.
+    //DIF_CHARS (BATCHED): param1 is a list of (text1, text2) string
+    //pairs; param2 is UNUSED (the Python wrapper passes None).
+    if IdAction = DIF_TEXTS then
     begin
-      MsgLogConsole('ERROR: diff_proc params must be two strings for DIF_TEXTS/DIF_CHARS');
-      Exit(ReturnNone);
+      if (ObjParam1 = nil) or (ObjParam1^.ob_type<>PyUnicode_Type) or
+         (ObjParam2 = nil) or (ObjParam2^.ob_type<>PyUnicode_Type) then
+      begin
+        MsgLogConsole('ERROR: diff_proc params must be two strings for DIF_TEXTS');
+        Exit(ReturnNone);
+      end;
+      Str1:= string(PyUnicodeAsUTF8String(ObjParam1));
+      Str2:= string(PyUnicodeAsUTF8String(ObjParam2));
+    end
+    else
+    begin
+      if not DiffParseCharPairs(ObjParam1, CharPairs) then
+        Exit(ReturnNone);
     end;
-    Str1:= string(PyUnicodeAsUTF8String(ObjParam1));
-    Str2:= string(PyUnicodeAsUTF8String(ObjParam2));
 
     //the optional 6th argument selects the async mode: either a string
     //'module.func' or any Python callable
@@ -11845,7 +12064,7 @@ begin
       else
         DiffJobLastId:= 1;
       TCudaDiffThread.Create(DiffJobLastId, IdAction, NAlgo, NFlags,
-        Str1, Str2, StrCallback, ObjCallback);
+        Str1, Str2, StrCallback, ObjCallback, CharPairs);
       Exit(PyLong_FromLong(DiffJobLastId));
     end;
 
@@ -11877,11 +12096,20 @@ begin
           end;
         DIF_CHARS:
           begin
-            //char-level diff. NAlgo is ignored — char diff always uses
-            //WinMerge's stringdiffs (ONP algorithm) internally.
-            OpcodesChars:= CudaDiffChars.DoDiffChars(Str1, Str2, NFlags);
-            DiffOpcodesFromChars(Opcodes, OpcodesChars);
-            Result:= DiffOpcodesToPyList(Opcodes);
+            //BATCHED char-level diff, synchronous form: every pair is
+            //compared independently in one pass. NAlgo is ignored —
+            //char diff always uses WinMerge's stringdiffs (ONP
+            //algorithm) internally. The synchronous form cannot be
+            //cancelled (no job handle exists); the engines' cancel
+            //threadvar is nil on the main thread, so nothing polls.
+            SetLength(CharOpcodes, Length(CharPairs));
+            for I:= 0 to High(CharPairs) do
+            begin
+              OpcodesChars:= CudaDiffChars.DoDiffChars(
+                CharPairs[I].S1, CharPairs[I].S2, NFlags);
+              DiffOpcodesFromChars(CharOpcodes[I], OpcodesChars);
+            end;
+            Result:= DiffCharOpcodesToPyList(CharOpcodes);
           end;
       end;
     except

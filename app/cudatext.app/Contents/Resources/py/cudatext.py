@@ -1410,25 +1410,34 @@ def finder_proc(id_finder, id_action, value="", setcaret=True):
 
 def diff_proc(id, param1, param2=None, algo=0, flags=0, callback=None):
     """
-    Compares two texts, returns difflib-compatible opcodes.
+    Compares texts, returns difflib-compatible opcodes.
 
     id: DIF_TEXTS -- param1/param2 are raw texts (split on CRLF/CR/LF inside
-    the native engine); DIF_CHARS -- param1/param2 are compared at char level.
+    the native engine); DIF_CHARS -- BATCHED char-level compare: param1 is
+    a LIST of (text1, text2) string pairs, param2 is unused. All pairs are
+    compared in ONE native engine call -- instead of one diff_proc call
+    per pair (hundreds of thousands of API round-trips on big files), the
+    whole batch runs in a single pass.
     algo: DIFF_ALGO_MYERS (default) or DIFF_ALGO_HISTOGRAM, DIF_TEXTS only.
-    flags: bitmask of DIFF_IGN_* constants.
+    flags: bitmask of DIFF_IGN_* constants (applied to every pair of a
+    DIF_CHARS batch identically).
 
     Without `callback` (default) the call is synchronous: it blocks until
-    the compare finishes and returns a list of
-    (tag, i1, i2, j1, j2) tuples, tag being 'equal'/'delete'/'insert'/
-    'replace'/'ignore'; returns None on error. Warning: plugin Python code
-    runs on the main GUI thread, so a long compare freezes CudaText --
-    use this form for small texts only.
+    the compare finishes and returns the result (None on error):
+    - DIF_TEXTS: a list of (tag, i1, i2, j1, j2) tuples, tag being
+      'equal'/'delete'/'insert'/'replace'/'ignore';
+    - DIF_CHARS: a list with ONE opcode list per input pair, in the same
+      order -- each element is the same (tag, i1, i2, j1, j2) list DIF_TEXTS
+      returns for a pair's two texts. Two empty strings give [].
+    Warning: plugin Python code runs on the main GUI thread, so a long
+    compare freezes CudaText -- use this form for small inputs only.
 
     With `callback` the call is asynchronous: it returns a job handle
     (positive int) at once and the compare runs in a background thread,
-    so CudaText stays responsive. When the compare finishes, `callback`
-    runs on the main thread with a single argument `opcodes`, holding
-    the same list the synchronous form returns (None on error):
+    so CudaText stays responsive. This works for BOTH DIF_TEXTS and the
+    batched DIF_CHARS. When the compare finishes, `callback` runs on the
+    main thread with a single argument `opcodes`, holding the same list
+    the synchronous form returns (None on error):
         def on_diff(opcodes): ...
     `callback` can be a string 'module_name.function_name' or any Python
     callable (function, lambda, bound method).
@@ -1436,17 +1445,22 @@ def diff_proc(id, param1, param2=None, algo=0, flags=0, callback=None):
     id: DIF_CANCEL -- cancels the background compare identified by the job
     handle in param1 (the positive int the asynchronous form returned):
         cudatext.diff_proc(cudatext.DIF_CANCEL, job)
-    Returns True when the job was found and cancellation was requested,
-    False when no such job is running (it already finished or never
-    existed). Cancellation is cooperative: the engine's diff loops notice
-    the request within a couple of seconds and unwind, releasing
-    everything the compare allocated. The completion callback of a
-    cancelled compare is NEVER invoked.
+    Works for DIF_TEXTS and DIF_CHARS jobs alike. Returns True when the
+    job was found and cancellation was requested, False when no such job
+    is running (it already finished or never existed). Cancellation is
+    cooperative: the engine's diff loops notice the request within a
+    couple of seconds and unwind, releasing everything the compare
+    allocated; a DIF_CHARS batch also re-checks the flag between pairs,
+    so a batch of many small pairs stops promptly too. The completion
+    callback of a cancelled compare is NEVER invoked.
     """
     if id == DIF_CANCEL:
         # param1 is the job handle returned by the asynchronous form;
         # the other parameters are not used for cancellation.
         return ct.diff_proc(id, param1)
+    # DIF_TEXTS: param1/param2 are the two texts. DIF_CHARS: param1 is the
+    # whole list of (text1, text2) pairs; param2/algo are ignored by the
+    # engine for DIF_CHARS (pass None), same call shape either way.
     return ct.diff_proc(id, param1, param2, algo, flags, callback)
 
 
