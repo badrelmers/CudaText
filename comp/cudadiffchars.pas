@@ -27,6 +27,15 @@
     function DoDiffChars(const ATextA, ATextB: string;
                         AFlags: Integer): TDiffOpcodeArray;
 
+    TDiffCharsBatch = class;
+
+  (see the G35 note in the divergence list below: the batched runner
+  that reuses ONE TStringDiff -- with every scratch buffer pooled --
+  across a whole DIF_CHARS batch, so a compared pair costs ~one heap
+  allocation in steady state. formmain_py_api.inc runs BOTH the async
+  background loop and the synchronous form of batched DIF_CHARS
+  through TDiffCharsBatch.)
+
   ----------------------------------------------------------------
   Source files ported
   ----------------------------------------------------------------
@@ -188,6 +197,29 @@
       are real anchors. WinMerge has no ignore-numbers option and its
       whitespace handling does not skip tokens this way, so there is no
       upstream counterpart.
+
+  22. POOLED ENGINE STATE (G35): TStringDiff owns every scratch buffer
+      the char-diff pipeline uses (decoded UTF-32 inputs, word arrays,
+      ONP fp/es/ses/edscript, wdiffs, pDiffs, byte substrings, digit
+      strip arrays/maps, opcode raw scratch) as GROW-ONLY pooled fields
+      with separate logical-length counters; TDiffCharsBatch reuses one
+      instance across a whole batch, so a compared pair costs ~ONE heap
+      allocation (its result array) in steady state.
+      REASON: batched DIF_CHARS runs the engine on a secondary OS thread
+      (TCudaDiffThread), and FPC's default heap manager penalizes
+      allocations made from fresh secondary threads catastrophically.
+      Measured with this exact engine (FPC 3.2.2, x86_64, 200k pairs,
+      per-pair runs): 44.5 us/pair on the main thread vs 270 us/pair on
+      a fresh TThread (6.1x slower); the same code linked with glibc
+      malloc instead runs 4.7-5.0 us/pair on BOTH threads. The old
+      per-pair path made ~50-400 SetLength heap calls per pair
+      (grow-by-one edit-script rows, ses, wdiffs, pDiffs, word-array
+      alloc+trim, byte substrings, UTF-8 decode temps) -- on the worker
+      thread that churn alone dominated the batched-DIF_CHARS run
+      (~6.6x slower than the old per-pair main-thread path).
+      Buffer pooling removes the allocator from the hot path entirely;
+      the algorithm, its results, and its cancel/timeout behavior are
+      unchanged (verified pair-by-pair against the pre-pooling engine).
 *)
 
 unit CudaDiffChars;
@@ -311,12 +343,24 @@ type
   { Ported from stringdiffsi.h:46-127 — the stringdiffs class.
     Holds together data needed to implement ComputeWordDiffs.
     We use a class (not unit-level functions) to match WinMerge's
-    structure exactly. The constructor takes references to the two
-    strings (TCodePointArrays) and the options. }
+    structure exactly.
+
+    G35 POOLED INSTANCE STATE: besides the WinMerge fields, the
+    instance owns every scratch buffer the pipeline allocates, as
+    grow-only dynamic arrays with SEPARATE logical-length counters
+    (FLen1/FLen2 for the decoded inputs, FWords*Len, FWdiffsLen,
+    FEdscriptLen, FEsLens per ONP diagonal, FSesLen, FPDiffsLen). A
+    reused instance therefore performs ~one heap allocation per
+    compared pair (the fresh result array) in steady state, instead
+    of the ~50-400 SetLength calls the per-call locals used to make.
+    See the unit header (G35) for why that matters so much when the
+    engine runs on a secondary thread. }
   TStringDiff = class
   private
     FStr1: TCodePointArray;
     FStr2: TCodePointArray;
+    FLen1: Integer;             { logical length of FStr1 (capacity may be larger) }
+    FLen2: Integer;             { logical length of FStr2 }
     FWhitespace: Integer;
     FBreakType: Integer;
     FCaseSensitive: Boolean;
@@ -326,13 +370,36 @@ type
       emission - see EmitWdiff (G34). }
     FSawMatchSinceDiff: Boolean;
     FMatchBlock: Boolean;
-    FPDiffs: ^TwdiffArray;     // pointer to caller's array (we Append to it)
     FWords1: TWordArray;
     FWords2: TWordArray;
+    FWords1Len: Integer;        { logical length of FWords1 }
+    FWords2Len: Integer;        { logical length of FWords2 }
     FWdiffs: TwdiffArray;
+    FWdiffsLen: Integer;        { logical length of FWdiffs }
     { FEdscript is filled by onp() and read by BuildWordDiffList_DP().
       Equivalent to the C++ `std::vector<char> edscript` passed by reference. }
     FEdscript: array of Char;
+    FEdscriptLen: Integer;      { logical length of FEdscript }
+
+    { --- G35 pooled ONP scratch --- }
+    FFp: array of Integer;              { furthest-point array, k in [-(M+1)..N+1] }
+    FEs: TEditScriptElemMatrix;         { edit-script history per diagonal }
+    FEsLens: array of Integer;           { logical length of each FEs[k] }
+    FSes: array of Char;                 { walk-back script buffer }
+    FSesLen: Integer;
+
+    { --- G35 pooled byte-refinement scratch --- }
+    FSub1: TCodePointArray;             { wordLevelToByteLevel substrings }
+    FSub2: TCodePointArray;
+    FDigits1: TCodePointArray;          { ComputeByteDiff digit-stripped arrays }
+    FDigits2: TCodePointArray;
+    FMap1: array of Integer;            { stripped->original index maps }
+    FMap2: array of Integer;
+
+    { --- G35 pooled output scratch --- }
+    FPDiffsBuf: TwdiffArray;            { PopulateDiffs target (the old pDiffs) }
+    FPDiffsLen: Integer;
+    FOpRaw: TDiffOpcodeArray;           { WdiffsToOpcodesInto raw scratch }
 
     { Ported from stringdiffs.cpp:554-613 — AreWordsSame.
       Checks if two words are considered equal under the current options. }
@@ -345,9 +412,13 @@ type
     { Ported from stringdiffsi.h:99-102 — IsEOL inline. }
     function IsEOL(const w: TWord): Boolean; inline;
 
-    { Ported from stringdiffs.cpp:420-482 — BuildWordsArray.
-      Splits a TCodePointArray into tokens. }
-    function BuildWordsArray(const S: TCodePointArray): TWordArray;
+    { Ported from stringdiffs.cpp:420-482 — BuildWordsArray, pooled
+      variant (G35): splits a TCodePointArray into tokens, writing them
+      into the grow-only Dst buffer; DstLen is the token count (the
+      buffer's capacity is NOT trimmed — the old alloc+trim pair is
+      gone). }
+    procedure BuildWordsInto(const S: TCodePointArray; SLen: Integer;
+      var Dst: TWordArray; var DstLen: Integer);
 
     { Ported from stringdiffs.cpp:519-549 — Hash (diffutils rolling hash).
       HASH(h, c) := c + ROL(h, 7). Wraps on overflow intentionally. }
@@ -360,7 +431,7 @@ type
     { Ported from stringdiffs.cpp:618-730 — onp (O(NP) Sequence Comparison).
       Sun Wu, Udi Manber, Gene Myers (1990).
       Returns edit distance D (>=0) or -1 on timeout.
-      Fills edscript with the post-processed edit script alphabet:
+      Fills FEdscript with the post-processed edit script alphabet:
       '=' (match), '-' (delete), '+' (insert), '!' (replace). }
     function onp: Integer;
 
@@ -368,30 +439,74 @@ type
       Advances while words match, returns the new y position. }
     function snake(k, y, M, N: Integer; exchanged: Boolean): Integer;
 
+    { ONP edit-script append, pooled (G35). Ported from the lambda
+      addEditScriptElem in stringdiffs.cpp:634-650: computes the new
+      element from fp[k-1] and fp[k+1], then appends it to FEs[k]
+      (grow-only capacity, logical length in FEsLens). }
+    procedure AddEditScriptElem(esBase, fpBase, k: Integer);
+
     { Ported from stringdiffs.cpp:489-517 — PopulateDiffs.
-      Coalesces adjacent wdiffs where end[i]+1 == next.begin[i] on BOTH sides. }
+      Coalesces adjacent wdiffs where end[i]+1 == next.begin[i] on BOTH sides.
+      Appends the survivors into the pooled FPDiffsBuf (G35). }
     procedure PopulateDiffs;
 
     { Ported from stringdiffs.cpp:853-1074 — ComputeByteDiff.
       Refines a word-level diff down to character level using a two-pointer
-      scan (forward + reverse). }
-    procedure ComputeByteDiff(const str1, str2: TCodePointArray;
+      scan (forward + reverse). Pooled variant (G35): the digit-strip
+      buffers and index maps are grow-only fields; explicit str1Len/
+      str2Len parameters carry the logical lengths. }
+    procedure ComputeByteDiff(const str1: TCodePointArray; str1Len: Integer;
+      const str2: TCodePointArray; str2Len: Integer;
       casitive: Boolean; xwhite: Integer; ignore_numbers: Boolean;
       var begin0, begin1, end0, end1: Integer; equal: Boolean);
-    procedure ComputeByteDiffCore(const str1, str2: TCodePointArray;
+    procedure ComputeByteDiffCore(const str1: TCodePointArray; str1Len: Integer;
+      const str2: TCodePointArray; str2Len: Integer;
       casitive: Boolean; xwhite: Integer;
       var begin0, begin1, end0, end1: Integer; equal: Boolean);
 
     { Ported from stringdiffs.cpp:1083-1113 — wordLevelToByteLevel.
       Refines each wdiff down to character level by calling ComputeByteDiff
-      on the substring. }
+      on the substring (pooled substrings, G35). }
     procedure wordLevelToByteLevel;
+
+    { WdiffsToOpcodes as a pooled method (G35): converts the pooled
+      FPDiffsBuf[0..diffsLen-1] wdiff list into a FRESH AOut opcode
+      array, using the grow-only FOpRaw scratch instead of a per-call
+      raw buffer. Body is the pre-G35 WdiffsToOpcodes verbatim. }
+    procedure WdiffsToOpcodesInto(diffsLen, sizeA, sizeB: Integer;
+      var AOut: TDiffOpcodeArray);
   public
-    { Ported from stringdiffs.cpp:237-250 — constructor. }
-    constructor Create(const str1, str2: TCodePointArray;
-      case_sensitive: Boolean; eol_mode: TEolCompareMode;
-      whitespace: Integer; ignore_numbers: Boolean; breakType: Integer;
-      var pDiffs: TwdiffArray);
+    { Bare constructor: all pooled buffers start empty (nil) and grow on
+      first use; per-pair options are set by DiffStrings/SetOptions.
+      Replaces the old WinMerge-mirroring constructor that copied the
+      input arrays and a pDiffs pointer — with pooled state the inputs
+      are either decoded into FStr1/FStr2 (DiffStrings) or referenced
+      (SetExternalInput), and the pDiffs target is the pooled buffer. }
+    constructor Create;
+
+    { Legacy 2-array entry (ComputeWordDiffs): reference the caller's
+      arrays as this pair's inputs. Only meaningful on a freshly
+      created instance (a pooled instance that ran DiffStrings would
+      re-bind FStr1/FStr2 away from its pooled buffers). }
+    procedure SetExternalInput(const str1, str2: TCodePointArray);
+
+    { Set the WinMerge options (the values the old constructor took). }
+    procedure SetOptions(case_sensitive: Boolean; eol_mode: TEolCompareMode;
+      whitespace: Integer; ignore_numbers: Boolean; breakType: Integer);
+
+    { Full pipeline for ONE string pair on the pooled state (G35):
+      decode UTF-8 into the pooled input buffers, map DIFF_IGN_* flags
+      (identically to the old DoDiffChars), run BuildWordDiffList +
+      wordLevelToByteLevel + PopulateDiffs, then emit a FRESH opcode
+      array into AOut. Output is identical to DoDiffChars(same args).
+      Raises EDiffCancelled when the calling thread's diff job was
+      cancelled (cooperative; same polls the engine always had). }
+    procedure DiffStrings(const ATextA, ATextB: string; AFlags: Integer;
+      var AOut: TDiffOpcodeArray);
+
+    { Copy the pooled PopulateDiffs result into a fresh array (legacy
+      ComputeWordDiffs contract: the caller owns the result). }
+    procedure GetPooledDiffs(var AOut: TwdiffArray);
 
     { Ported from stringdiffs.cpp:390-415 — BuildWordDiffList.
       Top-level entry: build word arrays, run ONP, fall back to single
@@ -404,6 +519,37 @@ type
 
     { Ported from stringdiffs.cpp:489-517 — PopulateDiffs wrapper. }
     procedure PopulateDiffsWrapper;
+  end;
+
+  { TDiffCharsBatch — batched char-level diff runner (G35).
+
+    Owns ONE reused TStringDiff (with all of its pooled scratch
+    buffers), so a batch of N pairs runs the engine N times with ~N
+    heap allocations total (the per-pair result arrays) instead of
+    ~50-400 per pair. Created once per diff_proc(DIF_CHARS) batch —
+    formmain_py_api.inc runs BOTH the async background loop
+    (TCudaDiffThread.ComputeDiff) and the synchronous form
+    (api_diff_proc) through this class — and freed when the batch
+    ends.
+
+    Thread-safety: one instance per thread, exactly like the engine
+    itself (all state is per-batch; no internal synchronization). }
+  TDiffCharsBatch = class
+  public
+    constructor Create;
+    destructor Destroy; override;
+
+    { Compare one pair; replaces AOut with a FRESH result array owned
+      by the caller. Results are identical to
+      DoDiffChars(ATextA, ATextB, AFlags). Raises EDiffCancelled when
+      the current thread's diff job was cancelled (the engine's
+      cooperative polls; the batch loop in formmain also re-checks
+      its cancel flag BETWEEN pairs — cancellation stays responsive
+      exactly as before). }
+    procedure ComparePair(const ATextA, ATextB: string; AFlags: Integer;
+      var AOut: TDiffOpcodeArray);
+  private
+    FEngine: TStringDiff;
   end;
 
 { Public API — ported from stringdiffs.cpp:54-60 (the 2-string overload).
@@ -479,28 +625,126 @@ begin
   if a > b then Result := a else Result := b;
 end;
 
-{ Helper: append an edit script element to es[k].
-  Ported from the lambda addEditScriptElem in stringdiffs.cpp:634-650.
-  Computes the new element from fp[k-1] and fp[k+1], then appends. }
-procedure AddEditScriptElem(var es: TEditScriptElemMatrix; esBase: Integer;
-  const fp: array of Integer; fpBase: Integer; k: Integer;
-  out newElem: TEditScriptElem);
+{ G35 helper: new capacity for a pooled grow-only buffer — at least
+  'need', preferably double the current capacity, with a small floor
+  so the first grows don't do one-element steps. Callers only call
+  SetLength when the logical need exceeds the current capacity. }
+function GrowCap(cur, need: Integer): Integer; inline;
 begin
-  if fp[fpBase + k - 1] + 1 > fp[fpBase + k + 1] then
-  begin
-    newElem.op := '+';
-    newElem.neq := fp[fpBase + k] - (fp[fpBase + k - 1] + 1);
-    newElem.pk := k - 1;
-  end
+  if need <= cur then
+    Exit(cur);
+  if cur * 2 >= need then
+    Exit(cur * 2);
+  if need < 4 then
+    Result := 4
   else
+    Result := need;
+end;
+
+{ ------------------------------------------------------------------
+  UTF8ToUTF32Into — pooled variant of UTF8ToUTF32 (G35).
+  Decodes S into the grow-only Dst buffer (no temp array, no
+  per-call allocs); DstLen is the decoded code point count. The
+  decode body, its validation and its cancellation poll are the
+  UTF8ToUTF32 body verbatim — only the destination changed.
+  ------------------------------------------------------------------ }
+procedure UTF8ToUTF32Into(const S: string; var Dst: TCodePointArray;
+  var DstLen: Integer);
+var
+  n, i, outCount: Integer;
+  raw: PByte;
+  cp: UInt32;
+  b1, b2, b3, b4: Byte;
+begin
+  n := Length(S);
+  if n = 0 then
   begin
-    newElem.op := '-';
-    newElem.neq := fp[fpBase + k] - fp[fpBase + k + 1];
-    newElem.pk := k + 1;
+    DstLen := 0;
+    Exit;
   end;
-  newElem.pi := Length(es[esBase + newElem.pk]) - 1;
-  SetLength(es[esBase + k], Length(es[esBase + k]) + 1);
-  es[esBase + k, High(es[esBase + k])] := newElem;
+  if n > Length(Dst) then
+    SetLength(Dst, GrowCap(Length(Dst), n));
+
+  raw := PByte(Pointer(S));
+  outCount := 0;
+
+  i := 0;
+  while i < n do
+  begin
+    { Cooperative-cancellation poll: O(bytes) UTF-8 decode pass }
+    if (i and $FFFF) = 0 then
+      DiffCheckCancelled;
+    b1 := raw[i];
+    Inc(i);
+
+    if b1 < $80 then
+    begin
+      cp := b1;
+    end
+    else if (b1 and $E0) = $C0 then
+    begin
+      if i >= n then
+        raise EArgumentException.Create('UTF8ToUTF32: truncated 2-byte UTF-8 sequence');
+      b2 := raw[i];
+      Inc(i);
+      if (b2 and $C0) <> $80 then
+        raise EArgumentException.Create('UTF8ToUTF32: invalid continuation byte (2-byte seq)');
+      cp := ((UInt32(b1) and $1F) shl 6) or (UInt32(b2) and $3F);
+      if cp < $80 then
+        raise EArgumentException.Create('UTF8ToUTF32: overlong 2-byte UTF-8 sequence');
+    end
+    else if (b1 and $F0) = $E0 then
+    begin
+      if i + 1 >= n then
+        raise EArgumentException.Create('UTF8ToUTF32: truncated 3-byte UTF-8 sequence');
+      b2 := raw[i];
+      b3 := raw[i + 1];
+      Inc(i, 2);
+      if (b2 and $C0) <> $80 then
+        raise EArgumentException.Create('UTF8ToUTF32: invalid continuation byte (3-byte seq, byte 2)');
+      if (b3 and $C0) <> $80 then
+        raise EArgumentException.Create('UTF8ToUTF32: invalid continuation byte (3-byte seq, byte 3)');
+      cp := ((UInt32(b1) and $0F) shl 12)
+         or ((UInt32(b2) and $3F) shl 6)
+         or ((UInt32(b3) and $3F));
+      if cp < $800 then
+        raise EArgumentException.Create('UTF8ToUTF32: overlong 3-byte UTF-8 sequence');
+      if (cp >= $D800) and (cp <= $DFFF) then
+        raise EArgumentException.Create('UTF8ToUTF32: UTF-16 surrogate code point in UTF-8');
+    end
+    else if (b1 and $F8) = $F0 then
+    begin
+      if i + 2 >= n then
+        raise EArgumentException.Create('UTF8ToUTF32: truncated 4-byte UTF-8 sequence');
+      b2 := raw[i];
+      b3 := raw[i + 1];
+      b4 := raw[i + 2];
+      Inc(i, 3);
+      if (b2 and $C0) <> $80 then
+        raise EArgumentException.Create('UTF8ToUTF32: invalid continuation byte (4-byte seq, byte 2)');
+      if (b3 and $C0) <> $80 then
+        raise EArgumentException.Create('UTF8ToUTF32: invalid continuation byte (4-byte seq, byte 3)');
+      if (b4 and $C0) <> $80 then
+        raise EArgumentException.Create('UTF8ToUTF32: invalid continuation byte (4-byte seq, byte 4)');
+      cp := ((UInt32(b1) and $07) shl 18)
+         or ((UInt32(b2) and $3F) shl 12)
+         or ((UInt32(b3) and $3F) shl 6)
+         or ((UInt32(b4) and $3F));
+      if cp < $10000 then
+        raise EArgumentException.Create('UTF8ToUTF32: overlong 4-byte UTF-8 sequence');
+      if cp > $10FFFF then
+        raise EArgumentException.Create('UTF8ToUTF32: code point exceeds U+10FFFF');
+    end
+    else
+    begin
+      raise EArgumentException.Create('UTF8ToUTF32: invalid UTF-8 lead byte');
+    end;
+
+    Dst[outCount] := cp;
+    Inc(outCount);
+  end;
+
+  DstLen := outCount;
 end;
 
 { ------------------------------------------------------------------
@@ -660,24 +904,117 @@ end;
   TStringDiff methods
   ------------------------------------------------------------------ }
 
-constructor TStringDiff.Create(const str1, str2: TCodePointArray;
-  case_sensitive: Boolean; eol_mode: TEolCompareMode;
-  whitespace: Integer; ignore_numbers: Boolean; breakType: Integer;
-  var pDiffs: TwdiffArray);
-{ Ported from stringdiffs.cpp:237-250 — constructor.
-  Simply loads all members from arguments.
-  m_matchblock is hardcoded to true (matches WinMerge's default). }
+constructor TStringDiff.Create;
+{ G35: bare constructor — the old WinMerge-mirroring constructor took
+  the input arrays + options + a pDiffs pointer; with pooled state the
+  inputs are decoded into FStr1/FStr2 (DiffStrings) or referenced
+  (SetExternalInput), options come from DiffStrings/SetOptions, and
+  the pDiffs target is the pooled FPDiffsBuf. All logical lengths
+  start at 0; buffers stay nil until first use. m_matchblock is
+  hardcoded to true (matches WinMerge's default). }
 begin
   inherited Create;
+  FLen1 := 0;
+  FLen2 := 0;
+  FWords1Len := 0;
+  FWords2Len := 0;
+  FWdiffsLen := 0;
+  FEdscriptLen := 0;
+  FSesLen := 0;
+  FPDiffsLen := 0;
+  FMatchBlock := True;  // Change to false to get word to word compare
+end;
+
+procedure TStringDiff.SetExternalInput(const str1, str2: TCodePointArray);
+{ Legacy ComputeWordDiffs entry: alias the caller's arrays as this
+  pair's inputs (const assignment: refcount only, no copy). The
+  logical lengths are the arrays' real lengths. }
+begin
   FStr1 := str1;
   FStr2 := str2;
+  FLen1 := Length(str1);
+  FLen2 := Length(str2);
+end;
+
+procedure TStringDiff.SetOptions(case_sensitive: Boolean;
+  eol_mode: TEolCompareMode; whitespace: Integer; ignore_numbers: Boolean;
+  breakType: Integer);
+begin
   FWhitespace := whitespace;
   FBreakType := breakType;
   FCaseSensitive := case_sensitive;
   FEolMode := eol_mode;
   FIgnoreNumbers := ignore_numbers;
-  FMatchBlock := True;  // Change to false to get word to word compare
-  FPDiffs := @pDiffs;
+end;
+
+procedure TStringDiff.DiffStrings(const ATextA, ATextB: string;
+  AFlags: Integer; var AOut: TDiffOpcodeArray);
+{ G35: one string pair on the pooled state. The flag mapping is the
+  old DoDiffChars mapping verbatim; the pipeline order is the old
+  ComputeWordDiffs(byte_level=True) order. Steady-state heap cost:
+  ONE fresh result array (plus rare pool growth) per pair. }
+begin
+  AOut := nil;
+
+  { Decode both inputs into the pooled grow-only buffers. }
+  UTF8ToUTF32Into(ATextA, FStr1, FLen1);
+  UTF8ToUTF32Into(ATextB, FStr2, FLen2);
+
+  { G16: both empty → [] (matches difflib). }
+  if (FLen1 = 0) and (FLen2 = 0) then
+  begin
+    SetLength(AOut, 0);
+    Exit;
+  end;
+
+  { Map DIFF_IGN_* flags to WinMerge options (see G5). }
+  FCaseSensitive := (AFlags and DIFF_IGN_CASE_Private) = 0;
+  FIgnoreNumbers := (AFlags and DIFF_IGN_NUMBERS_Private) <> 0;
+
+  if (AFlags and DIFF_IGN_EOL_Private) <> 0 then
+    FEolMode := eolIgnore
+  else
+    FEolMode := eolStrict;
+  { EOL_AS_SPACE is never used via DoDiffChars — only EOL_STRICT and EOL_IGNORE. }
+
+  { Whitespace flag (G5):
+    DIFF_IGN_WHITESPACE → WHITESPACE_IGNORE_ALL
+    else → WHITESPACE_COMPARE_ALL
+    (DIFF_IGN_WHITESPACE_CHANGE / _EOL / _BEGINNING were removed from the
+    API — nothing maps to WHITESPACE_IGNORE_CHANGE anymore.) }
+  if (AFlags and DIFF_IGN_WHITESPACE_Private) <> 0 then
+    FWhitespace := WHITESPACE_IGNORE_ALL
+  else
+    FWhitespace := WHITESPACE_COMPARE_ALL;
+
+  { Note: DIFF_IGN_BLANK_LINES is accepted but has no effect here —
+    blank lines are a line-level concept (all-blank hunks are suppressed
+    by the DIF_TEXTS engines and re-tagged as 'ignore' opcodes); at
+    char level there is no hunk to suppress. DIF_CHARS never emits
+    DIFF_TAG_IGNORE. }
+
+  FBreakType := 1;    { always break on punctuation — matches Differ plugin expectations }
+  { ByteLevel := True: always refine to char level — Differ plugin uses
+    char-level highlights (the old DoDiffChars hardcoded it too). }
+
+  { The ComputeWordDiffs pipeline, in its original order. }
+  BuildWordDiffList;
+  wordLevelToByteLevel;
+  PopulateDiffs;
+
+  { Convert the pooled wdiff list → difflib opcodes (see G3) into a
+    FRESH result array. }
+  WdiffsToOpcodesInto(FPDiffsLen, FLen1, FLen2, AOut);
+end;
+
+procedure TStringDiff.GetPooledDiffs(var AOut: TwdiffArray);
+{ Legacy ComputeWordDiffs contract: the result is owned by the caller,
+  so copy the pooled pDiffs buffer into a fresh array. }
+begin
+  AOut := nil;
+  SetLength(AOut, FPDiffsLen);
+  if FPDiffsLen > 0 then
+    Move(FPDiffsBuf[0], AOut[0], FPDiffsLen * SizeOf(Twdiff));
 end;
 
 function TStringDiff.IsSpace(const w: TWord): Boolean;
@@ -752,7 +1089,7 @@ begin
   begin
     // WinMerge checks tc::istdigit(m_str1[word1.start]).
     // We use tc_istdigit on the first code point of each word.
-    if (word1.start < Length(FStr1)) and (word2.start < Length(FStr2)) then
+    if (word1.start < FLen1) and (word2.start < FLen2) then
       if tc_istdigit(FStr1[word1.start]) and tc_istdigit(FStr2[word2.start]) then
         Exit(True);
   end;
@@ -826,45 +1163,46 @@ end;
 
   Sentinel: a dummy word(0, -1, 0, 0) is prepended at index 0.
   Real tokens start at index 1. The 1-based indexing is used by onp/snake. }
-function TStringDiff.BuildWordsArray(const S: TCodePointArray): TWordArray;
+procedure TStringDiff.BuildWordsInto(const S: TCodePointArray; SLen: Integer;
+  var Dst: TWordArray; var DstLen: Integer);
 var
   i, begin_: Integer;
   break_type, prev_break_type: Integer;
   ch: TCodePoint;
-  iLen: Integer;
   count: Integer;
 begin
-  iLen := Length(S);
-  if iLen = 0 then
+  if SLen = 0 then
   begin
     { Both empty: just the dummy sentinel. }
-    SetLength(Result, 1);
-    Result[0].start := 0;
-    Result[0].end_ := -1;
-    Result[0].bBreak := 0;
-    Result[0].hash := 0;
+    if Length(Dst) < 1 then
+      SetLength(Dst, 4);
+    Dst[0].start := 0;
+    Dst[0].end_ := -1;
+    Dst[0].bBreak := 0;
+    Dst[0].hash := 0;
+    DstLen := 1;
     Exit;
   end;
 
-  { Pre-allocate up-front (O(N)) and trim at the end.
+  { Pre-allocate up-front (O(N)) and keep the capacity (G35: the old
+    per-call SetLength(iLen+2) + trim-to-count pair did two heap
+    round-trips per side; the pooled buffer keeps its capacity across
+    pairs and only DstLen shrinks).
     Worst case is 1 token per code point + 1 dummy sentinel + 1 final
-    token = iLen + 2 slots. The previous version used `Concat` per token
-    which is O(N^2) on long lines because Concat reallocates + copies
-    the whole array each time. This mirrors the optimisation used in
-    agent2's BuildWordsArray while preserving Agent1's EOL_AS_SPACE
-    branch (which agent2 omits). }
-  SetLength(Result, iLen + 2);
+    token = SLen + 2 slots. }
+  if SLen + 2 > Length(Dst) then
+    SetLength(Dst, GrowCap(Length(Dst), SLen + 2));
   count := 1;  // index 0 is reserved for the dummy sentinel
-  Result[0].start := 0;
-  Result[0].end_ := -1;
-  Result[0].bBreak := 0;
-  Result[0].hash := 0;
+  Dst[0].start := 0;
+  Dst[0].end_ := -1;
+  Dst[0].bBreak := 0;
+  Dst[0].hash := 0;
 
   i := 0;
   begin_ := 0;
   prev_break_type := 0;
 
-  while i < iLen do
+  while i < SLen do
   begin
     { Cooperative-cancellation poll: O(N) tokenization pass }
     if (i and $FFF) = 0 then
@@ -901,10 +1239,10 @@ begin
       ((prev_break_type = dleol) and not ((S[i-1] = $0D) and (ch = $0A)))
     ) then
     begin
-      Result[count].start := begin_;
-      Result[count].end_ := i - 1;
-      Result[count].bBreak := prev_break_type;
-      Result[count].hash := Hash(S, begin_, i - 1, 0);
+      Dst[count].start := begin_;
+      Dst[count].end_ := i - 1;
+      Dst[count].bBreak := prev_break_type;
+      Dst[count].hash := Hash(S, begin_, i - 1, 0);
       Inc(count);
       begin_ := i;
     end;
@@ -913,7 +1251,7 @@ begin
       Special case for EOL_AS_SPACE mode: skip consecutive whitespace/EOL. }
     if (FEolMode = eolAsSpace) and (break_type = dlspace) then
     begin
-      while i < iLen do
+      while i < SLen do
       begin
         ch := S[i];
         if (ch <> $0D) and (ch <> $0A) and (not isSafeWhitespace(ch)) then
@@ -931,14 +1269,14 @@ begin
   end;
 
   { Final token. }
-  Result[count].start := begin_;
-  Result[count].end_ := i - 1;
-  Result[count].bBreak := break_type;
-  Result[count].hash := Hash(S, begin_, i - 1, 0);
+  Dst[count].start := begin_;
+  Dst[count].end_ := i - 1;
+  Dst[count].bBreak := break_type;
+  Dst[count].hash := Hash(S, begin_, i - 1, 0);
   Inc(count);
 
-  { Trim to actual size. }
-  SetLength(Result, count);
+  { G35: logical length only — the capacity stays for the next pair. }
+  DstLen := count;
 end;
 
 { Ported from stringdiffs.cpp:732-749 — snake (diagonal extension).
@@ -994,15 +1332,13 @@ var
   M, N: Integer;
   exchanged: Boolean;
   DELTA: Integer;
-  fp: array of Integer;
-  fpBase: Integer;  // index 0 of fp maps to k = -(M+1)
-  es: TEditScriptElemMatrix;
+  size: Integer;
+  fpBase: Integer;  // index 0 of FFp maps to k = -(M+1)
   esBase: Integer;
   p, k: Integer;
   count: Integer;
   COUNTMAX: Integer;
   startTime: TDateTime;
-  ses: array of Char;
   i, j: Integer;
   D: Integer;
   nIdx: Integer;
@@ -1011,13 +1347,12 @@ var
   c: Char;
   cnt: Integer;
   esi: TEditScriptElem;
-  newElem: TEditScriptElem;
   nextExpected: Char;
 begin
   startTime := Now;
 
-  M := Length(FWords1) - 1;
-  N := Length(FWords2) - 1;
+  M := FWords1Len - 1;
+  N := FWords2Len - 1;
   exchanged := (M > N);
   if exchanged then
   begin
@@ -1026,20 +1361,32 @@ begin
 
   { Allocate fp with indices from -(M+1) to (N+1).
     Total size: (M+1) + 1 + (N+1) = M + N + 3.
-    fpBase = M+1 (so fp[fpBase + (-(M+1))] = fp[0] corresponds to k=-(M+1)). }
-  SetLength(fp, (M+1) + 1 + (N+1));
+    fpBase = M+1 (so fp[fpBase + (-(M+1))] = fp[0] corresponds to k=-(M+1)).
+    G35: pooled grow-only buffers — no per-call heap round-trips. }
+  size := (M + 1) + 1 + (N + 1);
+  if size > Length(FFp) then
+    SetLength(FFp, GrowCap(Length(FFp), size));
   fpBase := M + 1;
 
   { Allocate es (edit script history per diagonal).
-    Each es[k] is a TEditScriptElemArray (dynamic array). }
-  SetLength(es, (M+1) + 1 + (N+1));
+    Each FEs[k] is a TEditScriptElemArray (dynamic array); its logical
+    length lives in FEsLens[k] (G35), so per-pair reset = counter write,
+    not a SetLength. }
+  if size > Length(FEs) then
+    SetLength(FEs, GrowCap(Length(FEs), size));
+  if size > Length(FEsLens) then
+    SetLength(FEsLens, GrowCap(Length(FEsLens), size));
   esBase := M + 1;
 
   DELTA := N - M;
 
-  { Initialize fp to -1 for all k. }
+  { Initialize fp to -1 for all k and reset the per-diagonal script
+    lengths (the es sub-arrays keep their capacity — G35). }
   for k := -(M+1) to (N+1) do
-    fp[fpBase + k] := -1;
+  begin
+    FFp[fpBase + k] := -1;
+    FEsLens[esBase + k] := 0;
+  end;
 
   p := -1;
   count := 0;
@@ -1050,23 +1397,23 @@ begin
     { Forward sweep: k from -p to DELTA-1. }
     for k := -p to DELTA - 1 do
     begin
-      fp[fpBase + k] := snake(k, MaxIntOf(fp[fpBase + k - 1] + 1, fp[fpBase + k + 1]), M, N, exchanged);
-      AddEditScriptElem(es, esBase, fp, fpBase, k, newElem);
+      FFp[fpBase + k] := snake(k, MaxIntOf(FFp[fpBase + k - 1] + 1, FFp[fpBase + k + 1]), M, N, exchanged);
+      AddEditScriptElem(esBase, fpBase, k);
       Inc(count);
     end;
 
     { Reverse sweep: k from DELTA+p down to DELTA+1. }
     for k := DELTA + p downto DELTA + 1 do
     begin
-      fp[fpBase + k] := snake(k, MaxIntOf(fp[fpBase + k - 1] + 1, fp[fpBase + k + 1]), M, N, exchanged);
-      AddEditScriptElem(es, esBase, fp, fpBase, k, newElem);
+      FFp[fpBase + k] := snake(k, MaxIntOf(FFp[fpBase + k - 1] + 1, FFp[fpBase + k + 1]), M, N, exchanged);
+      AddEditScriptElem(esBase, fpBase, k);
       Inc(count);
     end;
 
     { Center diagonal: k = DELTA. }
     k := DELTA;
-    fp[fpBase + k] := snake(k, MaxIntOf(fp[fpBase + k - 1] + 1, fp[fpBase + k + 1]), M, N, exchanged);
-    AddEditScriptElem(es, esBase, fp, fpBase, k, newElem);
+    FFp[fpBase + k] := snake(k, MaxIntOf(FFp[fpBase + k - 1] + 1, FFp[fpBase + k + 1]), M, N, exchanged);
+    AddEditScriptElem(esBase, fpBase, k);
     Inc(count);
 
     { Timeout check. }
@@ -1084,31 +1431,38 @@ begin
       char engine (its natural bound is O(NP) -- the 500ms timeout above
       already caps the worst case, this makes it interruptible too). }
     DiffCheckCancelled;
-  until fp[fpBase + k] = N;
+  until FFp[fpBase + k] = N;
 
-  { Build the edit script by walking back from es[DELTA][last]. }
-  SetLength(ses, 0);
+  { Build the edit script by walking back from es[DELTA][last].
+    G35: FSes is the pooled grow-only script buffer; FSesLen is its
+    logical length (the old code did one SetLength per appended
+    symbol — a realloc+copy each, i.e. O(L^2) copying per pair). }
+  FSesLen := 0;
   k := DELTA;
-  i := High(es[esBase + DELTA]);  // last index
+  i := FEsLens[esBase + DELTA] - 1;  // last index
   while i >= 0 do
   begin
-    esi := es[esBase + k][i];
+    esi := FEs[esBase + k][i];
     for j := 0 to esi.neq - 1 do
     begin
-      SetLength(ses, Length(ses) + 1);
-      ses[High(ses)] := Char('=');
+      if FSesLen >= Length(FSes) then
+        SetLength(FSes, GrowCap(Length(FSes), FSesLen + 1));
+      FSes[FSesLen] := Char('=');
+      Inc(FSesLen);
     end;
-    SetLength(ses, Length(ses) + 1);
-    ses[High(ses)] := Char(esi.op);
+    if FSesLen >= Length(FSes) then
+      SetLength(FSes, GrowCap(Length(FSes), FSesLen + 1));
+    FSes[FSesLen] := Char(esi.op);
+    Inc(FSesLen);
     i := esi.pi;
     k := esi.pk;
   end;
   { Reverse ses. }
-  for i := 0 to (Length(ses) div 2) - 1 do
+  for i := 0 to (FSesLen div 2) - 1 do
   begin
-    c := ses[i];
-    ses[i] := ses[Length(ses) - 1 - i];
-    ses[Length(ses) - 1 - i] := c;
+    c := FSes[i];
+    FSes[i] := FSes[FSesLen - 1 - i];
+    FSes[FSesLen - 1 - i] := c;
   end;
 
   { Post-process: collapse "+-" and "-+" pairs into "!" (replace).
@@ -1123,15 +1477,16 @@ begin
           on (exchanged XOR is_plus): if they're equal, '+'; else '-'.
       Otherwise (ses[n] is '='), emit '='.
       D counts the number of edits (1 per collapsed pair, 1 per single + or -). }
-  SetLength(FEdscript, Length(ses));
+  if FSesLen > Length(FEdscript) then
+    SetLength(FEdscript, GrowCap(Length(FEdscript), FSesLen));
   D := 0;
   nIdx := 1;
-  cnt := Length(ses);
+  cnt := FSesLen;
   i := 0;  // FEdscript write index
   while nIdx < cnt do
   begin
     c := '!';
-    ch := ses[nIdx];
+    ch := FSes[nIdx];
     is_plus := (ch = '+');
     if is_plus or (ch = '-') then
     begin
@@ -1140,7 +1495,7 @@ begin
       else
         nextExpected := '+';
 
-      if (nIdx <> (cnt - 1)) and (ses[nIdx + 1] = nextExpected) then
+      if (nIdx <> (cnt - 1)) and (FSes[nIdx + 1] = nextExpected) then
       begin
         { Collapse "+-" or "-+" pair into "!" (replace). }
         Inc(nIdx);
@@ -1167,10 +1522,48 @@ begin
     Inc(i);
     Inc(nIdx);
   end;
-  { Trim FEdscript to actual size. }
-  SetLength(FEdscript, i);
+  { G35: logical length only — the capacity stays for the next pair
+    (the old code trimmed with a realloc). }
+  FEdscriptLen := i;
 
   Result := D;
+end;
+
+{ ONP edit-script append (G35 pooled). Ported from the lambda
+  addEditScriptElem in stringdiffs.cpp:634-650: computes the new
+  element from fp[k-1] and fp[k+1], then appends it to FEs[k]. The
+  old free procedure grew es[k] by exactly ONE element per call
+  (SetLength+copy per row — the single biggest heap-churn source of
+  the engine); the pooled version appends into the kept capacity and
+  only doubles it when full (amortized O(1), zero steady-state heap
+  calls). FEsLens[esBase+k] is the sub-array's logical length. }
+procedure TStringDiff.AddEditScriptElem(esBase, fpBase, k: Integer);
+var
+  newElem: TEditScriptElem;
+  idx, n: Integer;
+begin
+  if FFp[fpBase + k - 1] + 1 > FFp[fpBase + k + 1] then
+  begin
+    newElem.op := '+';
+    newElem.neq := FFp[fpBase + k] - (FFp[fpBase + k - 1] + 1);
+    newElem.pk := k - 1;
+  end
+  else
+  begin
+    newElem.op := '-';
+    newElem.neq := FFp[fpBase + k] - FFp[fpBase + k + 1];
+    newElem.pk := k + 1;
+  end;
+  { Index of the last element on the PREVIOUS diagonal (must be
+    computed before the append below). }
+  newElem.pi := FEsLens[esBase + newElem.pk] - 1;
+
+  idx := esBase + k;
+  n := FEsLens[idx];
+  if n >= Length(FEs[idx]) then
+    SetLength(FEs[idx], GrowCap(Length(FEs[idx]), n + 1));
+  FEs[idx][n] := newElem;
+  FEsLens[idx] := n + 1;
 end;
 
 { EmitWdiff — wdiff emitter with gap-merging (G34).
@@ -1191,21 +1584,23 @@ end;
 procedure TStringDiff.EmitWdiff(s1, e1, s2, e2: Integer);
 var
   n: Integer;
-  last: ^Twdiff;
 begin
-  if (not FSawMatchSinceDiff) and (Length(FWdiffs) > 0) then
+  if (not FSawMatchSinceDiff) and (FWdiffsLen > 0) then
   begin
-    n := High(FWdiffs);
+    n := FWdiffsLen - 1;
     { Merge into the last emitted wdiff. }
     if s1 < FWdiffs[n].begin_[0] then FWdiffs[n].begin_[0] := s1;
     if e1 > FWdiffs[n].end_[0] then FWdiffs[n].end_[0] := e1;
     if s2 < FWdiffs[n].begin_[1] then FWdiffs[n].begin_[1] := s2;
     if e2 > FWdiffs[n].end_[1] then FWdiffs[n].end_[1] := e2;
-    last := nil; { silence hint }
     Exit;
   end;
-  SetLength(FWdiffs, Length(FWdiffs) + 1);
-  FWdiffs[High(FWdiffs)] := Twdiff.Create(s1, e1, s2, e2);
+  { G35: pooled append (the old grow-by-one SetLength was a
+    realloc+copy per wdiff). }
+  if FWdiffsLen >= Length(FWdiffs) then
+    SetLength(FWdiffs, GrowCap(Length(FWdiffs), FWdiffsLen + 1));
+  FWdiffs[FWdiffsLen] := Twdiff.Create(s1, e1, s2, e2);
+  Inc(FWdiffsLen);
   FSawMatchSinceDiff := False;
 end;
 
@@ -1217,8 +1612,11 @@ var
   i, j, k: Integer;
   s1, e1, s2, e2: Integer;
 begin
-  SetLength(FEdscript, 0);
-  SetLength(FWdiffs, 0);
+  { G35: logical resets (the old SetLength(...,0) pair freed the
+    arrays — pooled state only zeroes the counters; onp rewrites all
+    of them before anything reads them). }
+  FEdscriptLen := 0;
+  FWdiffsLen := 0;
   FSawMatchSinceDiff := True;  { nothing to merge before the first wdiff }
   D := onp;
   if D < 0 then
@@ -1226,7 +1624,7 @@ begin
 
   i := 1;  // 1-based because words[0] is the dummy sentinel
   j := 1;
-  for k := 0 to High(FEdscript) do
+  for k := 0 to FEdscriptLen - 1 do
   begin
     if FEdscript[k] = '-' then
     begin
@@ -1344,44 +1742,55 @@ var
   succeeded: Boolean;
   s1, e1, s2, e2: Integer;
 begin
-  FWords1 := BuildWordsArray(FStr1);
-  FWords2 := BuildWordsArray(FStr2);
+  { G35: reset the pooled wdiff list — every pipeline entry must start
+    from an empty list (the old code implicitly did, because ComputeWordDiffs
+    created fresh state per call). Without this, a pair that exits early
+    (empty side) would see the PREVIOUS pair's wdiffs re-emitted by
+    PopulateDiffs. }
+  FWdiffsLen := 0;
+
+  BuildWordsInto(FStr1, FLen1, FWords1, FWords1Len);
+  BuildWordsInto(FStr2, FLen2, FWords2, FWords2Len);
 
   { DIVERGENCE guard: handle empty-side cases that ONP can't handle safely.
     WinMerge would access out-of-bounds memory here; we emit the correct
     single-sided wdiff instead. }
-  if (Length(FWords1) <= 1) and (Length(FWords2) <= 1) then
+  if (FWords1Len <= 1) and (FWords2Len <= 1) then
   begin
     { Both sides empty (or just dummies) — no diff. }
     Exit;
   end;
-  if Length(FWords1) <= 1 then
+  if FWords1Len <= 1 then
   begin
     { Side 1 is empty — entire side 2 is an insertion.
       wdiff(begin[0]=0, end[0]=-1, begin[1]=words2[1].start, end[1]=words2[last].end). }
     s1 := 0;
     e1 := -1;  // empty side encoding
     s2 := FWords2[1].start;
-    e2 := FWords2[Length(FWords2) - 1].end_;
-    SetLength(FWdiffs, 1);
+    e2 := FWords2[FWords2Len - 1].end_;
+    if Length(FWdiffs) < 1 then
+      SetLength(FWdiffs, 4);
     FWdiffs[0] := Twdiff.Create(s1, e1, s2, e2);
+    FWdiffsLen := 1;
     Exit;
   end;
-  if Length(FWords2) <= 1 then
+  if FWords2Len <= 1 then
   begin
     { Side 2 is empty — entire side 1 is a deletion. }
     s1 := FWords1[1].start;
-    e1 := FWords1[Length(FWords1) - 1].end_;
+    e1 := FWords1[FWords1Len - 1].end_;
     s2 := 0;
     e2 := -1;  // empty side encoding
-    SetLength(FWdiffs, 1);
+    if Length(FWdiffs) < 1 then
+      SetLength(FWdiffs, 4);
     FWdiffs[0] := Twdiff.Create(s1, e1, s2, e2);
+    FWdiffsLen := 1;
     Exit;
   end;
 
   succeeded := False;
   { Size guard: bail if either word list has >= MAX_TOKEN_COUNT tokens. }
-  if (Length(FWords1) < MAX_TOKEN_COUNT) and (Length(FWords2) < MAX_TOKEN_COUNT) then
+  if (FWords1Len < MAX_TOKEN_COUNT) and (FWords2Len < MAX_TOKEN_COUNT) then
   begin
     succeeded := BuildWordDiffList_DP;
   end;
@@ -1390,26 +1799,31 @@ begin
   begin
     { Bail out: emit a single wdiff covering the entire line. }
     s1 := FWords1[0].start;
-    e1 := FWords1[Length(FWords1) - 1].end_;
+    e1 := FWords1[FWords1Len - 1].end_;
     s2 := FWords2[0].start;
-    e2 := FWords2[Length(FWords2) - 1].end_;
-    SetLength(FWdiffs, 1);
+    e2 := FWords2[FWords2Len - 1].end_;
+    if Length(FWdiffs) < 1 then
+      SetLength(FWdiffs, 4);
     FWdiffs[0] := Twdiff.Create(s1, e1, s2, e2);
+    FWdiffsLen := 1;
     Exit;
   end;
 end;
 
 { Ported from stringdiffs.cpp:489-517 — PopulateDiffs.
-  Coalesces adjacent wdiffs where end[i]+1 == next.begin[i] on BOTH sides. }
+  Coalesces adjacent wdiffs where end[i]+1 == next.begin[i] on BOTH sides.
+  G35: appends into the pooled FPDiffsBuf with FPDiffsLen as the logical
+  length (the old code append-reset the CALLER's array via a pointer). }
 procedure TStringDiff.PopulateDiffs;
 var
   i: Integer;
   skipIt: Boolean;
 begin
-  for i := 0 to High(FWdiffs) do
+  FPDiffsLen := 0;
+  for i := 0 to FWdiffsLen - 1 do
   begin
     skipIt := False;
-    if i + 1 < Length(FWdiffs) then
+    if i + 1 < FWdiffsLen then
     begin
       if (FWdiffs[i].end_[0] + 1 = FWdiffs[i+1].begin_[0]) and
          (FWdiffs[i].end_[1] + 1 = FWdiffs[i+1].begin_[1]) then
@@ -1422,9 +1836,11 @@ begin
     end;
     if not skipIt then
     begin
-      { Append to caller's pDiffs list. }
-      SetLength(FPDiffs^, Length(FPDiffs^) + 1);
-      FPDiffs^[High(FPDiffs^)] := FWdiffs[i];
+      { Append to the pooled pDiffs list. }
+      if FPDiffsLen >= Length(FPDiffsBuf) then
+        SetLength(FPDiffsBuf, GrowCap(Length(FPDiffsBuf), FPDiffsLen + 1));
+      FPDiffsBuf[FPDiffsLen] := FWdiffs[i];
+      Inc(FPDiffsLen);
     end;
   end;
 end;
@@ -1449,60 +1865,62 @@ end;
     - begin = Length(stripped)  -> Length(original)   (empty-side tail)
     - end   >= 0                -> map[end]            (always < Length)
     - begin = -1                -> all four outputs stay -1 (no diff). }
-procedure TStringDiff.ComputeByteDiff(const str1, str2: TCodePointArray;
+procedure TStringDiff.ComputeByteDiff(const str1: TCodePointArray;
+  str1Len: Integer; const str2: TCodePointArray; str2Len: Integer;
   casitive: Boolean; xwhite: Integer; ignore_numbers: Boolean;
   var begin0, begin1, end0, end1: Integer; equal: Boolean);
 var
-  s1, s2: TCodePointArray;
-  m1, m2: array of Integer;
-  n, i, j: Integer;
+  n1, n2, i: Integer;
 begin
   if not ignore_numbers then
   begin
-    ComputeByteDiffCore(str1, str2, casitive, xwhite,
+    ComputeByteDiffCore(str1, str1Len, str2, str2Len, casitive, xwhite,
       begin0, begin1, end0, end1, equal);
     Exit;
   end;
 
-  { Strip digit code points, keeping stripped->original index maps. }
-  SetLength(s1, Length(str1));
-  SetLength(m1, Length(str1));
-  n := 0;
-  for i := 0 to High(str1) do
+  { Strip digit code points, keeping stripped->original index maps.
+    G35: FDigits1/FDigits2/FMap1/FMap2 are pooled grow-only buffers
+    with logical counts n1/n2 — the old code did 8 SetLength calls
+    (alloc + trim) per refined wdiff. }
+  if str1Len > Length(FDigits1) then
+    SetLength(FDigits1, GrowCap(Length(FDigits1), str1Len));
+  if str1Len > Length(FMap1) then
+    SetLength(FMap1, GrowCap(Length(FMap1), str1Len));
+  n1 := 0;
+  for i := 0 to str1Len - 1 do
     if not tc_istdigit(str1[i]) then
     begin
-      s1[n] := str1[i];
-      m1[n] := i;
-      Inc(n);
+      FDigits1[n1] := str1[i];
+      FMap1[n1] := i;
+      Inc(n1);
     end;
-  SetLength(s1, n);
-  SetLength(m1, n);
 
-  SetLength(s2, Length(str2));
-  SetLength(m2, Length(str2));
-  n := 0;
-  for i := 0 to High(str2) do
+  if str2Len > Length(FDigits2) then
+    SetLength(FDigits2, GrowCap(Length(FDigits2), str2Len));
+  if str2Len > Length(FMap2) then
+    SetLength(FMap2, GrowCap(Length(FMap2), str2Len));
+  n2 := 0;
+  for i := 0 to str2Len - 1 do
     if not tc_istdigit(str2[i]) then
     begin
-      s2[n] := str2[i];
-      m2[n] := i;
-      Inc(n);
+      FDigits2[n2] := str2[i];
+      FMap2[n2] := i;
+      Inc(n2);
     end;
-  SetLength(s2, n);
-  SetLength(m2, n);
 
-  ComputeByteDiffCore(s1, s2, casitive, xwhite,
+  ComputeByteDiffCore(FDigits1, n1, FDigits2, n2, casitive, xwhite,
     begin0, begin1, end0, end1, equal);
 
   { Map stripped indices back to original positions. }
   if begin0 <> -1 then
   begin
-    if begin0 < Length(s1) then
-      begin0 := m1[begin0]
+    if begin0 < n1 then
+      begin0 := FMap1[begin0]
     else
-      begin0 := Length(str1);
+      begin0 := str1Len;
     if end0 >= 0 then
-      end0 := m1[end0];
+      end0 := FMap1[end0];
     { The core's "empty side" encoding is end = begin - 1. Mapping the two
       indices independently can break that invariant when digits sit
       between them (m[end_s] can be < m[begin_s] - 1), which would make
@@ -1514,12 +1932,12 @@ begin
   end;
   if begin1 <> -1 then
   begin
-    if begin1 < Length(s2) then
-      begin1 := m2[begin1]
+    if begin1 < n2 then
+      begin1 := FMap2[begin1]
     else
-      begin1 := Length(str2);
+      begin1 := str2Len;
     if end1 >= 0 then
-      end1 := m2[end1];
+      end1 := FMap2[end1];
     { See the clamp above. }
     if end1 < begin1 - 1 then
       end1 := begin1 - 1;
@@ -1538,7 +1956,8 @@ end;
   begin_/end_ arrays are [0]=side1, [1]=side2.
   Convention: begin[i] = -1 means "no visible diff on side i".
   end[i] is INCLUSIVE (matches WinMerge's encoding). }
-procedure TStringDiff.ComputeByteDiffCore(const str1, str2: TCodePointArray;
+procedure TStringDiff.ComputeByteDiffCore(const str1: TCodePointArray;
+  str1Len: Integer; const str2: TCodePointArray; str2Len: Integer;
   casitive: Boolean; xwhite: Integer;
   var begin0, begin1, end0, end1: Integer; equal: Boolean);
 var
@@ -1553,8 +1972,8 @@ begin
   { Initialize to sane values. }
   begin0 := 0; begin1 := 0; end0 := 0; end1 := 0;
 
-  len1 := Length(str1);
-  len2 := Length(str2);
+  len1 := str1Len;
+  len2 := str2Len;
 
   if (len1 = 0) or (len2 = 0) then
   begin
@@ -1712,30 +2131,33 @@ procedure TStringDiff.wordLevelToByteLevel;
 var
   i: Integer;
   diff: Twdiff;
-  str1_2, str2_2: TCodePointArray;
   begin0, begin1, end0, end1: Integer;
   len1, len2: Integer;
 begin
-  for i := 0 to High(FWdiffs) do
+  for i := 0 to FWdiffsLen - 1 do
   begin
     diff := FWdiffs[i];
 
     { Extract substrings [diff.begin[0] .. diff.end[0]] and [diff.begin[1] .. diff.end[1]].
-      Inclusive ranges. If begin > end (empty side), extract empty. }
+      Inclusive ranges. If begin > end (empty side), extract empty.
+      G35: FSub1/FSub2 are pooled grow-only buffers — the old code did
+      two SetLength calls per refined wdiff. }
     len1 := diff.end_[0] - diff.begin_[0] + 1;
     if len1 < 0 then len1 := 0;
     len2 := diff.end_[1] - diff.begin_[1] + 1;
     if len2 < 0 then len2 := 0;
 
-    SetLength(str1_2, len1);
+    if len1 > Length(FSub1) then
+      SetLength(FSub1, GrowCap(Length(FSub1), len1));
     if len1 > 0 then
-      Move(FStr1[diff.begin_[0]], str1_2[0], len1 * SizeOf(TCodePoint));
+      Move(FStr1[diff.begin_[0]], FSub1[0], len1 * SizeOf(TCodePoint));
 
-    SetLength(str2_2, len2);
+    if len2 > Length(FSub2) then
+      SetLength(FSub2, GrowCap(Length(FSub2), len2));
     if len2 > 0 then
-      Move(FStr2[diff.begin_[1]], str2_2[0], len2 * SizeOf(TCodePoint));
+      Move(FStr2[diff.begin_[1]], FSub2[0], len2 * SizeOf(TCodePoint));
 
-    ComputeByteDiff(str1_2, str2_2, FCaseSensitive, FWhitespace,
+    ComputeByteDiff(FSub1, len1, FSub2, len2, FCaseSensitive, FWhitespace,
       FIgnoreNumbers, begin0, begin1, end0, end1, False);
 
     { Adjust diff.begin[0] and diff.end[0]. }
@@ -1786,10 +2208,16 @@ var
   sdiffs: TStringDiff;
 begin
   Result := nil;  // silence "managed type not initialized" warning
-  SetLength(Result, 0);
-  sdiffs := TStringDiff.Create(str1, str2, case_sensitive, eol_mode,
-    whitespace, ignore_numbers, breakType, Result);
+  sdiffs := TStringDiff.Create;
   try
+    { G35: the old constructor took the input arrays + options + the
+      caller's pDiffs var; the pooled instance references the inputs
+      (SetExternalInput), takes the options explicitly, and appends
+      into its own pooled buffer, copied out at the end. }
+    sdiffs.SetExternalInput(str1, str2);
+    sdiffs.SetOptions(case_sensitive, eol_mode, whitespace,
+      ignore_numbers, breakType);
+
     { Hash all words in both lines and then compare them word by word
       storing differences into m_wdiffs. }
     sdiffs.BuildWordDiffList;
@@ -1800,6 +2228,7 @@ begin
     { Now copy m_wdiffs into caller-supplied m_pDiffs (coalescing adjacents
       if possible). }
     sdiffs.PopulateDiffs;
+    sdiffs.GetPooledDiffs(Result);
   finally
     sdiffs.Free;
   end;
@@ -1910,29 +2339,33 @@ begin
 end;
 
 { ------------------------------------------------------------------
-  WdiffsToOpcodes — convert WinMerge wdiff list to difflib opcodes.
-  Ported conceptually from G3: WinMerge returns wdiff list (differences
-  only); difflib requires equal regions synthesized.
+  TStringDiff.WdiffsToOpcodesInto — convert WinMerge wdiff list to
+  difflib opcodes, POOLED (G35). Ported conceptually from G3: WinMerge
+  returns wdiff list (differences only); difflib requires equal regions
+  synthesized. Reads the pooled FPDiffsBuf[0..diffsLen-1] into the pooled
+  FOpRaw scratch and emits ONE fresh AOut array (the per-pair heap
+  allocation that stays).
   ------------------------------------------------------------------ }
-function WdiffsToOpcodes(const diffs: TwdiffArray; sizeA, sizeB: Integer): TDiffOpcodeArray;
+procedure TStringDiff.WdiffsToOpcodesInto(diffsLen, sizeA, sizeB: Integer;
+  var AOut: TDiffOpcodeArray);
 var
   i: Integer;
   posA, posB: Integer;
-  raw: TDiffOpcodeArray;
   rawCount: Integer;
   op: TDiffOpcode;
   side1Empty, side2Empty: Boolean;
   d: Twdiff;
 begin
-  Result := nil;  // silence "managed type not initialized" warning
-  SetLength(raw, Length(diffs) * 2 + 1);
+  AOut := nil;
+  if diffsLen * 2 + 1 > Length(FOpRaw) then
+    SetLength(FOpRaw, GrowCap(Length(FOpRaw), diffsLen * 2 + 1));
   rawCount := 0;
 
   posA := 0;
   posB := 0;
-  for i := 0 to High(diffs) do
+  for i := 0 to diffsLen - 1 do
   begin
-    d := diffs[i];
+    d := FPDiffsBuf[i];
 
     { Synthesize EQUAL for the gap before this diff.
       G18: The gap is "matched" under the ignore rules (the word-level
@@ -1956,7 +2389,7 @@ begin
       op.I2 := d.begin_[0];
       op.J1 := posB;
       op.J2 := d.begin_[1];
-      raw[rawCount] := op;
+      FOpRaw[rawCount] := op;
       Inc(rawCount);
     end;
 
@@ -2004,7 +2437,7 @@ begin
       Continue;
     end;
 
-    raw[rawCount] := op;
+    FOpRaw[rawCount] := op;
     Inc(rawCount);
 
     posA := d.end_[0] + 1;
@@ -2021,77 +2454,56 @@ begin
     op.I2 := sizeA;
     op.J1 := posB;
     op.J2 := sizeB;
-    raw[rawCount] := op;
+    FOpRaw[rawCount] := op;
     Inc(rawCount);
   end;
 
-  SetLength(Result, rawCount);
+  { ONE fresh allocation per pair — the caller owns the result. }
+  SetLength(AOut, rawCount);
   if rawCount > 0 then
-    Move(raw[0], Result[0], rawCount * SizeOf(TDiffOpcode));
+    Move(FOpRaw[0], AOut[0], rawCount * SizeOf(TDiffOpcode));
 end;
 
 { ------------------------------------------------------------------
-  DoDiffChars — public entry point.
-  Replaces the phase 1 stub body with the real WinMerge port.
+  DoDiffChars — public single-pair entry point.
+  Thin wrapper over TDiffCharsBatch: create the pooled runner, compare
+  the one pair, free the runner. The flag mapping and the pipeline
+  live in TStringDiff.DiffStrings now; single-pair callers keep the
+  exact same signature and output as before (G35).
   ------------------------------------------------------------------ }
 function DoDiffChars(const ATextA, ATextB: string; AFlags: Integer): TDiffOpcodeArray;
 var
-  CPA, CPB: TCodePointArray;
-  CaseSensitive: Boolean;
-  EolMode: TEolCompareMode;
-  Whitespace: Integer;
-  IgnoreNumbers: Boolean;
-  BreakType: Integer;
-  ByteLevel: Boolean;
-  Diffs: TwdiffArray;
+  Batch: TDiffCharsBatch;
 begin
   Result := nil;  // silence "managed type not initialized" warning
-
-  CPA := UTF8ToUTF32(ATextA);
-  CPB := UTF8ToUTF32(ATextB);
-
-  { G16: both empty → [] (matches difflib). }
-  if (Length(CPA) = 0) and (Length(CPB) = 0) then
-  begin
-    SetLength(Result, 0);
-    Exit;
+  Batch := TDiffCharsBatch.Create;
+  try
+    Batch.ComparePair(ATextA, ATextB, AFlags, Result);
+  finally
+    Batch.Free;
   end;
+end;
 
-  { Map DIFF_IGN_* flags to WinMerge options (see G5). }
-  CaseSensitive := (AFlags and DIFF_IGN_CASE_Private) = 0;
-  IgnoreNumbers := (AFlags and DIFF_IGN_NUMBERS_Private) <> 0;
+{ ------------------------------------------------------------------
+  TDiffCharsBatch — the batched runner (G35). See the interface comment.
+  ------------------------------------------------------------------ }
 
-  if (AFlags and DIFF_IGN_EOL_Private) <> 0 then
-    EolMode := eolIgnore
-  else
-    EolMode := eolStrict;
-  { EOL_AS_SPACE is never used via DoDiffChars — only EOL_STRICT and EOL_IGNORE. }
+constructor TDiffCharsBatch.Create;
+begin
+  inherited Create;
+  FEngine := TStringDiff.Create;
+end;
 
-  { Whitespace flag (G5):
-    DIFF_IGN_WHITESPACE → WHITESPACE_IGNORE_ALL
-    else → WHITESPACE_COMPARE_ALL
-    (DIFF_IGN_WHITESPACE_CHANGE / _EOL / _BEGINNING were removed from the
-    API — nothing maps to WHITESPACE_IGNORE_CHANGE anymore.) }
-  if (AFlags and DIFF_IGN_WHITESPACE_Private) <> 0 then
-    Whitespace := WHITESPACE_IGNORE_ALL
-  else
-    Whitespace := WHITESPACE_COMPARE_ALL;
+destructor TDiffCharsBatch.Destroy;
+begin
+  FEngine.Free;
+  inherited Destroy;
+end;
 
-  { Note: DIFF_IGN_BLANK_LINES is accepted but has no effect here —
-    blank lines are a line-level concept (all-blank hunks are suppressed
-    by the DIF_TEXTS engines and re-tagged as 'ignore' opcodes); at
-    char level there is no hunk to suppress. DIF_CHARS never emits
-    DIFF_TAG_IGNORE. }
-
-  BreakType := 1;    { always break on punctuation — matches Differ plugin expectations }
-  ByteLevel := True; { always refine to char level — Differ plugin uses char-level highlights }
-
-  { Call the ported WinMerge engine. }
-  Diffs := ComputeWordDiffs(CPA, CPB, CaseSensitive, EolMode, Whitespace,
-    IgnoreNumbers, BreakType, ByteLevel);
-
-  { Convert wdiff list → difflib opcodes (see G3). }
-  Result := WdiffsToOpcodes(Diffs, Length(CPA), Length(CPB));
+procedure TDiffCharsBatch.ComparePair(const ATextA, ATextB: string;
+  AFlags: Integer; var AOut: TDiffOpcodeArray);
+begin
+  FEngine.DiffStrings(ATextA, ATextB, AFlags, AOut);
 end;
 
 end.
