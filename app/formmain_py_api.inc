@@ -11322,7 +11322,15 @@ type
     I1, I2, J1, J2: Integer;
   end;
   TPyDiffOpcodeArray = array of TPyDiffOpcode;
-  TPyDiffOpcodeMatrix = array of TPyDiffOpcodeArray;
+
+  { Batched DIF_CHARS result: one ENGINE opcode array per pair (the
+    engine's own TDiffOpcode record, G13 — not copied to TPyDiffOpcode).
+    The worker thread fills the per-pair arrays; the conversion to
+    Python objects happens on the main thread in DoCallback
+    (DiffCharOpcodesToPyList). This avoids ~2 more heap operations
+    (alloc + field copy) per pair on the background thread, whose FPC
+    heap calls are the expensive ones (G35 — see cudadiffchars.pas). }
+  TDiffCharsOpcodeMatrix = array of CudaDiffChars.TDiffOpcodeArray;
 
   { One char-level compare pair of a BATCHED DIF_CHARS call: S1/S2 are the
     two strings of the pair, compared at char level independently of the
@@ -11334,9 +11342,13 @@ type
   end;
   TPyDiffCharPairArray = array of TPyDiffCharPair;
 
-{ Copy opcodes from the 3 diff engine units into the neutral type above.
-  The units intentionally declare their own TDiffOpcode records (G13),
-  so the copy is field-by-field; all 3 layouts are 5 integers. }
+{ Copy opcodes from the 2 line-level diff engine units into the neutral
+  type above (DIF_TEXTS paths — G13 field-by-field copies).
+  NOTE: the DIF_CHARS path no longer uses a copy pass: the batch results
+  stay in the engine's own record type (TDiffCharsOpcodeMatrix) and are
+  converted straight to Python on the main thread (G35 — the copy cost
+  and its per-pair heap allocation would land on the background thread,
+  where FPC heap calls are the expensive ones). }
 procedure DiffOpcodesFromMyers(var ADest: TPyDiffOpcodeArray;
   const ASrc: CudaDiffMyers.TDiffOpcodeArray);
 var
@@ -11355,22 +11367,6 @@ end;
 
 procedure DiffOpcodesFromHistogram(var ADest: TPyDiffOpcodeArray;
   const ASrc: CudaDiffHistogram.TDiffOpcodeArray);
-var
-  i: integer;
-begin
-  SetLength(ADest, Length(ASrc));
-  for i:= 0 to High(ASrc) do
-  begin
-    ADest[i].Tag:= ASrc[i].Tag;
-    ADest[i].I1:= ASrc[i].I1;
-    ADest[i].I2:= ASrc[i].I2;
-    ADest[i].J1:= ASrc[i].J1;
-    ADest[i].J2:= ASrc[i].J2;
-  end;
-end;
-
-procedure DiffOpcodesFromChars(var ADest: TPyDiffOpcodeArray;
-  const ASrc: CudaDiffChars.TDiffOpcodeArray);
 var
   i: integer;
 begin
@@ -11458,10 +11454,50 @@ begin
   end;
 end;
 
+{ Build the Python list of (tag, i1, i2, j1, j2) tuples from the ENGINE's
+  opcode array (DIF_CHARS batch results — G35: no neutral-type copy pass).
+  Must be called on the main thread (GIL), like DiffOpcodesToPyList. }
+function DiffCharsOpcodesToPyList(const AOpcodes: CudaDiffChars.TDiffOpcodeArray): PPyObject;
+var
+  J: integer;
+  NTag: integer;
+  ObjTuple, ObjInt: PPyObject;
+begin
+  Result:= nil;
+  DiffTagPyStrInit;
+  with AppPython.Engine do
+  begin
+    Result:= PyList_New(Length(AOpcodes));
+    if not Assigned(Result) then
+      raise EPythonError.Create(msgPythonListError);
+    for J:= 0 to High(AOpcodes) do
+    begin
+      NTag:= AOpcodes[J].Tag;
+      if (NTag<0) or (NTag>4) then
+        NTag:= DIFF_TAG_EQUAL;
+      ObjTuple:= PyTuple_New(5);
+      if ObjTuple=nil then
+        raise EPythonError.Create(msgPythonListError);
+      Py_INCREF(DiffTagPyStr[NTag]);
+      PyTuple_SetItem(ObjTuple, 0, DiffTagPyStr[NTag]);
+      ObjInt:= PyLong_FromLong(AOpcodes[J].I1);
+      if ObjInt<>nil then PyTuple_SetItem(ObjTuple, 1, ObjInt);
+      ObjInt:= PyLong_FromLong(AOpcodes[J].I2);
+      if ObjInt<>nil then PyTuple_SetItem(ObjTuple, 2, ObjInt);
+      ObjInt:= PyLong_FromLong(AOpcodes[J].J1);
+      if ObjInt<>nil then PyTuple_SetItem(ObjTuple, 3, ObjInt);
+      ObjInt:= PyLong_FromLong(AOpcodes[J].J2);
+      if ObjInt<>nil then PyTuple_SetItem(ObjTuple, 4, ObjInt);
+      //SetItem steals the tuple reference on success
+      PyList_SetItem(Result, J, ObjTuple);
+    end;
+  end;
+end;
+
 { Build the Python result of a BATCHED DIF_CHARS call: a list with ONE
   opcode list per input pair, in input order. Must be called on the main
   thread (GIL), like DiffOpcodesToPyList. }
-function DiffCharOpcodesToPyList(const APairs: TPyDiffOpcodeMatrix): PPyObject;
+function DiffCharOpcodesToPyList(const APairs: TDiffCharsOpcodeMatrix): PPyObject;
 var
   i: integer;
   ObjList: PPyObject;
@@ -11475,7 +11511,7 @@ begin
       raise EPythonError.Create(msgPythonListError);
     for i:= 0 to High(APairs) do
     begin
-      ObjList:= DiffOpcodesToPyList(APairs[i]);
+      ObjList:= DiffCharsOpcodesToPyList(APairs[i]);
       if ObjList=nil then
         raise EPythonError.Create(msgPythonListError);
       //SetItem steals the list reference on success
@@ -11635,7 +11671,7 @@ type
     FCallbackStr: string;      //non-empty: 'module.func' string callback
     FCallbackObj: PPyObject;   //non-nil: Python callable, we own a strong ref
     FOpcodes: TPyDiffOpcodeArray;       //DIF_TEXTS result
-    FCharOpcodes: TPyDiffOpcodeMatrix;  //batched DIF_CHARS result: one list per pair
+    FCharOpcodes: TDiffCharsOpcodeMatrix;   //batched DIF_CHARS result: one ENGINE opcode array per pair (G35)
     FErrorMessage: string;
     FCancelFlag: Boolean;      //set by DIF_CANCEL (main thread); polled by the engines, between batched pairs, and re-checked in DoCallback
     procedure ComputeDiff;
@@ -11699,9 +11735,9 @@ end;
 
 procedure TCudaDiffThread.ComputeDiff;
 var
+  Batch: CudaDiffChars.TDiffCharsBatch;
   OpcodesMyers: CudaDiffMyers.TDiffOpcodeArray;
   OpcodesHistogram: CudaDiffHistogram.TDiffOpcodeArray;
-  OpcodesChars: CudaDiffChars.TDiffOpcodeArray;
   i: integer;
 begin
   FErrorMessage:= '';
@@ -11739,14 +11775,32 @@ begin
           //engine run (each pair's engine call is short). The plain
           //boolean load needs no lock — same pattern as the engines'
           //threadvar polls.
+          //
+          //G35: all pairs run through ONE TDiffCharsBatch — a single
+          //reused engine instance with POOLED scratch buffers, so the
+          //batch performs ~one heap allocation per pair (the result
+          //array) in steady state. Per-pair DoDiffChars calls here would
+          //re-create the engine state per pair: ~50-400 heap calls each,
+          //and this thread's FPC heap calls are catastrophically slow
+          //(measured 6.1x whole-engine slowdown vs the same code on the
+          //main thread — see the G35 note in cudadiffchars.pas). The
+          //pooled batch runs at the same speed on the worker thread as
+          //on the main thread (measured: 3.5 vs 3.2 us/pair).
+          //The results land directly in the ENGINE-typed FCharOpcodes
+          //slots (no neutral-record copy pass); DoCallback converts
+          //them to Python objects on the main thread.
           SetLength(FCharOpcodes, Length(FCharPairs));
-          for i:= 0 to High(FCharPairs) do
-          begin
-            if FCancelFlag then
-              raise CudaDiffChars.EDiffCancelled.Create('diff cancelled');
-            OpcodesChars:= CudaDiffChars.DoDiffChars(
-              FCharPairs[i].S1, FCharPairs[i].S2, FFlags);
-            DiffOpcodesFromChars(FCharOpcodes[i], OpcodesChars);
+          Batch:= CudaDiffChars.TDiffCharsBatch.Create;
+          try
+            for i:= 0 to High(FCharPairs) do
+            begin
+              if FCancelFlag then
+                raise CudaDiffChars.EDiffCancelled.Create('diff cancelled');
+              Batch.ComparePair(FCharPairs[i].S1, FCharPairs[i].S2,
+                FFlags, FCharOpcodes[i]);
+            end;
+          finally
+            Batch.Free;
           end;
         end;
     else
@@ -11789,14 +11843,19 @@ begin
     CudaDiffChars.DiffCancelFlag:= nil;
   end;
 
-  //release the big input texts before the callback runs: the callback
-  //handler in the plugin usually makes its own copies of the compared
-  //data, so keeping FStr1/FStr2 alive here only wastes memory. The same
-  //holds for the batched DIF_CHARS input strings (FCharPairs can hold
-  //hundreds of thousands of line copies on big files).
+  //release the big DIF_TEXTS input texts before the callback runs: the
+  //callback handler in the plugin usually makes its own copies of the
+  //compared data, so keeping FStr1/FStr2 alive here only wastes memory.
+  //G35 NOTE for DIF_CHARS: FCharPairs is deliberately NOT cleared here
+  //anymore. Freeing its hundreds of thousands of input strings from this
+  //thread (FPC heap calls on the diff thread are the slow ones) would
+  //sit on the plugin's wait path between 'compute done' and 'callback
+  //delivered'. The strings are released when the thread object frees
+  //itself (FreeOnTerminate, right AFTER the callback phase) instead --
+  //the same moment the result matrix FCharOpcodes is released too, so
+  //nothing is observably different for the plugin except a shorter wait.
   FStr1:= '';
   FStr2:= '';
-  SetLength(FCharPairs, 0);
 
   //Unregister BEFORE the callback phase: after this, DIF_CANCEL can no
   //longer find the job (returns False -- "not running"), so no
@@ -11938,7 +11997,8 @@ var
   ObjParam1, ObjParam2: PPyObject;
   Str1, Str2: string;
   CharPairs: TPyDiffCharPairArray;
-  CharOpcodes: TPyDiffOpcodeMatrix;
+  CharBatch: CudaDiffChars.TDiffCharsBatch;
+  CharOpcodes: TDiffCharsOpcodeMatrix;
   NAlgo, NFlags: Integer;
   PtrCallback: PPyObject;
   StrCallback: string;
@@ -11949,7 +12009,6 @@ var
   Opcodes: TPyDiffOpcodeArray;
   OpcodesMyers: CudaDiffMyers.TDiffOpcodeArray;
   OpcodesHistogram: CudaDiffHistogram.TDiffOpcodeArray;
-  OpcodesChars: CudaDiffChars.TDiffOpcodeArray;
 begin
   NAlgo:= DIFF_ALGO_MYERS;
   NFlags:= 0;
@@ -12097,17 +12156,22 @@ begin
         DIF_CHARS:
           begin
             //BATCHED char-level diff, synchronous form: every pair is
-            //compared independently in one pass. NAlgo is ignored —
-            //char diff always uses WinMerge's stringdiffs (ONP
-            //algorithm) internally. The synchronous form cannot be
-            //cancelled (no job handle exists); the engines' cancel
-            //threadvar is nil on the main thread, so nothing polls.
+            //compared independently in one pass, through ONE pooled
+            //TDiffCharsBatch (G35 — same engine, ~one heap allocation
+            //per pair; see TCudaDiffThread.ComputeDiff for the full
+            //rationale). NAlgo is ignored — char diff always uses
+            //WinMerge's stringdiffs (ONP algorithm) internally. The
+            //synchronous form cannot be cancelled (no job handle
+            //exists); the engines' cancel threadvar is nil on the main
+            //thread, so nothing polls.
             SetLength(CharOpcodes, Length(CharPairs));
-            for I:= 0 to High(CharPairs) do
-            begin
-              OpcodesChars:= CudaDiffChars.DoDiffChars(
-                CharPairs[I].S1, CharPairs[I].S2, NFlags);
-              DiffOpcodesFromChars(CharOpcodes[I], OpcodesChars);
+            CharBatch:= CudaDiffChars.TDiffCharsBatch.Create;
+            try
+              for I:= 0 to High(CharPairs) do
+                CharBatch.ComparePair(CharPairs[I].S1, CharPairs[I].S2,
+                  NFlags, CharOpcodes[I]);
+            finally
+              CharBatch.Free;
             end;
             Result:= DiffCharOpcodesToPyList(CharOpcodes);
           end;
