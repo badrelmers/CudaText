@@ -124,6 +124,10 @@ BOOKMARK2_CLEAR_ALL   = 13
 BOOKMARK2_APPEND      = 15
 BOOKMARK2_GET_ALL     = 16
 BOOKMARK2_DELETE_BY_TAG = 18
+# Batched BOOKMARK2_APPEND: y/nkind are parallel lists of int
+# (ascending y, same contract as BOOKMARK2_APPEND). One call per
+# flush instead of one per bookmark.
+BOOKMARK2_APPEND_MANY = 19
 
 MARKERS_ADD           = 1
 MARKERS_DELETE_ALL    = 2

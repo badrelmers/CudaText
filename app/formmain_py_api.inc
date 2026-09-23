@@ -2161,6 +2161,130 @@ begin
   end;
 end;
 
+{ BOOKMARK2_APPEND_MANY's core: append Count bookmarks to
+  Ed.Strings.Bookmarks2 from two parallel int sequences (y + nkind),
+  with per-item semantics EXACTLY matching BOOKMARK2_APPEND's
+  single-item call:
+  - items are appended in sequence order, NO sorting and NO duplicate
+    search (the caller must pass ascending y -- the same contract
+    BOOKMARK2_APPEND documents);
+  - nkind is clamped to [Low(AppBookmarkSetup), High(AppBookmarkSetup)]
+    per item;
+  - no repaint is done here (BOOKMARK2_APPEND doesn't repaint either:
+    the caller repaints when it decides to);
+  - a non-int element or a y/nkind length mismatch aborts the WHOLE
+    batch BEFORE the first editor mutation (an error must never leave
+    a half-applied batch behind).
+  Returns the resulting Bookmarks2 count, or nil with the reason
+  logged to the console (caller returns None then). }
+function PyHelper_BookmarkAppendMany(Ed: TATSynEdit;
+  ObjLines, ObjKinds: PPyObject;
+  const AText: string;
+  NAutoDelete, NShowInList, ATag: integer): PPyObject;
+var
+  Count, CountKinds, i, NKind: integer;
+  Obj: PPyObject;
+  AutoDel: TATBookmarkAutoDelete;
+  Lines, Kinds: array of integer;
+begin
+  Result:= nil;
+
+  if (ObjLines=nil) or (ObjKinds=nil) then
+  begin
+    MsgLogConsole('ERROR: bookmark BOOKMARK2_APPEND_MANY needs y/nkind list arguments');
+    exit;
+  end;
+
+  with AppPython.Engine do
+  begin
+    if PyList_Check(ObjLines) then
+      Count:= PyList_Size(ObjLines)
+    else
+    if PyObject_TypeCheck(ObjLines, PyTuple_Type) then
+      Count:= PyTuple_Size(ObjLines)
+    else
+    begin
+      MsgLogConsole('ERROR: bookmark BOOKMARK2_APPEND_MANY: y must be list/tuple of int');
+      exit;
+    end;
+
+    if PyList_Check(ObjKinds) then
+      CountKinds:= PyList_Size(ObjKinds)
+    else
+    if PyObject_TypeCheck(ObjKinds, PyTuple_Type) then
+      CountKinds:= PyTuple_Size(ObjKinds)
+    else
+    begin
+      MsgLogConsole('ERROR: bookmark BOOKMARK2_APPEND_MANY: nkind must be list/tuple of int');
+      exit;
+    end;
+
+    if CountKinds<>Count then
+    begin
+      MsgLogConsole('ERROR: bookmark BOOKMARK2_APPEND_MANY: y/nkind lengths differ ('+
+        IntToStr(Count)+' vs '+IntToStr(CountKinds)+')');
+      exit;
+    end;
+  end;
+
+  //convert every element BEFORE touching the editor: a bad element
+  //anywhere must abort the whole batch, not apply half of it
+  SetLength(Lines, Count);
+  SetLength(Kinds, Count);
+  for i:= 0 to Count-1 do
+  begin
+    with AppPython.Engine do
+    begin
+      if PyList_Check(ObjLines) then
+        Obj:= PyList_GetItem(ObjLines, i)
+      else
+        Obj:= PyTuple_GetItem(ObjLines, i);
+      if (Obj=nil) or (not PyLong_Check(Obj)) then
+      begin
+        MsgLogConsole('ERROR: bookmark BOOKMARK2_APPEND_MANY: y['+IntToStr(i)+'] is not int');
+        exit;
+      end;
+      Lines[i]:= PyLong_AsLong(Obj);
+
+      if PyList_Check(ObjKinds) then
+        Obj:= PyList_GetItem(ObjKinds, i)
+      else
+        Obj:= PyTuple_GetItem(ObjKinds, i);
+      if (Obj=nil) or (not PyLong_Check(Obj)) then
+      begin
+        MsgLogConsole('ERROR: bookmark BOOKMARK2_APPEND_MANY: nkind['+IntToStr(i)+'] is not int');
+        exit;
+      end;
+      Kinds[i]:= PyLong_AsLong(Obj);
+    end;
+  end;
+
+  if Bool(NAutoDelete) then
+    AutoDel:= TATBookmarkAutoDelete.Delete
+  else
+    AutoDel:= TATBookmarkAutoDelete.ByOption;
+
+  for i:= 0 to Count-1 do
+  begin
+    //same nkind clamping as the single-item actions
+    NKind:= Kinds[i];
+    if NKind<Low(AppBookmarkSetup) then
+      NKind:= Low(AppBookmarkSetup);
+    if NKind>High(AppBookmarkSetup) then
+      NKind:= High(AppBookmarkSetup);
+
+    Ed.BookmarkAppendEx(Lines[i], NKind, AText,
+      AutoDel,
+      Bool(NShowInList),
+      ATag,
+      Ed.Strings.Bookmarks2
+      );
+  end;
+
+  with AppPython.Engine do
+    Result:= PyLong_FromLong(Ed.Strings.Bookmarks2.Count);
+end;
+
 function api_ed_bookmark(Self, Args: PPyObject): PPyObject; cdecl;
 var
   H: Int64;
@@ -2170,14 +2294,50 @@ var
   NId, NLine, NKind, NColor, NAutoDelete, NShowInList: integer;
   NTag: integer;
   AutoDel: TATBookmarkAutoDelete;
+  ObjLine, ObjKind: PPyObject;
 begin
+  //nline/nkind are parsed as OBJECTS ('O', not 'i'): the
+  //BOOKMARK2_APPEND_MANY action receives two parallel int SEQUENCES
+  //there (y, nkind lists -- one api call per editor instead of one
+  //per bookmark: a 1M-line compare flushes ~800k bookmarks per side
+  //and the per-call dispatch used to cost more than the append
+  //itself). All single-item actions still need plain ints there and
+  //convert below; a non-int leaves the TypeError PyLong_AsLong sets
+  //pending, so behavior for bad calls matches the old 'i' parse.
   with AppPython.Engine do
-    if Bool(PyArg_ParseTuple(Args, 'Liiiisiii:bookmark',
-            @H, @NId, @NLine, @NKind, @NColor, @PtrText,
+    if Bool(PyArg_ParseTuple(Args, 'LiOOisiii:bookmark',
+            @H, @NId, @ObjLine, @ObjKind, @NColor, @PtrText,
             @NAutoDelete, @NShowInList, @NTag)) then
     begin
       Ed:= PyHelper_EditorFromHandle(H);
       StrText:= string(PtrText);
+
+      if NId = BOOKMARK2_APPEND_MANY then
+      begin
+        //batch append (see PyHelper_BookmarkAppendMany): converts
+        //y/nkind lists to ints and appends everything to
+        // Bookmarks2 in one call
+        Result:= PyHelper_BookmarkAppendMany(Ed, ObjLine, ObjKind,
+          StrText, NAutoDelete, NShowInList, NTag);
+        if Result=nil then
+          Result:= ReturnNone;
+        exit;
+      end;
+
+      //single-item actions: nline/nkind must be int
+      if (ObjLine=nil) or (not PyLong_Check(ObjLine)) or
+         (ObjKind=nil) or (not PyLong_Check(ObjKind)) then
+      begin
+        if (ObjLine<>nil) and (not PyLong_Check(ObjLine)) then
+          PyLong_AsLong(ObjLine) //sets TypeError for the caller
+        else
+        if ObjKind<>nil then
+          PyLong_AsLong(ObjKind); //sets TypeError for the caller
+        Result:= ReturnNone;
+        exit;
+      end;
+      NLine:= PyLong_AsLong(ObjLine);
+      NKind:= PyLong_AsLong(ObjKind);
 
       //check range of NKind
       if NKind<Low(AppBookmarkSetup) then

@@ -3228,6 +3228,7 @@ Additional internal list Bookmarks2 exists, which holds list of background bookm
 * BOOKMARK2_CLEAR
 * BOOKMARK2_CLEAR_ALL
 * BOOKMARK2_DELETE_BY_TAG
+* BOOKMARK2_APPEND_MANY: Adds many bookmarks to Bookmarks2 at once, like calling BOOKMARK2_APPEND in a loop, but with one API call. Params "nline" and "nkind" must be lists/tuples of int, of the SAME length; all other params ("ncolor", "text", "auto_del", "show", "tag") are shared by all items. Per-item behavior is exactly BOOKMARK2_APPEND's: no duplicate search, no sorting (caller must pass "nline" already sorted ascending), no events, no repainting. "nkind" values are clamped to 1..63 per item. If any element is not int, or the lengths differ, the call does nothing. Returns the total count of Bookmarks2 items after the call.
 
 Notes:
 
