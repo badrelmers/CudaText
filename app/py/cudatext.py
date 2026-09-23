@@ -1058,6 +1058,24 @@ DIF_CANCEL             = 3  # param1 is the job handle int; cancels a running ba
 DIFF_ALGO_MYERS        = 0
 DIFF_ALGO_HISTOGRAM    = 1
 
+# diff_proc: DIF_CHARS-only bit of the algo parameter. DIF_CHARS + this
+# bit returns the batch as ONE FLAT bytes object instead of the list of
+# per-pair opcode lists: an int32 array (native byte order) laid out as
+#   [0] format version (1)
+#   [1] N = pair count
+#   [2] T = total opcode count
+#   [3 .. 3+N] starts: N+1 cumulative opcode-start indices (CSR)
+#   then T opcodes, 5 int32 each: tag (0=equal 1=delete 2=insert
+#   3=replace 4=ignore), i1, i2, j1, j2; pair k's opcodes are the
+#   starts[k] .. starts[k+1] entries
+# (decode: memoryview(buf).cast('i')). Building millions of opcode
+# tuples in the C wrapper costs seconds; one memcpy does not. Hosts
+# that ignore the bit for DIF_CHARS (algo was never used there)
+# return the list protocol, so detect the result shape and handle
+# both. Bit 16 is far from the 0/1/2.. algo ids a future engine might
+# honor.
+DIFF_CHARS_FLAT        = 0x10000
+
 # diff_proc: bitmask flags for the flags parameter.
 # Combine with the bitwise 'or' operator, e.g.
 #   flags = cudatext.DIFF_IGN_CASE | cudatext.DIFF_IGN_WHITESPACE
@@ -1419,6 +1437,13 @@ def diff_proc(id, param1, param2=None, algo=0, flags=0, callback=None):
     per pair (hundreds of thousands of API round-trips on big files), the
     whole batch runs in a single pass.
     algo: DIFF_ALGO_MYERS (default) or DIFF_ALGO_HISTOGRAM, DIF_TEXTS only.
+    DIF_CHARS only: the DIFF_CHARS_FLAT bit (algo | DIFF_CHARS_FLAT)
+    switches the result to ONE FLAT bytes object (int32 array; see the
+    DIFF_CHARS_FLAT constant's comment for the layout) -- the callback
+    argument / synchronous return value is that bytes object instead of
+    the list of per-pair lists. Hosts that ignore the bit return the
+    list protocol, so detect the result shape (bytes vs list) and
+    handle both.
     flags: bitmask of DIFF_IGN_* constants (applied to every pair of a
     DIF_CHARS batch identically).
 
@@ -1429,6 +1454,8 @@ def diff_proc(id, param1, param2=None, algo=0, flags=0, callback=None):
     - DIF_CHARS: a list with ONE opcode list per input pair, in the same
       order -- each element is the same (tag, i1, i2, j1, j2) list DIF_TEXTS
       returns for a pair's two texts. Two empty strings give [].
+    - DIF_CHARS with the DIFF_CHARS_FLAT bit: ONE bytes object in the flat
+      int32 layout (see DIFF_CHARS_FLAT).
     Warning: plugin Python code runs on the main GUI thread, so a long
     compare freezes CudaText -- use this form for small inputs only.
 
@@ -1653,6 +1680,17 @@ class Editor:
 
     def get_wrapinfo(self, param1=-1, param2=-1):
         return ct.ed_get_wrapinfo(self.h, param1, param2)
+
+    def get_wrap_counts(self):
+        """Flat per-line visual-row counts as ONE bytes object (int32
+        array, native byte order): [0] format version (1), [1] N = line
+        count (== get_line_count()), then N counts where counts[i] =
+        number of visual rows line i occupies (>= 1). Equivalent to
+        counting get_wrapinfo()'s 'line' values per line, but without
+        building one dict per visual row -- ~1s per million-row editor
+        saved. Decode: memoryview(buf).cast('i'). Only on hosts that
+        expose ed_get_wrap_counts; None elsewhere."""
+        return ct.ed_get_wrap_counts(self.h)
 
     def action(self, id, param1='', param2='', param3=''):
         return ct.ed_action(self.h, id, to_str(param1), to_str(param2), to_str(param3))

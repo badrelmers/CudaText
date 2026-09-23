@@ -3445,6 +3445,124 @@ begin
 end;
 
 
+{ Flat per-line visual-row counts for one editor, as a single bytes
+  object (int32 array; native byte order -- same-process consumer):
+    [0] format version, always 1
+    [1] N = Ed.Strings.Count (matches Editor.get_line_count())
+    [2 .. 2+N) counts: counts[i] = number of visual rows line i
+    occupies (>= 1; lines with no WrapInfo entry keep the default 1).
+  Equivalent to counting get_wrapinfo's 'line' values per line -- but
+  get_wrapinfo builds ONE DICT PER VISUAL ROW (6 keys each, ~0.5s per
+  million-row editor) and the plugin then runs a Counter pass over
+  them (~0.5s more); this helper does the same count in one Pascal
+  pass with zero Python objects, one PyBytes memcpy out.
+
+  Freshness: WrapInfo is recalculated by the editor itself on every
+  text change (EditorSetAllTextFromAPI does WrapInfo.Clear +
+  UpdateWrapInfo(true,false); the edit APIs call UpdateWrapInfo), so
+  the plugin no longer needs the EDACTION_UPDATE forced repaint it
+  used to run before get_wrapinfo. A stale structure is detected by
+  coverage (the LAST WrapInfo row's line index < N-1: the rows do not
+  reach the text's end) and forcibly recomputed with the same
+  UpdateWrapInfo(true,false) call set_text_all uses -- no repaint. A
+  completely empty WrapInfo on a non-empty editor is NOT recomputed:
+  it mirrors get_wrapinfo's "not info -> all counts 1" behavior for
+  hosts where wrap info is simply not maintained.
+
+  Run-length semantics are EXACTLY the plugin's old Counter logic:
+  out-of-range line indexes are skipped, lines with no rows keep 1,
+  a line with R rows gets count R. }
+function PyHelper_GetWrapCountsFlat(Ed: TATSynEdit): PPyObject;
+var
+  Buf: array of Int32;
+  NLines, i, NLine, NRun: integer;
+  WrapItem: TATWrapItem;
+  ByteLen: NativeInt;
+begin
+  Result:= nil;
+  NLines:= Ed.Strings.Count;
+
+  if (NLines>0) and (Ed.WrapInfo.Count>0) then
+  begin
+    WrapItem:= Ed.WrapInfo[Ed.WrapInfo.Count-1];
+    if WrapItem.NLineIndex < NLines-1 then
+      //stale coverage: the wrap rows do not reach the last line --
+      //recompute exactly the way EditorSetAllTextFromAPI does (no
+      //repaint; the plugin repaints when IT decides to)
+      Ed.UpdateWrapInfo(true, false);
+  end;
+
+  //header(2) + counts(N); always >= 2 ints, so @Buf[0] is valid
+  SetLength(Buf, 2 + NLines);
+  Buf[0]:= 1;               //format version
+  Buf[1]:= NLines;          //line count == Editor.get_line_count()
+  for i:= 0 to NLines-1 do
+    Buf[2+i]:= 0;           //0 = "no wrap rows seen for this line yet"
+
+  //one run-length pass over the wrap rows. WrapInfo's NLineIndex runs
+  //are ascending and contiguous in practice (it is the line->rows
+  //mapping used for rendering), but the code only ASSUMES GROUPING:
+  //a run breaks whenever the line index changes, runs of the SAME
+  //line accumulate (Inc), and out-of-range lines are skipped -- the
+  //exact semantics of the plugin's old Counter(map(itemgetter('line')))
+  //for any input shape.
+  if Ed.WrapInfo.Count>0 then
+  begin
+    NLine:= -1;
+    NRun:= 0;
+    for i:= 0 to Ed.WrapInfo.Count-1 do
+    begin
+      WrapItem:= Ed.WrapInfo[i];
+      if WrapItem.NLineIndex <> NLine then
+      begin
+        //close the previous run (bounds check == the plugin's old
+        //0 <= line < line_count skip)
+        if (NLine>=0) and (NLine<NLines) then
+          Inc(Buf[2+NLine], NRun);
+        NLine:= WrapItem.NLineIndex;
+        NRun:= 1;
+      end
+      else
+        Inc(NRun);
+    end;
+    //close the final run
+    if (NLine>=0) and (NLine<NLines) then
+      Inc(Buf[2+NLine], NRun);
+  end;
+
+  //lines with no wrap rows keep one visual row (the plugin's old
+  //[1]*line_count default that Counter only overwrote for PRESENT
+  //lines; an empty WrapInfo on a non-empty editor therefore yields
+  //all ones, get_wrapinfo's "not info" behavior)
+  for i:= 0 to NLines-1 do
+    if Buf[2+i]=0 then
+      Buf[2+i]:= 1;
+
+  with AppPython.Engine do
+  begin
+    ByteLen:= NativeInt(Length(Buf)) * 4;
+    Result:= PyBytes_FromStringAndSize(PAnsiChar(@Buf[0]), ByteLen);
+    if Result=nil then
+      raise EPythonError.Create(msgPythonListError);
+  end;
+end;
+
+function api_ed_get_wrap_counts(Self, Args: PPyObject): PPyObject; cdecl;
+var
+  H: Int64;
+  Ed: TATSynEdit;
+begin
+  with AppPython.Engine do
+    if Bool(PyArg_ParseTuple(Args, 'L:get_wrap_counts', @H)) then
+      begin
+        Ed:= PyHelper_EditorFromHandle(H);
+        Result:= PyHelper_GetWrapCountsFlat(Ed);
+      end
+  else
+    Result:= ReturnNone;
+end;
+
+
 function PyHelper_GetScrollInfo(const AInfo: TATEditorScrollInfo): PPyObject;
 begin
   with AppPython.Engine do
@@ -11262,7 +11380,18 @@ end;
 //      DIF_CANCEL (3) -- param1 is a job handle int returned by the
 //      asynchronous form; cancels that running background compare.
 //  algo: DIFF_ALGO_MYERS (0) or DIFF_ALGO_HISTOGRAM (1).
-//        Ignored for DIF_CHARS (char diff always uses word-Myers + byte-trim).
+//        Ignored for DIF_CHARS (char diff always uses word-Myers + byte-trim),
+//        EXCEPT for the DIFF_CHARS_FLAT bit ($10000): DIF_CHARS + that bit
+//        returns the batch as ONE FLAT bytes object (int32 array:
+//        [version=1, pair_count, total_opcodes, starts[pair_count+1],
+//        then 5 int32 per opcode: tag(0=equal 1=delete 2=insert 3=replace
+//        4=ignore), i1, i2, j1, j2; native byte order] -- see
+//        DiffCharOpcodesToFlatBuffer) instead of the list of per-pair
+//        opcode lists. Marshalling 1.6M opcodes as tuples costs seconds
+//        of main-thread time; one memcpy does not. Old hosts ignore the
+//        bit (they never read algo for DIF_CHARS) and return the list
+//        protocol, so the caller should detect the result shape
+//        (bytes -> flat, list -> per-pair lists) and handle both.
 //  flags: bitmask of DIFF_IGN_* values (case/whitespace/numbers/etc).
 //        Applied to every pair of a DIF_CHARS batch identically.
 //  callback: optional, enables the asynchronous mode. Works for BOTH
@@ -11305,9 +11434,12 @@ end;
 //Returns: synchronous DIF_TEXTS -- list of (tag, i1, i2, j1, j2) tuples;
 //  synchronous DIF_CHARS -- list with ONE opcode list per input pair, in
 //  the same order (each element is the (tag, i1, i2, j1, j2) list for that
-//  pair, the same format DIF_TEXTS returns for two whole texts);
-//  asynchronous form -- job handle int (positive; None when the engine
-//  could not start the background compare); DIF_CANCEL -- True/False.
+//  pair, the same format DIF_TEXTS returns for two whole texts); a
+//  DIF_CHARS call with the DIFF_CHARS_FLAT bit -- ONE bytes object in the
+//  flat int32 layout (see above), async form included (the callback
+//  receives the bytes object);  asynchronous form -- job handle int
+//  (positive; None when the engine could not start the background
+//  compare); DIF_CANCEL -- True/False.
 //  Tag is a lowercase string
 //  'equal'/'delete'/'insert'/'replace'/'ignore'. Format matches
 //  difflib.SequenceMatcher.get_opcodes() exactly. 'ignore' is a CudaText
@@ -11517,6 +11649,86 @@ begin
       //SetItem steals the list reference on success
       PyList_SetItem(Result, i, ObjList);
     end;
+  end;
+end;
+
+{ FLAT alternative to DiffCharOpcodesToPyList: the DIF_CHARS result as
+  ONE bytes object carrying the whole batch as a native-endian int32
+  array (requested with the DIFF_CHARS_FLAT bit of the algo parameter).
+
+  Layout (int32 units; native byte order -- producer and consumer are
+  the same process, so no endian marker is needed):
+    [0]      format version, always 1
+    [1]      N = pair count (== Length(APairs))
+    [2]      T = total opcode count over all pairs
+    [3 .. 3+N]   starts: N+1 cumulative opcode-start indices,
+                 starts[0]=0, starts[k+1]=starts[k]+opcode count of
+                 pair k. Pair k's opcodes are flat[5*starts[k] ..
+                 5*starts[k+1]), five int32 per opcode:
+                 tag, i1, i2, j1, j2 (tag = DIFF_TAG_* value,
+                 0=equal 1=delete 2=insert 3=replace 4=ignore).
+  Total size: (4 + N + 5*T) * 4 bytes. The plugin decodes it with
+  memoryview(buf).cast('i') and walks pairs through the starts array
+  (CSR layout: no per-pair headers in the opcode stream, random pair
+  access = 2 index reads).
+
+  Why: DiffCharOpcodesToPyList builds 1 tuple + 4 int objects PER
+  OPCODE through the C API (plus one list per pair); on a
+  800k-pair / 1.6M-opcode batch that is seconds of main-thread time
+  under the GIL (measured ~1.6-2s in the differ profiling reports) and
+  ~300MB of short-lived object churn. This builder writes the same
+  numbers into one preallocated Int32 array (two linear passes: total
+  count, then fill) and hands Python a single PyBytes copy of it --
+  one allocation + one memcpy, tens of milliseconds for tens of MB.
+
+  Must be called on the main thread (GIL), like DiffCharOpcodesToPyList.
+  Raises EPythonError when the bytes object cannot be created (same
+  error contract as the list builder). }
+function DiffCharOpcodesToFlatBuffer(const APairs: TDiffCharsOpcodeMatrix): PPyObject;
+var
+  Buf: array of Int32;
+  N, T, i, j, Dst: integer;
+  ByteLen: NativeInt;
+begin
+  Result:= nil;
+  N:= Length(APairs);
+  T:= 0;
+  for i:= 0 to N-1 do
+    T:= T + Length(APairs[i]);
+
+  //header(3) + starts(N+1) + opcodes(5*T); always >= 4 ints, so
+  //@Buf[0] below is always valid
+  SetLength(Buf, 4 + N + 5*T);
+  Buf[0]:= 1;               //format version
+  Buf[1]:= N;               //pair count
+  Buf[2]:= T;               //total opcode count
+  Dst:= 3;
+  Buf[Dst]:= 0;             //starts[0] = 0
+  for i:= 0 to N-1 do
+  begin
+    //starts[i+1] = starts[i] + pair i's opcode count; written before
+    //the opcodes so the fill below can use it as the running cursor
+    Inc(Dst);
+    Buf[Dst]:= Buf[Dst-1] + Length(APairs[i]);
+  end;
+  Inc(Dst);                 //Dst now = 4+N, the opcode region start
+  for i:= 0 to N-1 do
+    for j:= 0 to High(APairs[i]) do
+    begin
+      Buf[Dst]:=   APairs[i][j].Tag;
+      Buf[Dst+1]:= APairs[i][j].I1;
+      Buf[Dst+2]:= APairs[i][j].I2;
+      Buf[Dst+3]:= APairs[i][j].J1;
+      Buf[Dst+4]:= APairs[i][j].J2;
+      Inc(Dst, 5);
+    end;
+
+  with AppPython.Engine do
+  begin
+    ByteLen:= NativeInt(Length(Buf)) * 4;
+    Result:= PyBytes_FromStringAndSize(PAnsiChar(@Buf[0]), ByteLen);
+    if Result=nil then
+      raise EPythonError.Create(msgPythonListError);
   end;
 end;
 
@@ -11911,11 +12123,21 @@ begin
   try
     //result object passed to the callback: the opcode list (DIF_TEXTS)
     //or the list of per-pair opcode lists (batched DIF_CHARS), or None
-    //on error (the same contract the synchronous form of diff_proc has)
+    //on error (the same contract the synchronous form of diff_proc has).
+    //DIF_CHARS with the DIFF_CHARS_FLAT bit of the algo parameter gets
+    //the FLAT encoding instead: one bytes object (DiffCharOpcodesTo
+    //FlatBuffer). Old hosts ignore the bit for DIF_CHARS and produce
+    //the list protocol, so the plugin's result-shape detection handles
+    //every host/plugin version combination.
     if FErrorMessage='' then
     begin
       if FIdAction=DIF_CHARS then
-        Obj:= DiffCharOpcodesToPyList(FCharOpcodes)
+      begin
+        if (FAlgo and DIFF_CHARS_FLAT)<>0 then
+          Obj:= DiffCharOpcodesToFlatBuffer(FCharOpcodes)
+        else
+          Obj:= DiffCharOpcodesToPyList(FCharOpcodes)
+      end
       else
         Obj:= DiffOpcodesToPyList(FOpcodes);
     end
@@ -12173,7 +12395,13 @@ begin
             finally
               CharBatch.Free;
             end;
-            Result:= DiffCharOpcodesToPyList(CharOpcodes);
+            //DIFF_CHARS_FLAT bit of the algo parameter: same selection
+            //as the async form's DoCallback (one bytes object instead
+            //of the per-pair opcode lists)
+            if (NAlgo and DIFF_CHARS_FLAT)<>0 then
+              Result:= DiffCharOpcodesToFlatBuffer(CharOpcodes)
+            else
+              Result:= DiffCharOpcodesToPyList(CharOpcodes);
           end;
       end;
     except
@@ -12248,6 +12476,7 @@ begin
     AddMethod('ed_get_sublexer_ranges', @api_ed_get_sublexer_ranges, '');
     AddMethod('ed_get_token', @api_ed_get_token, '');
     AddMethod('ed_get_wrapinfo', @api_ed_get_wrapinfo, '');
+    AddMethod('ed_get_wrap_counts', @api_ed_get_wrap_counts, '');
 
     AddMethod('ed_save', @api_ed_save, '');
     AddMethod('ed_load', @api_ed_load, '');

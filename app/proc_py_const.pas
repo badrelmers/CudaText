@@ -922,6 +922,20 @@ const
   DIFF_ALGO_MYERS        = 0;
   DIFF_ALGO_HISTOGRAM    = 1;
 
+  { diff_proc: DIF_CHARS-only bit of the algo parameter. When set, the
+    DIF_CHARS result (callback argument of the async form / return
+    value of the sync form) is ONE FLAT bytes object instead of the
+    list of per-pair opcode lists: the batch's millions of opcodes are
+    marshalled as a single int32 array (see DiffCharOpcodesToFlatBuffer
+    in formmain_py_api.inc for the exact layout). Building 1 tuple + 4
+    int objects per opcode in the C wrapper costs seconds on
+    million-pair batches; one memcpy does not. Old hosts ignore the
+    bit for DIF_CHARS (algo was never used there), so a new plugin
+    falling back to the list protocol when the result is not bytes
+    stays compatible in BOTH directions. Bit 16 is deliberately far
+    from the 0/1/2.. algo ids a future engine might honor. }
+  DIFF_CHARS_FLAT       = $10000;
+
   { diff_proc: bitmask flags for the flags parameter.
     Combine with 'or', e.g. DIFF_IGN_CASE or DIFF_IGN_WHITESPACE. }
   DIFF_IGN_NONE        = 0;

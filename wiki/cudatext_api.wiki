@@ -2335,7 +2335,15 @@ Param "id" specifies the action:
 * DIF_CHARS: BATCHED char-level diff. Param "param1" is a list of <code>(text1, text2)</code> string pairs - each element is a tuple (or 2-item list) of two str values; param "param2" is unused (pass None). ALL pairs are compared at character granularity (typically single lines, but works on any strings) in ONE engine call: a batch of e.g. 100'000 pairs is one diff_proc call instead of 100'000 calls, eliminating the per-call API overhead (argument parsing, string conversion, result building), which dominates the runtime when char-diffing the changed lines of big files. Each pair is compared independently of the others. Internally each pair's strings are converted to UTF-32 code point arrays and compared on code point indices (NOT byte indices - so <code>len(line_a)</code> in Python equals the index range returned for that pair, even for non-ASCII strings). The algorithm is WinMerge's ONP (O(NP) Sequence Comparison, Wu-Manber-Myers-Miller) with word-level tokenization followed by byte-level (character-level) refinement. Tokenization splits on whitespace, punctuation (default break chars <code>,.;:</code>), and digits (when <code>DIFF_IGN_NUMBERS</code> is set). Each pair's engine run has a built-in size guard (bails out to a single REPLACE if either side has ≥ 20480 tokens) and a 500ms timeout (bails out to a single REPLACE if exceeded). An empty batch <code>[]</code> returns an empty list.
 * DIF_CANCEL: Cooperative cancellation of a running background compare. Param "param1" is the job handle (the positive int the asynchronous form returned); all other parameters are unused. Works identically for DIF_TEXTS and DIF_CHARS jobs. Returns True when the job was found and cancellation was requested, False when no such job is running (it already finished, was cancelled before, or never existed). See "Cancelling a background compare" below.
 
-Param "algo" selects the diff algorithm (only used for DIF_TEXTS, ignored for DIF_CHARS - char-diff always uses WinMerge's Myers ONP):
+Param "algo" selects the diff algorithm (only used for DIF_TEXTS, ignored for DIF_CHARS - char-diff always uses WinMerge's Myers ONP). One DIF_CHARS-only exception: the bit <code>DIFF_CHARS_FLAT</code> (0x10000) can be combined into "algo" (<code>algo | DIFF_CHARS_FLAT</code>) to switch the DIF_CHARS result to ONE FLAT <code>bytes</code> object instead of the list of per-pair opcode lists - the whole batch marshalled as a single int32 array (native byte order):
+
+* <code>[0]</code>: format version, always 1.
+* <code>[1]</code>: N = pair count.
+* <code>[2]</code>: T = total opcode count over all pairs.
+* <code>[3 .. 3+N]</code>: starts, N+1 cumulative opcode-start indices (CSR layout: starts[0]=0, starts[k+1]=starts[k]+pair k's opcode count). Pair k's opcodes are the entries <code>starts[k] .. starts[k+1]-1</code>.
+* Then T opcodes, 5 int32 each: tag (0=equal 1=delete 2=insert 3=replace 4=ignore), i1, i2, j1, j2 - the same numbers the tuple protocol carries as (tag, i1, i2, j1, j2) tuples.
+
+Decode on the Python side with <code>memoryview(buf).cast('i')</code>. This encoding exists because building 1 tuple + 4 int objects per opcode in the C wrapper costs seconds of main-thread time on million-opcode batches, while one memcpy does not. Hosts that don't know the bit return the list protocol (the bit is ignored for DIF_CHARS there), so callers should detect the result shape (bytes -&gt; flat, list -&gt; per-pair lists) and handle both. Works for the synchronous form and the asynchronous form alike (the callback receives the bytes object).
 
 * DIFF_ALGO_MYERS: GNU diffutils Myers O(ND) bidirectional middle-snake search, with the Eggert TOO_EXPENSIVE heuristic (cost cutoff at <code>max(4096, 2^ceil(log4(N+M)))</code>), the <code>big_snake</code> early-exit heuristic, and the <code>discard_confusing_lines</code> Hirschberg-style junk pre-filter. The Eggert heuristic trades output optimality for speed - worst case is O(N^1.5 log N) instead of O(N²). Ported from WinMerge's bundled GNU diffutils. The algorithm git uses for <code>git diff --myers</code>. This is the faster engine for large/different files.
 * DIFF_ALGO_HISTOGRAM: JGit Histogram Diff with <code>max_chain_length=64</code> fallback to JGit's Myers O(ND) Diff. Ported from JGit. The algorithm git uses for <code>git diff --histogram</code>. Behaves like Patience diff when unique common elements exist, with graceful fallback when they don't. May be slower than DIFF_ALGO_MYERS on heavily-different big files (JGit's MyersDiff fallback is pure O(ND) with no Eggert heuristic), but produces patience-style anchoring on unique lines.
@@ -3358,6 +3366,20 @@ Notes:
 * If "param1" specifies incorrect line index, returns empty list.
 * If "param2" is < 0 or specifies incorrect line index, its value is replaced to the maximal possible index.
 * Length of resulting list equals the lines count for non-wrapped document. For wrapped document, you get 1 or more list items per each document line.
+
+===Editor.get_wrap_counts===
+
+ get_wrap_counts()
+
+Gets the number of visual (wrapped) rows each line occupies on screen, as ONE FLAT <code>bytes</code> object instead of a list of dicts - the flat encoding of what counting <code>get_wrapinfo()</code>'s "line" values per line would give, without building one dict per visual row (get_wrapinfo costs ~0.5s per million-row editor; this call is a single Pascal pass + one buffer copy).
+
+The bytes object is an int32 array in native byte order (decode with <code>memoryview(buf).cast('i')</code>):
+
+* <code>[0]</code>: format version, always 1.
+* <code>[1]</code>: N = line count (equals <code>get_line_count()</code>).
+* <code>[2 .. 2+N)</code>: counts, where <code>counts[i]</code> = number of visual rows line i occupies (always &gt;= 1; a line that does not wrap has 1).
+
+Semantics match counting get_wrapinfo's "line" values per line: lines with no wrap rows keep 1, a line with R rows gets R, out-of-range line indexes are skipped. The editor's wrap info is recalculated by the editor itself on every text change, and a stale structure (detected by coverage: the wrap rows do not reach the last line) is recomputed before counting - with no repaint, unlike the <code>action(EDACTION_UPDATE, "1")</code> forced repaint plugins had to run before get_wrapinfo.
 
 ===Editor.markers===
 
