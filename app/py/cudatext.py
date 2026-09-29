@@ -1410,7 +1410,7 @@ def finder_proc(id_finder, id_action, value="", setcaret=True):
     return ct.finder_proc(id_finder, id_action, to_str(value), setcaret)
 
 def diff_proc(id, param1, param2=None, algo=0, flags=0, callback=None,
-             break_chars=',.;:'):
+             break_chars=".,:;?[](){}<=>`'!\"#$%&^~\\|@+-*/"):
     """
     Compares texts, returns difflib-compatible opcodes.
 
@@ -1426,8 +1426,14 @@ def diff_proc(id, param1, param2=None, algo=0, flags=0, callback=None,
     break_chars: word-break characters of the DIF_CHARS tokenizer (DIF_CHARS
     only; DIF_TEXTS/DIF_CANCEL accept and ignore it). A string of chars,
     every char of the set is its own token and a word boundary, default
-    ',.;:' (WinMerge's default). Applied to every pair of a batch
-    identically. Empty string '' disables punctuation breaking (words are
+    ".,:;?[](){}<=>`'!\"#$%&^~\\|@+-*/" -- WinMerge's "Word break
+    characters" options default (WinMerge's engine source hard-codes only
+    a ",.;:" fallback that runs until SetBreakChars() is called, but
+    WinMerge's Options dialog stores the long list as the setting's
+    default and pushes it into the engine on every compare -- so the long
+    list is the effective default this API mirrors). Applied to every
+    pair of a batch identically. Empty string '' disables punctuation
+    breaking (words are
     only split on whitespace/EOL). Whitespace, CR/LF and digits under
     DIFF_IGN_NUMBERS are classified before the break-char check, so putting
     them in the set has no effect; non-ASCII chars always break regardless.
