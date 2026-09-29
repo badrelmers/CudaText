@@ -1409,7 +1409,8 @@ def dlg_proc(id_dialog, id_action, prop='', index=-1, index2=-1, name=''):
 def finder_proc(id_finder, id_action, value="", setcaret=True):
     return ct.finder_proc(id_finder, id_action, to_str(value), setcaret)
 
-def diff_proc(id, param1, param2=None, algo=0, flags=0, callback=None):
+def diff_proc(id, param1, param2=None, algo=0, flags=0, callback=None,
+             break_chars=',.;:'):
     """
     Compares texts, returns difflib-compatible opcodes.
 
@@ -1422,6 +1423,14 @@ def diff_proc(id, param1, param2=None, algo=0, flags=0, callback=None):
     algo: DIFF_ALGO_MYERS (default) or DIFF_ALGO_HISTOGRAM, DIF_TEXTS only.
     flags: bitmask of DIFF_IGN_* constants (applied to every pair of a
     DIF_CHARS batch identically).
+    break_chars: word-break characters of the DIF_CHARS tokenizer (DIF_CHARS
+    only; DIF_TEXTS/DIF_CANCEL accept and ignore it). A string of chars,
+    every char of the set is its own token and a word boundary, default
+    ',.;:' (WinMerge's default). Applied to every pair of a batch
+    identically. Empty string '' disables punctuation breaking (words are
+    only split on whitespace/EOL). Whitespace, CR/LF and digits under
+    DIFF_IGN_NUMBERS are classified before the break-char check, so putting
+    them in the set has no effect; non-ASCII chars always break regardless.
 
     Without `callback` (default) the call is synchronous: it blocks until
     the compare finishes and returns the result (None on error):
@@ -1462,7 +1471,8 @@ def diff_proc(id, param1, param2=None, algo=0, flags=0, callback=None):
     # DIF_TEXTS: param1/param2 are the two texts. DIF_CHARS: param1 is the
     # whole list of (text1, text2) pairs; param2/algo are ignored by the
     # engine for DIF_CHARS (pass None), same call shape either way.
-    return ct.diff_proc(id, param1, param2, algo, flags, callback)
+    # break_chars must be a str (the engine rejects other types).
+    return ct.diff_proc(id, param1, param2, algo, flags, callback, break_chars)
 
 
 def esc_z(s):

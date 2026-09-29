@@ -25,7 +25,8 @@
 
     function UTF8ToUTF32(const S: string): TCodePointArray;
     function DoDiffChars(const ATextA, ATextB: string;
-                        AFlags: Integer): TDiffOpcodeArray;
+                        AFlags: Integer;
+                        const ABreakChars: string): TDiffOpcodeArray;
 
     TDiffCharsBatch = class;
 
@@ -57,7 +58,7 @@
     Src/stringdiffs.cpp:wordLevelToByteLevel    | TStringDiff.wordLevelToByteLevel
     Src/stringdiffs.cpp:isSafeWhitespace        | isSafeWhitespace
     Src/stringdiffs.cpp:isWordBreak             | isWordBreak
-    Src/stringdiffs.cpp:Init/SetBreakChars      | const BreakChars (fixed to default)
+    Src/stringdiffs.cpp:Init/SetBreakChars      | SetBreakChars + DefaultBreakChars (exposed via diff_proc break_chars)
     Src/stringdiffs.cpp:matchchar               | matchchar
     Src/CompareOptions.h:WhitespaceIgnoreChoices | WHITESPACE_* constants
     Externals/crystaledit/editlib/utils/ctchar.h | tc_* helper functions (ASCII only)
@@ -153,8 +154,12 @@
       removed from diff_proc — their old mapping to
       WHITESPACE_IGNORE_CHANGE is gone with them.
 
-  15. BREAK_CHARS (G6): Fixed to the WinMerge default ",.;:" — the
-      SetBreakChars API is not exposed via diff_proc.
+  15. BREAK_CHARS (G6): Exposed. WinMerge's SetBreakChars API is ported
+      as TStringDiff.SetBreakChars and exposed via the diff_proc
+      break_chars parameter (formmain_py_api.inc passes it down to
+      DiffStrings/ComparePair/DoDiffChars). The default is the WinMerge
+      default ",.;:" (DefaultBreakChars); an empty string selects no
+      break chars at all (punctuation never breaks words).
 
   16. Fix WinMerge Hash bug: WinMerge's Hash() does `h += HASH(h, ch)`
       which is `h := h + (ch + ROL(h, 7))`. The first iteration with h=0
@@ -276,10 +281,12 @@ const
     (Pascal on modern systems is essentially 64-bit). }
   MAX_TOKEN_COUNT = 20480;
 
-  { Default break chars — ported from stringdiffs.cpp:24.
-    Fixed to ",.;:" — SetBreakChars API not exposed via diff_proc.
-    Declared as a function because FPC doesn't allow typed const arrays of
-    a type defined later in the same const block. }
+  { Word-break characters — ported from stringdiffs.cpp:24. The value is
+    the WinMerge default ",.;:"; it is the DEFAULT of the diff_proc
+    break_chars parameter (formmain_py_api.inc), which lets users change
+    it. TStringDiff.SetBreakChars decodes the UTF-8 string into code
+    points; isWordBreak() breaks a word at every code point in that set. }
+  DefaultBreakChars = ',.;:';
 
 type
   { Ported from stringdiffs.h:15 — EolCompareMode enum. }
@@ -366,6 +373,14 @@ type
     FCaseSensitive: Boolean;
     FEolMode: TEolCompareMode;
     FIgnoreNumbers: Boolean;
+    { Word-break chars (user-settable — see SetBreakChars / the diff_proc
+      break_chars parameter). Pooled grow-only buffer like the other
+      G35 scratch: re-decoded only when the source string changes, so a
+      DIF_CHARS batch passing the same break chars per pair decodes it
+      exactly once. FBreakCharsSource is the last decoded UTF-8 string. }
+    FBreakChars: TCodePointArray;
+    FBreakCharsLen: Integer;
+    FBreakCharsSource: string;
     { True when a '=' (matched word) step was seen since the last wdiff
       emission - see EmitWdiff (G34). }
     FSawMatchSinceDiff: Boolean;
@@ -494,6 +509,17 @@ type
     procedure SetOptions(case_sensitive: Boolean; eol_mode: TEolCompareMode;
       whitespace: Integer; ignore_numbers: Boolean; breakType: Integer);
 
+    { Ported from stringdiffs.cpp:Init/SetBreakChars — set the word-break
+      characters used by the tokenizer (isWordBreak). ABreakChars is a
+      UTF-8 string of break code points (DefaultBreakChars = ',.;:'); an
+      empty string means NO break chars (punctuation never breaks).
+      Characters classified earlier by BuildWordsInto (CR/LF, safe
+      whitespace, digits under DIFF_IGN_NUMBERS) are never affected.
+      Re-decodes only when the string changed (G35-friendly for batches).
+      Raises on invalid UTF-8 (the Python layer always passes valid
+      UTF-8 from a Python str). }
+    procedure SetBreakChars(const ABreakChars: string);
+
     { Full pipeline for ONE string pair on the pooled state (G35):
       decode UTF-8 into the pooled input buffers, map DIFF_IGN_* flags
       (identically to the old DoDiffChars), run BuildWordDiffList +
@@ -502,7 +528,7 @@ type
       Raises EDiffCancelled when the calling thread's diff job was
       cancelled (cooperative; same polls the engine always had). }
     procedure DiffStrings(const ATextA, ATextB: string; AFlags: Integer;
-      var AOut: TDiffOpcodeArray);
+      const ABreakChars: string; var AOut: TDiffOpcodeArray);
 
     { Copy the pooled PopulateDiffs result into a fresh array (legacy
       ComputeWordDiffs contract: the caller owns the result). }
@@ -547,7 +573,7 @@ type
       its cancel flag BETWEEN pairs — cancellation stays responsive
       exactly as before). }
     procedure ComparePair(const ATextA, ATextB: string; AFlags: Integer;
-      var AOut: TDiffOpcodeArray);
+      const ABreakChars: string; var AOut: TDiffOpcodeArray);
   private
     FEngine: TStringDiff;
   end;
@@ -558,7 +584,8 @@ type
 function ComputeWordDiffs(const str1, str2: TCodePointArray;
   case_sensitive: Boolean; eol_mode: TEolCompareMode;
   whitespace: Integer; ignore_numbers: Boolean;
-  breakType: Integer; byte_level: Boolean): TwdiffArray;
+  breakType: Integer; const ABreakChars: string;
+  byte_level: Boolean): TwdiffArray;
 
 { Convert a UTF-8 Pascal string to a UTF-32 code point array.
   (Already implemented in phase 1 stub — kept verbatim.) }
@@ -566,7 +593,8 @@ function UTF8ToUTF32(const S: string): TCodePointArray;
 
 { Char-level diff entry point — called by formmain_py_api.inc.
   Replaces the phase 1 stub body with the real WinMerge port. }
-function DoDiffChars(const ATextA, ATextB: string; AFlags: Integer): TDiffOpcodeArray;
+function DoDiffChars(const ATextA, ATextB: string; AFlags: Integer;
+  const ABreakChars: string): TDiffOpcodeArray;
 
 { ------------------------------------------------------------------
   Cooperative cancellation (diff_proc DIF_CANCEL)
@@ -612,12 +640,6 @@ begin
   if (DiffCancelFlag <> nil) and DiffCancelFlag^ then
     raise EDiffCancelled.Create('diff cancelled');
 end;
-
-const
-  { Default break chars — ported from stringdiffs.cpp:24.
-    Fixed to ",.;:" — SetBreakChars API not exposed via diff_proc.
-    Referenced directly by isWordBreak() below. }
-  BreakCharsDefault: array[0..3] of TCodePoint = (Ord(','), Ord('.'), Ord(';'), Ord(':'));
 
 { Helper: max of two integers. Avoids pulling in Math unit. }
 function MaxIntOf(a, b: Integer): Integer; inline;
@@ -809,11 +831,15 @@ end;
 { Ported from stringdiffs.cpp:792-826 — isWordBreak.
   Returns true if the code point at S[index] is a word-break character.
   - ASCII + breakType=0: never break (return false)
-  - ASCII + breakType≠0: break if char is in BreakChars
+  - ASCII + breakType≠0: break if char is in BreakChars[0..BreakCharsLen-1]
+    (the user-settable break-char set — see TStringDiff.SetBreakChars;
+    the WinMerge default ",.;:" is DefaultBreakChars)
   - Non-ASCII: WinMerge uses GetStringTypeW (C1_UPPER|C1_LOWER|C1_DIGIT).
     Pascal port treats ALL non-ASCII as break (each is its own token).
-    See G29 divergence #6. }
-function isWordBreak(breakType: Integer; const S: TCodePointArray; index: Integer): Boolean;
+    See G29 divergence #6. BreakChars entries ≥$100 never match — every
+    non-ASCII code point already breaks unconditionally in this branch. }
+function isWordBreak(breakType: Integer; const BreakChars: TCodePointArray;
+  BreakCharsLen: Integer; const S: TCodePointArray; index: Integer): Boolean;
 var
   ch: TCodePoint;
   i: Integer;
@@ -823,8 +849,8 @@ begin
   begin
     if breakType = 0 then
       Exit(False);
-    for i := 0 to High(BreakCharsDefault) do
-      if ch = BreakCharsDefault[i] then
+    for i := 0 to BreakCharsLen - 1 do
+      if ch = BreakChars[i] then
         Exit(True);
     Exit(False);
   end
@@ -947,8 +973,22 @@ begin
   FIgnoreNumbers := ignore_numbers;
 end;
 
+procedure TStringDiff.SetBreakChars(const ABreakChars: string);
+{ Ported from stringdiffs.cpp:Init/SetBreakChars. G35-friendly: decode
+  only when the source string changed, so a DIF_CHARS batch that passes
+  the same break_chars (the normal case — one value per whole batch)
+  decodes it exactly once; per-pair cost is a tiny string compare.
+  Empty string => FBreakCharsLen=0 => isWordBreak never breaks on the
+  break-char set (punctuation is not special). }
+begin
+  if ABreakChars = FBreakCharsSource then
+    Exit;
+  FBreakCharsSource := ABreakChars;
+  UTF8ToUTF32Into(ABreakChars, FBreakChars, FBreakCharsLen);
+end;
+
 procedure TStringDiff.DiffStrings(const ATextA, ATextB: string;
-  AFlags: Integer; var AOut: TDiffOpcodeArray);
+  AFlags: Integer; const ABreakChars: string; var AOut: TDiffOpcodeArray);
 { G35: one string pair on the pooled state. The flag mapping is the
   old DoDiffChars mapping verbatim; the pipeline order is the old
   ComputeWordDiffs(byte_level=True) order. Steady-state heap cost:
@@ -994,6 +1034,7 @@ begin
     DIFF_TAG_IGNORE. }
 
   FBreakType := 1;    { always break on punctuation — matches Differ plugin expectations }
+  SetBreakChars(ABreakChars);  { user-settable break chars (diff_proc break_chars; default ",.;:") }
   { ByteLevel := True: always refine to char level — Differ plugin uses
     char-level highlights (the old DoDiffChars hardcoded it too). }
 
@@ -1151,7 +1192,8 @@ end;
   Rules (per G6):
   1. '\r' or '\n' → dlEol (or dlSpace when eol_mode = eolAsSpace)
   2. isSafeWhitespace(ch) → dlSpace
-  3. isWordBreak(breakType, str, i) → dlBreak (punctuation)
+  3. isWordBreak(breakType, breakChars, str, i) → dlBreak (a word-break
+     char of the user-settable set — see SetBreakChars; default ",.;:")
   4. ignore_numbers and tc::istdigit(ch) → dlNumber
   5. otherwise → dlWord (default)
 
@@ -1222,7 +1264,7 @@ begin
     begin
       break_type := dlspace;
     end
-    else if isWordBreak(FBreakType, S, i) then
+    else if isWordBreak(FBreakType, FBreakChars, FBreakCharsLen, S, i) then
     begin
       break_type := dlbreak;
     end
@@ -2203,7 +2245,8 @@ end;
 function ComputeWordDiffs(const str1, str2: TCodePointArray;
   case_sensitive: Boolean; eol_mode: TEolCompareMode;
   whitespace: Integer; ignore_numbers: Boolean;
-  breakType: Integer; byte_level: Boolean): TwdiffArray;
+  breakType: Integer; const ABreakChars: string;
+  byte_level: Boolean): TwdiffArray;
 var
   sdiffs: TStringDiff;
 begin
@@ -2217,6 +2260,7 @@ begin
     sdiffs.SetExternalInput(str1, str2);
     sdiffs.SetOptions(case_sensitive, eol_mode, whitespace,
       ignore_numbers, breakType);
+    sdiffs.SetBreakChars(ABreakChars);
 
     { Hash all words in both lines and then compare them word by word
       storing differences into m_wdiffs. }
@@ -2471,14 +2515,15 @@ end;
   live in TStringDiff.DiffStrings now; single-pair callers keep the
   exact same signature and output as before (G35).
   ------------------------------------------------------------------ }
-function DoDiffChars(const ATextA, ATextB: string; AFlags: Integer): TDiffOpcodeArray;
+function DoDiffChars(const ATextA, ATextB: string; AFlags: Integer;
+  const ABreakChars: string): TDiffOpcodeArray;
 var
   Batch: TDiffCharsBatch;
 begin
   Result := nil;  // silence "managed type not initialized" warning
   Batch := TDiffCharsBatch.Create;
   try
-    Batch.ComparePair(ATextA, ATextB, AFlags, Result);
+    Batch.ComparePair(ATextA, ATextB, AFlags, ABreakChars, Result);
   finally
     Batch.Free;
   end;
@@ -2501,9 +2546,9 @@ begin
 end;
 
 procedure TDiffCharsBatch.ComparePair(const ATextA, ATextB: string;
-  AFlags: Integer; var AOut: TDiffOpcodeArray);
+  AFlags: Integer; const ABreakChars: string; var AOut: TDiffOpcodeArray);
 begin
-  FEngine.DiffStrings(ATextA, ATextB, AFlags, AOut);
+  FEngine.DiffStrings(ATextA, ATextB, AFlags, ABreakChars, AOut);
 end;
 
 end.

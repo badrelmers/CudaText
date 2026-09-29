@@ -11260,7 +11260,8 @@ end;
 
 
 
-//diff_proc(id, param1, param2=None, algo=0, flags=0, callback=None)
+//diff_proc(id, param1, param2=None, algo=0, flags=0, callback=None,
+//          break_chars=',.;:')
 //Compares texts and returns difflib-compatible opcodes.
 //  id: DIF_TEXTS (1) -- param1, param2 are raw text strings. The native
 //      engine splits them internally on \r\n / \r / \n (CRLF/CR/LF).
@@ -11277,6 +11278,17 @@ end;
 //        Ignored for DIF_CHARS (char diff always uses word-Myers + byte-trim).
 //  flags: bitmask of DIFF_IGN_* values (case/whitespace/numbers/etc).
 //        Applied to every pair of a DIF_CHARS batch identically.
+//  break_chars: str of word-break characters for the DIF_CHARS
+//        tokenizer (DIF_CHARS only; DIF_TEXTS/DIF_CANCEL accept and
+//        ignore it). Default is the WinMerge default ",.;:". The
+//        tokenizer splits words at every char of the set (each break
+//        char is its own token), which the byte-level refinement then
+//        uses as real anchors. Applied to every pair of a batch
+//        identically. Empty string '' = no break chars (punctuation
+//        never breaks words). CR/LF, whitespace (space/tab) and digits
+//        under DIFF_IGN_NUMBERS are classified before the break-char
+//        check, so putting those in the set has no effect. Non-ASCII
+//        code points always break regardless of the set (G29).
 //  callback: optional, enables the asynchronous mode. Works for BOTH
 //      DIF_TEXTS and DIF_CHARS.
 //      Without it (None/empty) the call is SYNCHRONOUS: it blocks until the
@@ -11680,6 +11692,7 @@ type
     FStr1: string;
     FStr2: string;
     FCharPairs: TPyDiffCharPairArray;   //batched DIF_CHARS input (DIF_CHARS only)
+    FBreakChars: string;      //DIF_CHARS word-break chars (diff_proc break_chars param)
     FCallbackStr: string;      //non-empty: 'module.func' string callback
     FCallbackObj: PPyObject;   //non-nil: Python callable, we own a strong ref
     FOpcodes: TPyDiffOpcodeArray;       //DIF_TEXTS result
@@ -11696,12 +11709,13 @@ type
     constructor Create(AJobId, AIdAction, AAlgo, AFlags: Integer;
       const AStr1, AStr2, ACallbackStr: string;
       ACallbackObj: PPyObject;
-      const ACharPairs: TPyDiffCharPairArray);
+      const ACharPairs: TPyDiffCharPairArray;
+      const ABreakChars: string);
   end;
 
 constructor TCudaDiffThread.Create(AJobId, AIdAction, AAlgo, AFlags: Integer;
   const AStr1, AStr2, ACallbackStr: string; ACallbackObj: PPyObject;
-  const ACharPairs: TPyDiffCharPairArray);
+  const ACharPairs: TPyDiffCharPairArray; const ABreakChars: string);
 begin
   inherited Create(true{CreateSuspended});
   FreeOnTerminate:= true;
@@ -11712,6 +11726,7 @@ begin
   FStr1:= AStr1;
   FStr2:= AStr2;
   FCharPairs:= ACharPairs;
+  FBreakChars:= ABreakChars;
   FCallbackStr:= ACallbackStr;
   FCallbackObj:= ACallbackObj;
   FCancelFlag:= false;
@@ -11809,7 +11824,7 @@ begin
               if FCancelFlag then
                 raise CudaDiffChars.EDiffCancelled.Create('diff cancelled');
               Batch.ComparePair(FCharPairs[i].S1, FCharPairs[i].S2,
-                FFlags, FCharOpcodes[i]);
+                FFlags, FBreakChars, FCharOpcodes[i]);
             end;
           finally
             Batch.Free;
@@ -11989,8 +12004,8 @@ begin
 end;
 
 //diff_proc implementation. Three call shapes:
-//  diff_proc(DIF_TEXTS, text1, text2, algo, flags, callback)
-//  diff_proc(DIF_CHARS, pairs, param2, algo, flags, callback)
+//  diff_proc(DIF_TEXTS, text1, text2, algo, flags, callback, break_chars)
+//  diff_proc(DIF_CHARS, pairs, param2, algo, flags, callback, break_chars)
 //  -- callback present: ASYNCHRONOUS, spawns TCudaDiffThread and returns
 //     the job handle (positive int) at once, so the app keeps processing
 //     UI messages; the callback fires on the main thread when done.
@@ -11999,6 +12014,8 @@ end;
 //     lists) -- use for small inputs only, it freezes the UI.
 //     DIF_CHARS takes the WHOLE batch of pairs in param1 (a list of
 //     (text1, text2) tuples); param2 is unused for DIF_CHARS.
+//     break_chars: str (default ",.;:") -- the DIF_CHARS word-break
+//     chars, DIF_CHARS only (accepted and ignored by DIF_TEXTS).
 //  diff_proc(DIF_CANCEL, job_handle)
 //  -- cooperative cancellation of a running background compare; returns
 //     True when the job was found and cancellation was requested, False
@@ -12015,6 +12032,8 @@ var
   PtrCallback: PPyObject;
   StrCallback: string;
   ObjCallback: PPyObject;
+  ObjBreakChars: PPyObject;
+  StrBreakChars: string;
   NJob: Integer;
   I: Integer;
   DiffThread: TCudaDiffThread;
@@ -12027,19 +12046,21 @@ begin
   PtrCallback:= nil;
   ObjParam1:= nil;
   ObjParam2:= nil;
+  ObjBreakChars:= nil;
   CharPairs:= nil;
 
   with AppPython.Engine do
   begin
     Result:= ReturnNone;
 
-    //'iO|OiiO': required (id, param1-object); optional (param2-object,
-    //algo, flags, callback). param1/param2 are converted per action below
+    //'iO|OiiOO': required (id, param1-object); optional (param2-object,
+    //algo, flags, callback, break_chars). param1/param2 are converted per action below
     //(two strings for DIF_TEXTS, a list of string pairs for DIF_CHARS,
     //an int job handle for DIF_CANCEL), which lets the DIF_CANCEL form
     //pass a plain int as param1 and DIF_CHARS ignore param2 entirely.
-    if not Bool(PyArg_ParseTuple(Args, 'iO|OiiO:diff_proc',
-      @IdAction, @ObjParam1, @ObjParam2, @NAlgo, @NFlags, @PtrCallback)) then
+    if not Bool(PyArg_ParseTuple(Args, 'iO|OiiOO:diff_proc',
+      @IdAction, @ObjParam1, @ObjParam2, @NAlgo, @NFlags, @PtrCallback,
+      @ObjBreakChars)) then
       Exit;
 
     //DIF_CANCEL: find the job in the registry and request cooperative
@@ -12103,6 +12124,23 @@ begin
         Exit(ReturnNone);
     end;
 
+    //break_chars (optional 7th argument): the DIF_CHARS word-break
+    //characters. None/not given -> CudaDiffChars.DefaultBreakChars
+    //(",.;:", WinMerge's default). Accepted and ignored by DIF_TEXTS
+    //(the line-level engines don't tokenize words) and never read by
+    //DIF_CANCEL. Applied to every pair of a DIF_CHARS batch identically.
+    if (ObjBreakChars<>nil) and (Pointer(ObjBreakChars)<>Pointer(Py_None)) then
+    begin
+      if ObjBreakChars^.ob_type<>PyUnicode_Type then
+      begin
+        MsgLogConsole('ERROR: diff_proc break_chars must be a str');
+        Exit(ReturnNone);
+      end;
+      StrBreakChars:= string(PyUnicodeAsUTF8String(ObjBreakChars));
+    end
+    else
+      StrBreakChars:= CudaDiffChars.DefaultBreakChars;
+
     //the optional 6th argument selects the async mode: either a string
     //'module.func' or any Python callable
     StrCallback:= '';
@@ -12135,7 +12173,7 @@ begin
       else
         DiffJobLastId:= 1;
       TCudaDiffThread.Create(DiffJobLastId, IdAction, NAlgo, NFlags,
-        Str1, Str2, StrCallback, ObjCallback, CharPairs);
+        Str1, Str2, StrCallback, ObjCallback, CharPairs, StrBreakChars);
       Exit(PyLong_FromLong(DiffJobLastId));
     end;
 
@@ -12181,7 +12219,7 @@ begin
             try
               for I:= 0 to High(CharPairs) do
                 CharBatch.ComparePair(CharPairs[I].S1, CharPairs[I].S2,
-                  NFlags, CharOpcodes[I]);
+                  NFlags, StrBreakChars, CharOpcodes[I]);
             finally
               CharBatch.Free;
             end;
