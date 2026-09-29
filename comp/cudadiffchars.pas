@@ -58,7 +58,7 @@
     Src/stringdiffs.cpp:wordLevelToByteLevel    | TStringDiff.wordLevelToByteLevel
     Src/stringdiffs.cpp:isSafeWhitespace        | isSafeWhitespace
     Src/stringdiffs.cpp:isWordBreak             | isWordBreak
-    Src/stringdiffs.cpp:Init/SetBreakChars      | SetBreakChars + DefaultBreakChars (exposed via diff_proc break_chars)
+    Src/stringdiffs.cpp:Init/SetBreakChars      | SetBreakChars + DefaultBreakChars (exposed via diff_proc break_chars; the const mirrors WinMerge's Options value, not Init()'s ",.;:" fallback)
     Src/stringdiffs.cpp:matchchar               | matchchar
     Src/CompareOptions.h:WhitespaceIgnoreChoices | WHITESPACE_* constants
     Externals/crystaledit/editlib/utils/ctchar.h | tc_* helper functions (ASCII only)
@@ -157,9 +157,15 @@
   15. BREAK_CHARS (G6): Exposed. WinMerge's SetBreakChars API is ported
       as TStringDiff.SetBreakChars and exposed via the diff_proc
       break_chars parameter (formmain_py_api.inc passes it down to
-      DiffStrings/ComparePair/DoDiffChars). The default is the WinMerge
-      default ",.;:" (DefaultBreakChars); an empty string selects no
-      break chars at all (punctuation never breaks words).
+      DiffStrings/ComparePair/DoDiffChars). The default (DefaultBreakChars)
+      is WinMerge's "Word break characters" OPTIONS default
+      ".,:;?[](){}<=>`'!"#$%&^~\|@+-*/" -- NOT stringdiffs.cpp's
+      hard-coded ",.;:", which is only the fallback WinMerge's Init()
+      runs with until SetBreakChars() is called (WinMerge's Options dialog
+      always pushes the saved setting -- the long list above -- into the
+      engine, so the long list is the effective default; see the comment
+      on DefaultBreakChars). An empty string selects no break chars at
+      all (punctuation never breaks words).
 
   16. Fix WinMerge Hash bug: WinMerge's Hash() does `h += HASH(h, ch)`
       which is `h := h + (ch + ROL(h, 7))`. The first iteration with h=0
@@ -281,12 +287,33 @@ const
     (Pascal on modern systems is essentially 64-bit). }
   MAX_TOKEN_COUNT = 20480;
 
-  { Word-break characters — ported from stringdiffs.cpp:24. The value is
-    the WinMerge default ",.;:"; it is the DEFAULT of the diff_proc
-    break_chars parameter (formmain_py_api.inc), which lets users change
-    it. TStringDiff.SetBreakChars decodes the UTF-8 string into code
-    points; isWordBreak() breaks a word at every code point in that set. }
-  DefaultBreakChars = ',.;:';
+  (* Word-break characters: the DEFAULT of the diff_proc break_chars
+    parameter (formmain_py_api.inc), which lets users change it.
+
+    WinMerge default research (verified in WinMerge's source and its
+    Options UI): stringdiffs.cpp:24 hard-codes the break-char fallback
+      ",.;:"
+    but that value only runs inside Init(), i.e. until something calls
+    strdiff::SetBreakChars(). WinMerge's Options dialog (Compare /
+    "Whitespace & breaks") has a "Word break characters" setting whose
+    DEFAULT is the much longer list
+      .,:;?[](){}<=>`'!"#$%&^~\|@+-*/
+    and when WinMerge starts (or a compare opens) it reads the saved
+    "Word break characters" setting and calls strdiff::SetBreakChars()
+    with that value -- so in normal use the engine runs with the LONG
+    list, never with the short fallback. CudaText's diff_proc has no
+    options-storage coupling, so this constant mirrors WinMerge's
+    EFFECTIVE default (the Options-dialog list): the default break_chars
+    behavior matches what WinMerge's word-level highlights actually do,
+    not the Init() fallback nobody runs with. (",.;:" remains reachable
+    as an explicit break_chars value.)
+
+    TStringDiff.SetBreakChars decodes the UTF-8 string into code
+    points; isWordBreak() breaks a word at every code point in that
+    set. Note the Pascal literal below: the embedded single quote is
+    written doubled ('') between > and !, and the backslash needs no
+    escaping in Pascal. *)
+  DefaultBreakChars = '.,:;?[](){}<=>'',!"#$%&^~\|@+-*/';
 
 type
   { Ported from stringdiffs.h:15 — EolCompareMode enum. }
@@ -511,8 +538,10 @@ type
 
     { Ported from stringdiffs.cpp:Init/SetBreakChars — set the word-break
       characters used by the tokenizer (isWordBreak). ABreakChars is a
-      UTF-8 string of break code points (DefaultBreakChars = ',.;:'); an
-      empty string means NO break chars (punctuation never breaks).
+      UTF-8 string of break code points (the default is DefaultBreakChars:
+      WinMerge's "Word break characters" Options-dialog list, NOT the
+      ",.;:" Init() fallback -- see the comment on DefaultBreakChars);
+      an empty string means NO break chars (punctuation never breaks).
       Characters classified earlier by BuildWordsInto (CR/LF, safe
       whitespace, digits under DIFF_IGN_NUMBERS) are never affected.
       Re-decodes only when the string changed (G35-friendly for batches).
@@ -828,16 +857,17 @@ begin
   Result := (ch = $20) or (ch = $09);
 end;
 
-{ Ported from stringdiffs.cpp:792-826 — isWordBreak.
+(* Ported from stringdiffs.cpp:792-826 — isWordBreak.
   Returns true if the code point at S[index] is a word-break character.
   - ASCII + breakType=0: never break (return false)
   - ASCII + breakType≠0: break if char is in BreakChars[0..BreakCharsLen-1]
     (the user-settable break-char set — see TStringDiff.SetBreakChars;
-    the WinMerge default ",.;:" is DefaultBreakChars)
+    DefaultBreakChars = WinMerge's Options-dialog default
+    ".,:;?[](){}<=>`'!"#$%&^~\|@+-*/", see the comment on it)
   - Non-ASCII: WinMerge uses GetStringTypeW (C1_UPPER|C1_LOWER|C1_DIGIT).
     Pascal port treats ALL non-ASCII as break (each is its own token).
     See G29 divergence #6. BreakChars entries ≥$100 never match — every
-    non-ASCII code point already breaks unconditionally in this branch. }
+    non-ASCII code point already breaks unconditionally in this branch. *)
 function isWordBreak(breakType: Integer; const BreakChars: TCodePointArray;
   BreakCharsLen: Integer; const S: TCodePointArray; index: Integer): Boolean;
 var
@@ -1034,7 +1064,7 @@ begin
     DIFF_TAG_IGNORE. }
 
   FBreakType := 1;    { always break on punctuation — matches Differ plugin expectations }
-  SetBreakChars(ABreakChars);  { user-settable break chars (diff_proc break_chars; default ",.;:") }
+  SetBreakChars(ABreakChars);  { user-settable break chars (diff_proc break_chars; default: DefaultBreakChars, WinMerge's options list) }
   { ByteLevel := True: always refine to char level — Differ plugin uses
     char-level highlights (the old DoDiffChars hardcoded it too). }
 
@@ -1193,7 +1223,8 @@ end;
   1. '\r' or '\n' → dlEol (or dlSpace when eol_mode = eolAsSpace)
   2. isSafeWhitespace(ch) → dlSpace
   3. isWordBreak(breakType, breakChars, str, i) → dlBreak (a word-break
-     char of the user-settable set — see SetBreakChars; default ",.;:")
+     char of the user-settable set — see SetBreakChars; default:
+     DefaultBreakChars, WinMerge's options list)
   4. ignore_numbers and tc::istdigit(ch) → dlNumber
   5. otherwise → dlWord (default)
 
