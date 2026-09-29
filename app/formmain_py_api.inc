@@ -11261,7 +11261,7 @@ end;
 
 
 //diff_proc(id, param1, param2=None, algo=0, flags=0, callback=None,
-//          break_chars=',.;:')
+//          break_chars=".,:;?[](){}<=>`'!\"#$%&^~\\|@+-*/")
 //Compares texts and returns difflib-compatible opcodes.
 //  id: DIF_TEXTS (1) -- param1, param2 are raw text strings. The native
 //      engine splits them internally on \r\n / \r / \n (CRLF/CR/LF).
@@ -11280,7 +11280,15 @@ end;
 //        Applied to every pair of a DIF_CHARS batch identically.
 //  break_chars: str of word-break characters for the DIF_CHARS
 //        tokenizer (DIF_CHARS only; DIF_TEXTS/DIF_CANCEL accept and
-//        ignore it). Default is the WinMerge default ",.;:". The
+//        ignore it). Default is WinMerge's "Word break characters"
+//        options default:
+//            .,:;?[](){}<=>`'!"#$%&^~\|@+-*/
+//        (WinMerge note: stringdiffs.cpp's Init() hard-codes only the
+//        small fallback ",.;:", that runs until SetBreakChars is called;
+//        WinMerge's Options dialog stores the long list above as the
+//        setting's default and calls SetBreakChars with it on every
+//        compare, so the long list is the EFFECTIVE default -- diff_proc
+//        mirrors that). The
 //        tokenizer splits words at every char of the set (each break
 //        char is its own token), which the byte-level refinement then
 //        uses as real anchors. Applied to every pair of a batch
@@ -12014,8 +12022,9 @@ end;
 //     lists) -- use for small inputs only, it freezes the UI.
 //     DIF_CHARS takes the WHOLE batch of pairs in param1 (a list of
 //     (text1, text2) tuples); param2 is unused for DIF_CHARS.
-//     break_chars: str (default ",.;:") -- the DIF_CHARS word-break
-//     chars, DIF_CHARS only (accepted and ignored by DIF_TEXTS).
+//     break_chars: str (default: the WinMerge "Word break characters"
+//     options list .,:;?[](){}<=>`'!"#$%&^~\|@+-*/) -- the DIF_CHARS
+//     word-break chars, DIF_CHARS only (accepted and ignored by DIF_TEXTS).
 //  diff_proc(DIF_CANCEL, job_handle)
 //  -- cooperative cancellation of a running background compare; returns
 //     True when the job was found and cancellation was requested, False
@@ -12126,7 +12135,9 @@ begin
 
     //break_chars (optional 7th argument): the DIF_CHARS word-break
     //characters. None/not given -> CudaDiffChars.DefaultBreakChars
-    //(",.;:", WinMerge's default). Accepted and ignored by DIF_TEXTS
+    //(WinMerge's "Word break characters" options default, NOT the
+    //",.;:" Init() fallback -- see the comment on DefaultBreakChars).
+    //Accepted and ignored by DIF_TEXTS
     //(the line-level engines don't tokenize words) and never read by
     //DIF_CANCEL. Applied to every pair of a DIF_CHARS batch identically.
     if (ObjBreakChars<>nil) and (Pointer(ObjBreakChars)<>Pointer(Py_None)) then
