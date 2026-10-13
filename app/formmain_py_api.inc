@@ -11878,19 +11878,28 @@ begin
     CudaDiffChars.DiffCancelFlag:= nil;
   end;
 
-  //release the big DIF_TEXTS input texts before the callback runs: the
-  //callback handler in the plugin usually makes its own copies of the
-  //compared data, so keeping FStr1/FStr2 alive here only wastes memory.
-  //G35 NOTE for DIF_CHARS: FCharPairs is deliberately NOT cleared here
-  //anymore. Freeing its hundreds of thousands of input strings from this
-  //thread (FPC heap calls on the diff thread are the slow ones) would
-  //sit on the plugin's wait path between 'compute done' and 'callback
-  //delivered'. The strings are released when the thread object frees
-  //itself (FreeOnTerminate, right AFTER the callback phase) instead --
-  //the same moment the result matrix FCharOpcodes is released too, so
-  //nothing is observably different for the plugin except a shorter wait.
-  FStr1:= '';
-  FStr2:= '';
+  //FPC HEAP FIX (issue #6533, the retained ~600 MB after closing a big
+  //diff tab): FStr1/FStr2/FCharPairs/FBreakChars are NOT freed on this
+  //diff thread anymore. All of them were ALLOCATED on the main thread
+  //(the Python->Pascal conversions in api_diff_proc), so a free executed
+  //here is a cross-thread free, which FPC's heap does NOT apply: it only
+  //pushes the block onto the OWNING (main) thread's deferred lists
+  //(rtl/inc/heap.inc waitfree_var / waitfree_fixed). The var-path
+  //pendings then wait for the main thread's next >544-byte allocation;
+  //the fixed-path pendings (hundreds of thousands of small pair strings)
+  //wait for one of the main thread's fixed-size class freelists to run
+  //empty -- in a GUI app that essentially never happens, so the chunks
+  //stay committed for the whole app lifetime. DoCallback (which the
+  //Synchronize below runs on the MAIN thread) frees all of them there
+  //now: same-thread frees are applied at once, fully empty >1 MiB chunks
+  //are returned to the OS immediately.
+  //G35 note: no FPC heap calls were added to this thread's wait path --
+  //the two big ones were REMOVED from it (and main-thread FPC heap calls
+  //are fast anyway; the 6.1x penalty is specific to this cold diff
+  //thread, see the G35 note in cudadiffchars.pas). FOpcodes /
+  //FCharOpcodes / FErrorMessage stay diff-thread-owned (allocated in
+  //ComputeDiff) and keep being freed by the FreeOnTerminate destructor:
+  //those are same-thread frees, applied at once -- nothing to fix there.
 
   //Unregister BEFORE the callback phase: after this, DIF_CANCEL can no
   //longer find the job (returns False -- "not running"), so no
@@ -11927,88 +11936,125 @@ var
   Obj, Params, Res: PPyObject;
   SModule, SFunc: string;
 begin
-  if Application.Terminated then exit;
-  if not AppPython.Inited then exit;
-
-  //A cancelled compare NEVER invokes its completion callback. This also
-  //covers a DIF_CANCEL that arrived while the finished result was being
-  //marshalled / was waiting for the main thread: the result is dropped
-  //here. The strong ref to the callable is still released below.
-  if FCancelFlag then
-  begin
-    ReleaseCallbackObj;
-    exit;
-  end;
-
-  if FErrorMessage<>'' then
-    MsgLogConsole('ERROR: diff_proc exception: '+FErrorMessage);
-
   try
-    //result object passed to the callback: the opcode list (DIF_TEXTS)
-    //or the list of per-pair opcode lists (batched DIF_CHARS), or None
-    //on error (the same contract the synchronous form of diff_proc has)
-    if FErrorMessage='' then
+    //FPC HEAP FIX (issue #6533), part 1: free the main-thread-allocated
+    //job data HERE, on the main thread (this method runs via Synchronize,
+    //so this code is on the main thread now). api_diff_proc allocated
+    //FStr1/FStr2 (the whole input texts), FCharPairs (the batch array
+    //plus all of its pair strings) and FBreakChars on the main thread;
+    //freeing them on the diff thread -- the old code did: FStr1/FStr2 in
+    //Execute, the rest in the FreeOnTerminate destructor, which also
+    //runs on the diff thread -- only DEFERRED every free onto the main
+    //thread's waitvar/waitfixed lists (rtl/inc/heap.inc waitfree_var /
+    //waitfree_fixed): the var-path half waited for the main thread's
+    //next >544-byte allocation, the fixed-path half (hundreds of
+    //thousands of small pair strings) for one of its fixed-size class
+    //freelists to run empty, which in a GUI app essentially never
+    //happens -- the retained ~600 MB of ALREADY-FREED memory after
+    //closing a big diff tab. Same-thread frees here are applied at once;
+    //fully empty >1 MiB chunks are returned to the OS immediately
+    //(append_to_oslist). Cleared FIRST so every path below (Terminated /
+    //not Inited / cancel / error) frees them too; nothing below reads
+    //these fields -- the result conversion reads FCharOpcodes/FOpcodes
+    //only. Peak memory also improves: the input data dies BEFORE the
+    //Python result list is built and before the plugin callback runs.
+    FStr1:= '';
+    FStr2:= '';
+    FCharPairs:= nil;
+    FBreakChars:= '';
+
+    if Application.Terminated then exit;
+    if not AppPython.Inited then exit;
+
+    //A cancelled compare NEVER invokes its completion callback. This also
+    //covers a DIF_CANCEL that arrived while the finished result was being
+    //marshalled / was waiting for the main thread: the result is dropped
+    //here. The strong ref to the callable is still released below.
+    if FCancelFlag then
     begin
-      if FIdAction=DIF_CHARS then
-        Obj:= DiffCharOpcodesToPyList(FCharOpcodes)
-      else
-        Obj:= DiffOpcodesToPyList(FOpcodes);
-    end
-    else
-      Obj:= AppPython.Engine.ReturnNone();
+      ReleaseCallbackObj;
+      exit;
+    end;
 
-    if not Assigned(Obj) then exit;
+    if FErrorMessage<>'' then
+      MsgLogConsole('ERROR: diff_proc exception: '+FErrorMessage);
+
     try
-      if FCallbackObj<>nil then
+      //result object passed to the callback: the opcode list (DIF_TEXTS)
+      //or the list of per-pair opcode lists (batched DIF_CHARS), or None
+      //on error (the same contract the synchronous form of diff_proc has)
+      if FErrorMessage='' then
       begin
-        //a Python callable was passed: call it as callback(opcodes)
-        with AppPython.Engine do
-        begin
-          Params:= PyTuple_New(1);
-          if Assigned(Params) then
-          try
-            Py_INCREF(Obj);
-            if PyTuple_SetItem(Params, 0, Obj)<>0 then
-              Py_DECREF(Obj); //SetItem failed, so it didn't steal our ref
-
-            try
-              MaskFPUExceptions(true); //the same TAppPython.MaskFPU does
-              Res:= PyObject_CallObject(FCallbackObj, Params);
-              if Res<>nil then
-                Py_DECREF(Res)
-              else
-                if PyErr_Occurred<>nil then
-                  CheckError(False);
-            except
-              on E: Exception do
-                MsgLogConsole('ERROR: diff_proc callback: '+E.Message);
-            end;
-          finally
-            Py_DECREF(Params);
-          end;
-        end;
+        if FIdAction=DIF_CHARS then
+          Obj:= DiffCharOpcodesToPyList(FCharOpcodes)
+        else
+          Obj:= DiffOpcodesToPyList(FOpcodes);
       end
       else
-      if FCallbackStr<>'' then
-      begin
-        //'module.func' string callback, the same style as timer_proc
-        //callbacks. 'opcodes' is passed as a named param, so the plugin
-        //function must be defined as: def on_diff(opcodes): ...
-        SSplitByChar(FCallbackStr, '.', SModule, SFunc);
-        if (SModule<>'') and (SFunc<>'') then
-          AppPython.RunModuleFunction(SModule, SFunc, [Obj], ['opcodes'])
+        Obj:= AppPython.Engine.ReturnNone();
+
+      if not Assigned(Obj) then exit;
+      try
+        if FCallbackObj<>nil then
+        begin
+          //a Python callable was passed: call it as callback(opcodes)
+          with AppPython.Engine do
+          begin
+            Params:= PyTuple_New(1);
+            if Assigned(Params) then
+            try
+              Py_INCREF(Obj);
+              if PyTuple_SetItem(Params, 0, Obj)<>0 then
+                Py_DECREF(Obj); //SetItem failed, so it didn't steal our ref
+
+              try
+                MaskFPUExceptions(true); //the same TAppPython.MaskFPU does
+                Res:= PyObject_CallObject(FCallbackObj, Params);
+                if Res<>nil then
+                  Py_DECREF(Res)
+                else
+                  if PyErr_Occurred<>nil then
+                    CheckError(False);
+              except
+                on E: Exception do
+                  MsgLogConsole('ERROR: diff_proc callback: '+E.Message);
+              end;
+            finally
+              Py_DECREF(Params);
+            end;
+          end;
+        end
         else
-          MsgLogConsole('ERROR: diff_proc bad callback: '+FCallbackStr);
+        if FCallbackStr<>'' then
+        begin
+          //'module.func' string callback, the same style as timer_proc
+          //callbacks. 'opcodes' is passed as a named param, so the plugin
+          //function must be defined as: def on_diff(opcodes): ...
+          SSplitByChar(FCallbackStr, '.', SModule, SFunc);
+          if (SModule<>'') and (SFunc<>'') then
+            AppPython.RunModuleFunction(SModule, SFunc, [Obj], ['opcodes'])
+          else
+            MsgLogConsole('ERROR: diff_proc bad callback: '+FCallbackStr);
+        end;
+      finally
+        AppPython.Engine.Py_DECREF(Obj);
       end;
-    finally
-      AppPython.Engine.Py_DECREF(Obj);
+    except
+      on E: Exception do
+        MsgLogConsole('ERROR: diff_proc callback: '+E.Message);
     end;
-  except
-    on E: Exception do
-      MsgLogConsole('ERROR: diff_proc callback: '+E.Message);
+    //release the strong ref taken in the constructor (main thread, GIL)
+    ReleaseCallbackObj;
+  finally
+    //FPC HEAP FIX (issue #6533), part 2: FCallbackStr is read by the
+    //'module.func' callback branch above, so it can only be cleared here
+    //-- still on the main thread, on every path (it is main-thread
+    //allocated too: api_diff_proc's callback-name conversion; freeing it
+    //in the FreeOnTerminate destructor on the diff thread would defer it
+    //onto the main thread's waitfixed list exactly like the fields
+    //cleared at the top of this method).
+    FCallbackStr:= '';
   end;
-  //release the strong ref taken in the constructor (main thread, GIL)
-  ReleaseCallbackObj;
 end;
 
 //diff_proc implementation. Three call shapes:
