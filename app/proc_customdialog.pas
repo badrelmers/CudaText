@@ -30,12 +30,14 @@ uses
   ATSynEdit_Globals,
   ATSynEdit_Edits,
   ATSynEdit_Adapter_EControl,
+  MarkDown.Control,
   proc_customdialog_dummy,
   proc_miscutils,
   proc_globdata,
   proc_py,
   proc_editor,
   proc_colors,
+  proc_markdown_hilite,
   proc_scrollbars,
   proc_lexer_styles,
   proc_str,
@@ -77,9 +79,19 @@ type
   TControlHack = class(TControl);
   TCustomEditHack = class(TCustomEdit);
   TWinControlHack = class(TWinControl);
+  TMarkDownControlHack = class(TCustomMarkDownControl);
 
 const
   cControlBorderStyles: array[boolean] of TBorderStyle = (bsNone, bsSingle);
+
+function MixTwoColors(AColor1, AColor2: TColor; APercentsOfSecond: byte): TColor;
+//mix: result = AColor1*(100-P)/100 + AColor2*P/100
+begin
+  Result:= RGBToColor(
+    (Red(AColor1)*(100-APercentsOfSecond) + Red(AColor2)*APercentsOfSecond) div 100,
+    (Green(AColor1)*(100-APercentsOfSecond) + Green(AColor2)*APercentsOfSecond) div 100,
+    (Blue(AColor1)*(100-APercentsOfSecond) + Blue(AColor2)*APercentsOfSecond) div 100);
+end;
 
 procedure SetDictKey_NotEmpty(Obj: PPyObject; const AKey, AValue: string);
 begin
@@ -260,6 +272,9 @@ begin
 
   if C is TScrollBox then
     exit(DoControl_GetState_ScrollBox(TScrollBox(C)));
+
+  if C is TMarkDownControl then
+    exit(TMarkDownControl(C).MarkDown.Text);
 end;
 
 
@@ -270,6 +285,15 @@ begin
 
   C.Lines.TextLineBreakStyle:= tlbsLF;
   C.Lines.Text:= AValue;
+end;
+
+procedure DoControl_SetState_MarkDown(C: TMarkDownControl; const AValue: string);
+var
+  S: string;
+begin
+  S:= StringReplace(AValue, #9, #10, [rfReplaceAll]);
+  S:= StringReplace(S, #3, #9, [rfReplaceAll]);
+  C.MarkDown.Text:= S;
 end;
 
 procedure DoControl_SetState_Checkgroup(C: TCheckGroup; const AValue: string);
@@ -1160,6 +1184,24 @@ begin
       exit;
     end;
 
+    if S='markdown' then
+    begin
+      Ctl:= TMarkDownControl.Create(AForm);
+      TMarkDownControl(Ctl).AutoSize:= false;
+      TMarkDownControl(Ctl).BorderStyle:= bsSingle;
+      TMarkDownControl(Ctl).Color:= AppTheme.Colors[TAppThemeColor.EdTextBg].Color;
+      TMarkDownControl(Ctl).FontColor:= AppTheme.Colors[TAppThemeColor.EdTextFont].Color;
+      TMarkDownControl(Ctl).FontCodeColor:= AppTheme.Colors[TAppThemeColor.EdTextFont].Color;
+      TMarkDownControl(Ctl).FontQuoteColor:= AppTheme.Colors[TAppThemeColor.EdTextFont].Color;
+      TMarkDownControl(Ctl).HyperLinkColor:= AppTheme.Colors[TAppThemeColor.EdLinks].Color;
+      TMarkDownControl(Ctl).BGCodeColor:= MixTwoColors(
+        AppTheme.Colors[TAppThemeColor.EdTextBg].Color,
+        AppTheme.Colors[TAppThemeColor.EdTextFont].Color, 12);
+      TMarkDownControl(Ctl).OnOpenURL:= @AForm.DoOnMarkdownOpenURL;
+      TMarkDownControl(Ctl).OnHiliteCode:= @GetMarkdownHiliter.DoHiliteCode;
+      exit;
+    end;
+
     //unsupported control type: create red panel to indicate plugin's error
     Ctl:= TPanel.Create(AForm);
     Ctl.Caption:= S+'?';
@@ -1260,6 +1302,34 @@ const
 var
   N: integer;
 begin
+  if C is TMarkDownControl then
+  begin
+    case AIndex of
+      0: TMarkDownControl(C).BaseFontSize:= StrToIntDef(S, 10);
+      1: TMarkDownControl(C).FontName:= S;
+      2: TMarkDownControl(C).MonoFontName:= S;
+      3: TMarkDownControl(C).FontColor:= StrToIntDef(S, clDefault);
+      4: TMarkDownControl(C).FontCodeColor:= StrToIntDef(S, clDefault);
+      5: TMarkDownControl(C).FontQuoteColor:= StrToIntDef(S, clDefault);
+      6: TMarkDownControl(C).HyperLinkColor:= StrToIntDef(S, clDefault);
+      7: TMarkDownControl(C).BGCodeColor:= StrToIntDef(S, clDefault);
+      8: TMarkDownControl(C).SelectionColor:= StrToIntDef(S, clDefault);
+      9:
+        begin
+          //TScrollStyle: 0=ssNone..6=ssAutoBoth, default 5=ssAutoVertical
+          N:= StrToIntDef(S, 5);
+          N:= Max(0, Min(6, N));
+          TMarkDownControl(C).ScrollBars:= TScrollStyle(N);
+        end;
+      10: TMarkDownControl(C).ParagraphSpacing:= StrToIntDef(S, 10);
+      11: TMarkDownControl(C).BlockQuoteIndent:= StrToIntDef(S, 0);
+      12: TMarkDownControl(C).ExtraIndent:= StrToIntDef(S, 0);
+      13: TMarkDownControl(C).WheelScrollLines:= StrToIntDef(S, 3);
+      14: SetMarkdownHiliteEnabled(AppStrToBool(S));
+    end;
+    exit
+  end;
+
   if C is TButton then
   begin
     case AIndex of
@@ -1674,6 +1744,11 @@ begin
   if C is TScrollBox then
   begin
     DoControl_SetState_ScrollBox(TScrollBox(C), S);
+    exit
+  end;
+  if C is TMarkDownControl then
+  begin
+    DoControl_SetState_MarkDown(TMarkDownControl(C), S);
     exit
   end;
 end;
@@ -2544,7 +2619,7 @@ var
   SItems, SColumns: string;
   SParent: string;
   Props: TAppControlProps;
-  N: integer;
+  N, NPreferred: integer;
 begin
   bFocused:= false;
   bTabStop:= false;
@@ -2614,6 +2689,21 @@ begin
     N:= DoControl_GetIndexHovered(C);
     if N>=0 then
       AppPython.SetDictKey(Result, 'tab_hovered', N);
+
+    if (C is TCustomMarkDownControl) and (C.Parent<>nil) then
+    begin
+      //'h_needed': height of markdown text, calculated for the current width
+      if not TWinControl(C).HandleAllocated then
+        TWinControl(C).HandleNeeded;
+      if TWinControl(C).HandleAllocated then
+      begin
+        N:= 0;
+        NPreferred:= 0;
+        TMarkDownControlHack(C).CalcLayout;
+        TMarkDownControlHack(C).CalculatePreferredSize(N, NPreferred, false);
+        AppPython.SetDictKey(Result, 'h_needed', NPreferred);
+      end;
+    end;
 
     SetDictKey_NotEmpty(Result, 'on_change', Props.FEventOnChange);
     SetDictKey_NotEmpty(Result, 'on_click', Props.FEventOnClick);

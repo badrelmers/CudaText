@@ -1068,10 +1068,11 @@ Action DLG_CTL_PROP_SET, for "listview", allows both "items" (it sets columns) a
 * For "scrollbox":
 ** on reading: value is 6 numbers ","-separated: vert_position, horz_position, vert_range, horz_range, vert_pagesize, horz_pagesize.
 ** on writing: value is only 2 numbers ","-separated: vert_position, horz_position.
+* For "markdown": value is the Markdown source text, multi-line, "\t"-separated lines (in lines "\t" chars must be replaced with chr(3)), same as for "memo". Reading gives the same text back.
 
 ====dlg_custom - Properties "ex"====
 
-Properties "ex0"..."ex9" are specific to each control kind. They have different simple types (str, bool, int...). Note: for dlg_custom, bool values must be specified as "0"/"1", not as strings "True"/"False".
+Properties "ex0"..."ex14" are specific to each control kind. They have different simple types (str, bool, int...). Note: for dlg_custom, bool values must be specified as "0"/"1", not as strings "True"/"False".
 
 * "button":
 ** "ex0": bool: default for Enter key.
@@ -1105,6 +1106,22 @@ Properties "ex0"..."ex9" are specific to each control kind. They have different 
 ** "ex3": int: color of border.
 * "filter_listview":
 ** "ex0": bool: filter works for all columns.
+* "markdown":
+** "ex0": int: base font size.
+** "ex1": str: proportional font name.
+** "ex2": str: monospaced font name (used in code spans/blocks).
+** "ex3": int: color of normal text.
+** "ex4": int: color of text in code spans/blocks.
+** "ex5": int: color of text in quotes.
+** "ex6": int: color of hyperlinks.
+** "ex7": int: background color of code blocks.
+** "ex8": int: color of text selection.
+** "ex9": int: scrollbars style, 0..6 like SCROLLSTYLE_nnn constants (0: none, 1: horz, 2: vert, 3: both, 4: auto-horz, 5: auto-vert (default), 6: auto-both).
+** "ex10": int: paragraph spacing, in pixels.
+** "ex11": int: blockquote indent, in pixels (0: auto by font).
+** "ex12": int: additional indent of all content, in pixels.
+** "ex13": int: how many text lines to scroll per mouse-wheel notch (default 3).
+** "ex14": bool: enable syntax highlighting of fenced code blocks using app's lexers, global for all "markdown" controls (default on).
 * "image":
 ** "ex0": bool: center picture.
 ** "ex1": bool: stretch picture.
@@ -1188,6 +1205,7 @@ Additional types, supported only by "dlg_proc":
 * "editor_edit": one-line variant of "editor".
 * "editor_combo": one-line variant of "editor", with drop-down arrow.
 * "listbox_ex": listbox, application-themed, works via <code>listbox_proc()</code>.
+* "markdown": read-only control which renders Markdown text (headings, lists, quotes, tables, code blocks with syntax highlighting, links, images). Markdown flavor: CommonMark-like subset with GFM tables and fenced code blocks; the fence info string (e.g. '''python) enables highlighting of the code block using app's lexers. Text is set via property "val", needed height is readable via "h_needed".
 * "statusbar": statusbar: panel with one horizontal row of cells, works via <code>statusbar_proc()</code>.
 * "toolbar": toolbar: panel which holds buttons with icons, works via <code>toolbar_proc()</code>.
 * "treeview": tree structure with nodes and nested nodes, works via <code>tree_proc()</code>.
@@ -1285,10 +1303,12 @@ How to get nice key description in "on_key_down", e.g. "Ctrl+Alt+Esc" from id_ct
 * "font_size": int: Font size.
 * "font_color": int: Font color.
 * "hint": str: Hint (tooltip) for mouse-over. Newlines must be "\r".
-* "ex0"..."ex9": Advanced control-specific props. Described in dlg_custom.
+* "ex0"..."ex14": Advanced control-specific props. Described in dlg_custom.
 * "items": str: Usually tab-separated items. Described in dlg_custom.
 * "val": str: Value of control. Described in dlg_custom.
 * "tag": str: Any string, set by plugin.
+
+* "h_needed" (only for reading, only for "markdown"): int: height of rendered Markdown text, calculated for the current width of control. Read it after setting "val" and width; then set control's/form's height to fit, or keep smaller height and let auto-scrollbars appear.
 
 * "focused": bool: Shows if control has focus.
 * "tab_stop": bool: Allows tab-key to jump to this control.
@@ -1355,6 +1375,10 @@ Special events for control "treeview":
 
 * "on_fold", "on_unfold": Called before treeview node is folded/unfolded. Param "data" is int handle of treeview node. Handler can return False to disable the folding/unfolding.
 * "on_select": Called after selection is changed.
+
+Special events for control "markdown":
+
+* "on_click_link": Called on click of hyperlink in rendered Markdown. Param "data" is str URL. Only http/https/mailto URLs are usually used.
 
 Special events for controls "memo", "edit", "edit_pwd", "spinedit", "combo":
 

@@ -189,6 +189,7 @@ type
     procedure DoOnEditorClickGutter(Sender: TObject; ABand, ALine: integer; var AHandled: boolean);
     procedure DoOnEditorClickGap(Sender: TObject; AGapItem: TATGapItem; APos: TPoint);
     procedure DoOnEditorClickLink(Sender: TObject; const ALink: string);
+    procedure DoOnMarkdownOpenURL(Sender: TObject; AURL: string);
     procedure DoOnEditorPaste(Sender: TObject; var AHandled: boolean; AKeepCaret, ASelectThen: boolean);
     function DoEvent(AIdControl: integer; const ACallback: string; const AData: TAppVariant): boolean;
     procedure DoEmulatedModalShow;
@@ -1733,6 +1734,11 @@ begin
   Data.Str:= ALink;
 
   DoEvent(IdControl, Callback, Data);
+end;
+
+procedure TFormDummy.DoOnMarkdownOpenURL(Sender: TObject; AURL: string);
+begin
+  DoOnEditorClickLink(Sender, AURL);
 end;
 
 procedure TFormDummy.DoOnEditorScroll(Sender: TObject);
