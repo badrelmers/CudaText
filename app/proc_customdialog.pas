@@ -698,9 +698,6 @@ begin
     C.HorzScrollBar.Position:= N;
 end;
 
-type
-  TMarkdownControlHack = class(TMarkdownControl);
-
 procedure DoControl_SetState_Markdown(C: TMarkDownControl; const AValue: string);
 begin
   C.Markdown.Clear;
@@ -1887,6 +1884,17 @@ begin
     exit;
   end;
 
+  if AName='filename' then
+  begin
+    //md_view: folder of this file is the base for relative image URLs
+    //of the 'val' markdown text, e.g. ![..](pic.png)
+    Props.FMarkdownFilename:= AValue;
+    if (C is TMarkDownControl) and (AValue<>'') then
+      //drop images already loaded for the old base folder
+      TMarkDownControl(C).ClearImageCache;
+    exit;
+  end;
+
   if AName='border' then
   begin
     DoControl_SetBorder(C, AppStrToBool(AValue));
@@ -2672,6 +2680,7 @@ begin
     SetDictKey_NotEmpty(Result, 'on_mouse_up', Props.FEventOnMouseUp);
     SetDictKey_NotEmpty(Result, 'on_mouse_move', Props.FEventOnMouseMove);
   SetDictKey_NotEmpty(Result, 'drag_files', Props.FDragFiles);
+    SetDictKey_NotEmpty(Result, 'filename', Props.FMarkdownFilename);
     SetDictKey_NotEmpty(Result, 'on_editor_caret', Props.FEventOnEditorCaret);
     SetDictKey_NotEmpty(Result, 'on_editor_scroll', Props.FEventOnEditorScroll);
     SetDictKey_NotEmpty(Result, 'on_editor_key_down', Props.FEventOnEditorKeyDown);

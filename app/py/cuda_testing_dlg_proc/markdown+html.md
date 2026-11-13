@@ -116,6 +116,10 @@ does not download from internet
 
 ![local image](markdown.png)
 
+![local image](./markdown.png)
+
+![local image](<markdown.png>)
+
 
 ### ___ Alerts ___
 > [!NOTE]

@@ -28,8 +28,7 @@ uses
   ATSynEdit,
   ATSynEdit_Gaps,
   ATStatusBar,
-  ATListbox,
-  markdown.canvasrender;
+  ATListbox;
 
 type
   TAppPyCommonCallback = function(
@@ -62,6 +61,9 @@ type
     FActive: boolean;
     FTagString: string;
     FDragFiles: string;
+    //md_view: filename of the displayed Markdown document, to resolve
+    //relative image URLs like ![..](pic.png); set via 'filename' prop
+    FMarkdownFilename: string;
     FEventOnChange: string;
     FEventOnClick: string;
     FEventOnClickX: string;
@@ -212,9 +214,7 @@ implementation
 
 {$ifdef windows}
 uses
-  Windows,
-  proc_windows_dragfiles,
-  proc_windows_droptarget;
+  Windows, proc_windows_dragfiles, proc_windows_droptarget;
 
 type
   // QueueAsyncCall requires a method (of object), not a free procedure.
@@ -1779,25 +1779,37 @@ end;
 
 procedure TFormDummy.DoOnMarkdownGetImage(Sender: TObject; const aURL: string;
   var aImage: TPicture);
+//aURL comes from the MD text as it is written there: relative filenames
+//like 'markdown.png' are NOT found by FileExists, they must be resolved
+//against the folder of the MD document. The 'filename' prop of the md_view
+//control carries that folder (stored in TAppControlProps), plugins set it
+//together with 'val'. The parser also percent-escapes image URLs ('\',
+//'"', non-ASCII): MdResolveImageFilename handles all of it.
 var
-  fn: string;
+  Props: TAppControlProps;
+  fn, Base: string;
+  Gr: TGraphic;
 begin
-  //URLs not supported
-  if Pos('://', aURL)>0 then exit;
-
-  fn:= aURL;
-  if Pos(DirectorySeparator, fn)=0 then
+  Base:= '';
+  if (Sender is TControl) and (TControl(Sender).Tag<>0) then
   begin
-    if (DirectorySeparator<>'/') and (Pos('/', fn)>0) then
-      fn:= StringReplace(fn, '/', DirectorySeparator, [rfReplaceAll])
-    else
-      fn:= ExtractFilePath((Sender as TMarkDownCanvasRenderer).Document.FileName)+aURL;
+    Props:= TAppControlProps(TControl(Sender).Tag);
+    Base:= ExtractFilePath(Props.FMarkdownFilename);
   end;
 
-  if FileExists(fn) then
-  begin
+  fn:= MdResolveImageFilename(aURL, Base);
+  if fn='' then exit;
+
+  //AppLoadPictureFromFile checks FileExists itself, supports png/bmp/gif/
+  //jpg/webp and swallows corrupted-image exceptions: OnGetImage is called
+  //from the paint cycle, it must not raise
+  Gr:= AppLoadPictureFromFile(fn);
+  if Gr=nil then exit;
+  try
     aImage:= TPicture.Create;
-    aImage.LoadFromFile(fn);
+    aImage.Assign(Gr);
+  finally
+    Gr.Free;
   end;
 end;
 

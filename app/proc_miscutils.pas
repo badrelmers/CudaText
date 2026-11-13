@@ -102,6 +102,13 @@ procedure ApplyThemeToTreeview(C: TTreeview; AThemedColors, AChangeShowRoot: boo
 procedure ApplyThemeToToolbar(C: TATFlatToolbar);
 procedure ApplyThemeToImageBox(AImageBox: TATImageBox);
 procedure ApplyThemeToMarkdown(C: TMarkDownControl);
+// Resolve the image URL from a rendered Markdown text to a local filename,
+// relative to aBaseFolder (folder of the MD document). Decodes the URL
+// percent-escaping done by the markdown parser ('\', '[', ']', '"', '`',
+// non-ASCII are escaped), strips 'file://' prefixes and surrounding quotes
+// (as in "![..](\"pic.png\")"), keeps absolute filenames as-is.
+// Result is empty when nothing sensible remains; caller checks FileExists.
+function MdResolveImageFilename(const aURL, aBaseFolder: string): string;
 
 function UpdateImagelistWithIconFromFile(AList: TCustomImagelist;
   const AFilename, ACallerAPI: string; AllowScaling: boolean=false): integer;
@@ -583,6 +590,83 @@ begin
   C.FontQuoteColor:= AppTheme.Styles[TAppThemeStyle.Id2].Font.Color;
   C.SelectionColor:= AppTheme.Colors[TAppThemeColor.EdSelBg].color;
   C.HyperLinkColor:= AppTheme.Colors[TAppThemeColor.EdLinks].color;
+end;
+
+function MdUrlUnescapePercent(const S: string): string;
+//percent-decoding of S: each '%XX' with two hex digits becomes one raw byte.
+//markdown parser percent-escapes image URLs ('\', '[', ']', '"', '`',
+//non-ASCII), so local filenames must be decoded before FileExists()
+var
+  i, N1, N2: integer;
+
+  function HexDigit(C: char): integer;
+  begin
+    case C of
+      '0'..'9': Result:= Ord(C)-Ord('0');
+      'a'..'f': Result:= Ord(C)-Ord('a')+10;
+      'A'..'F': Result:= Ord(C)-Ord('A')+10;
+    else
+      Result:= -1;
+    end;
+  end;
+
+begin
+  Result:= '';
+  i:= 1;
+  while i<=Length(S) do
+  begin
+    if (S[i]='%') and (i+2<=Length(S)) then
+    begin
+      N1:= HexDigit(S[i+1]);
+      N2:= HexDigit(S[i+2]);
+      if (N1>=0) and (N2>=0) then
+      begin
+        Result:= Result + char(N1*16+N2);
+        Inc(i, 3);
+        continue;
+      end;
+    end;
+    Result:= Result+S[i];
+    Inc(i);
+  end;
+end;
+
+function MdResolveImageFilename(const aURL, aBaseFolder: string): string;
+var
+  S: string;
+begin
+  Result:= '';
+
+  S:= MdUrlUnescapePercent(aURL);
+  if S='' then exit;
+
+  //local file URLs: 'file:///home/u/pic.png', 'file://F:/pic.png'
+  if AnsiStartsText('file://', S) then
+  begin
+    S:= Copy(S, 8, MaxInt);
+    //'file:///F:/pic.png' keeps '/F:/pic.png': drop the leading slash of
+    //a Windows drive-letter form
+    if (Length(S)>=3) and (S[1]='/') and (S[3]=':') and CharInSet(S[2], ['A'..'Z', 'a'..'z']) then
+      Delete(S, 1, 1);
+  end;
+
+  S:= Trim(S);
+  if S='' then exit;
+
+  //URL written in MD as ![..]("pic.png") or ![..](<pic.png>): surrounding
+  //quotes are kept in the URL (arrive percent-escaped as %22)
+  while (Length(S)>=2) and (S[1]=S[Length(S)]) and CharInSet(S[1], ['"', '''']) do
+    S:= Copy(S, 2, Length(S)-2);
+
+  if S='' then exit;
+
+  if FilenameIsAbsolute(S) then
+    exit(S);
+
+  //relative URL: resolve against the folder of the MD document
+  if aBaseFolder='' then
+    exit(S);
+  Result:= AppendPathDelim(aBaseFolder) + S;
 end;
 
 

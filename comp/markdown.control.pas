@@ -95,6 +95,10 @@ Type
     procedure ClearSelection;
     function GetSelectionText: String;
     procedure CopySelectionToClipBoard;
+    // Drop loaded images and re-render the document, so the OnGetImage
+    // event is called again for all images (e.g. application changed the
+    // base folder which relative image URLs are resolved against)
+    procedure ClearImageCache;
     property MarkDown : TStrings Read FMarkDown Write SetMarkDown;
     property BaseFontSize: Integer index 0 read GetInteger Write SetInteger;
     property FontName: string index 0 read GetString write SetString;
@@ -361,6 +365,16 @@ procedure TCustomMarkDownControl.ParseMarkDown;
 begin
   FRenderer.ParseMarkdown(FMarkDown);
   CalcLayout;
+end;
+
+procedure TCustomMarkDownControl.ClearImageCache;
+begin
+  FRenderer.ClearImageCache;
+  // images are requested from OnGetImage at the layout stage: re-layout
+  // the parsed document with the emptied cache; if the handle is not yet
+  // allocated, layout happens later with the cleared cache anyway
+  if HandleAllocated then
+    CalcLayout;
 end;
 
 procedure TCustomMarkDownControl.CalcLayout;

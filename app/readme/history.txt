@@ -6,6 +6,7 @@
 1.240.0 (2026/11)
 
 + add: new API to show Markdown with formatting/tables/pictures/bullets; it will be used in LSP_Client and later in other plugins
+- fix: API Markdown: pictures with local filenames were not shown: relative filenames (e.g. `![..](markdown.png)`) are now resolved against the folder of the MD document, which the dlg_proc prop 'filename' of md_view control gives; absolute filenames with forward slashes and `\\`-escaped Windows paths work too; percent-escaped URLs (`%20` etc) are decoded (fixed by Z.ai)
 
 1.239.1 (2026/11)
 

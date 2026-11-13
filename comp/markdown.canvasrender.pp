@@ -262,6 +262,11 @@ type
     constructor Create(aOwner: TComponent); override;
     destructor Destroy; override;
 
+    // Drop the images loaded via OnGetImage, so a next layout calls the
+    // OnGetImage event again for all images (e.g. application changed the
+    // base folder which relative image URLs are resolved against)
+    procedure ClearImageCache;
+
     // Markdown parsing
     procedure ParseMarkdown(const aMarkDown: utf8string); overload;
     procedure ParseMarkdown(const aMarkDown: TStrings); overload;
@@ -1463,6 +1468,14 @@ begin
   // Adapt line height
   if FLayout.LineHeight<lImage.Height then
     FLayout.LineHeight:=lImage.Height;
+end;
+
+procedure TMarkDownCanvasRenderer.ClearImageCache;
+begin
+  // recreate like the constructor does: table owns the TPicture objects,
+  // so all images loaded via OnGetImage are freed here
+  FreeAndNil(FImageCache);
+  FImageCache:=TFPObjectHashTable.Create(True);
 end;
 
 procedure TMarkDownCanvasRenderer.CollectHTMLEntities;

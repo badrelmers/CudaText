@@ -1233,7 +1233,10 @@ end
         fn = dlg_file(True, '', '', 'Markdown|*.md', 'Open file')
         if not fn: return
         text = open(fn, encoding='utf8').read()
-        dlg_proc(id_dlg, DLG_CTL_PROP_SET, name='markdown1', prop={'val': text})
+        dlg_proc(id_dlg, DLG_CTL_PROP_SET, name='markdown1', prop={
+            'filename': fn,
+            'val': text
+            })
 
     def test_sidepanel(self):
         print('test_sidepanel')
@@ -1445,6 +1448,8 @@ end
             'align': ALIGN_CLIENT,
             'border': False,
             'color': 0xC0F0C0,
+            #folder of the MD file is the base for ![..](markdown.png) images
+            'filename': fn_md,
             'val': text_md
             })
 
